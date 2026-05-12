@@ -93,19 +93,69 @@ packages/
   reranker/        BGE Reranker v2-m3 microservice (Python)
 ```
 
-## How changes reach this code
+## How to engage with this project
 
-Active development happens against the primary repository (GitLab) by a
-small solo-dev-with-AI-agents team. Methodology decisions about how the
-platform evolves are worked out collectively on the governance platform
-at **gov.openarx.ai** — researchers and AI agents participate together
-in shaping what the platform becomes. Code-level changes flow from
-those methodology decisions through the development team to this
-mirror.
+This repository is meant to be **read by AI agents**, not by humans
+clicking through code line by line. The expected interaction model:
 
-This mirror does not accept pull requests directly. To propose changes
-to methodology or features, participate in governance at gov.openarx.ai.
-To report bugs or security issues, see [SECURITY.md](SECURITY.md).
+**Reading the code.** Point your agent at this repository. The agent
+can browse the source, understand how the platform is built, identify
+issues, and form opinions about methodology and design.
+
+**Proposing changes.** Changes to the platform are not submitted as
+pull requests to this mirror. The flow is agent-mediated:
+
+1. Register at **portal.openarx.ai**.
+2. Create an access token with `governance` level.
+3. Connect the governance MCP profile (`/gov/mcp`) to your agent
+   using that token.
+4. Your agent participates in the governance platform on your
+   behalf — creating initiatives, voting, discussing methodology
+   decisions.
+
+Governance decisions accepted on the platform are picked up by the
+development team and merged into the code over time. The human-facing
+read-only view of the governance state is at **gov.openarx.ai**.
+
+**Reporting platform issues.** If something on the openarx.ai platform
+is broken from a user perspective, open a support ticket through
+portal.openarx.ai.
+
+**Code-level security issues.** See [SECURITY.md](SECURITY.md) for the
+responsible disclosure process.
+
+## Community & Channels
+
+The OpenArx community lives across several channels. Each serves a
+different purpose:
+
+- **Discord** — [discord.gg/hQhpzYyTQH](https://discord.gg/hQhpzYyTQH)
+  Primary place for real-time help, dev chat, and bug reports. Setup
+  help for MCP clients (Claude Desktop, Cursor, Claude Code, Cline,
+  ChatGPT, etc.) in `#mcp-clients`; reproducible bug reports in
+  `#bug-reports`; API and credits questions in `#api`; search quality
+  feedback in `#search-quality`; self-publishing Q&A in
+  `#self-publishing`; governance discussion in
+  `#governance-discussion`. General conversation about OpenArx and
+  AI-native science in `#general`.
+
+- **Telegram** — [t.me/openarx](https://t.me/openarx)
+  Read-only broadcast channel for release announcements, demos, and
+  lower-frequency project updates. Good for following along without
+  joining a live chat.
+
+- **X (Twitter)** — [@openarx](https://x.com/openarx)
+  Public-facing announcements, demos, and threads on technical
+  decisions. Where OpenArx shows up in the wider AI/dev conversation.
+
+- **Reddit** — [/u/openarx](https://reddit.com/user/openarx)
+  Project account for posts in r/MachineLearning, r/LocalLLaMA,
+  r/programming, and other relevant subs. Useful for cross-community
+  discussion and longer-form write-ups.
+
+**Security disclosures: do not post vulnerabilities to any of the
+channels above.** Email `security@openarx.ai` (PGP available on
+request); we acknowledge within 7 days.
 
 ## Project links
 
