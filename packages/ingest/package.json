@@ -1,0 +1,51 @@
+{
+  "name": "@openarx/ingest",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "download-samples": "tsx src/scripts/download-samples.ts",
+    "validate-parsers": "tsx src/scripts/validate-parsers.ts",
+    "register-papers": "tsx src/scripts/register-papers.ts",
+    "pipeline": "tsx src/scripts/run-pipeline.ts",
+    "download-pwc": "tsx src/scripts/download-pwc.ts",
+    "batch-fetch": "tsx src/scripts/batch-fetch-arxiv.ts",
+    "re-enrich": "tsx src/scripts/re-enrich.ts",
+    "backfill-ids": "tsx src/scripts/backfill-external-ids.ts",
+    "cleanup-orphans": "tsx src/scripts/cleanup-orphans.ts",
+    "migrate-embeddings": "tsx src/scripts/migrate-embeddings.ts",
+    "scan-qdrant-orphans": "tsx src/scripts/scan-qdrant-orphans.ts",
+    "reindex-orphans": "tsx src/scripts/reindex-orphans.ts",
+    "reindex-missing-specter2": "tsx src/scripts/reindex-missing-specter2.ts",
+    "detect-parse-failures": "tsx src/scripts/detect-parse-failures.ts",
+    "test-parser-coverage": "tsx src/scripts/test-parser-coverage.ts",
+    "qdrant-backfill-deleted": "tsx src/scripts/qdrant-backfill-deleted.ts",
+    "test:strip": "node --test --import tsx src/parsers/__tests__/strip-commands.test.ts",
+    "test:resolve-inputs": "node --test --import tsx src/parsers/__tests__/resolve-inputs.test.ts",
+    "test:abstract-tier-upgrade": "node --test --import tsx src/pipeline/__tests__/abstract-tier-upgrade.test.ts",
+    "test:migrate-embeddings": "node --test --import tsx src/scripts/__tests__/migrate-embeddings.test.ts",
+    "test:license": "node --test --import tsx src/lib/__tests__/license-normalizer.test.ts",
+    "runner": "node dist/scripts/runner.js",
+    "cli": "node dist/scripts/cli.js"
+  },
+  "bin": {
+    "openarx": "dist/scripts/cli.js"
+  },
+  "dependencies": {
+    "@openarx/api": "workspace:*",
+    "@openarx/types": "workspace:*",
+    "@qdrant/js-client-rest": "^1.13.0",
+    "fast-xml-parser": "^5.2.3",
+    "form-data": "^4.0.2",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "undici": "^7.24.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.18",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

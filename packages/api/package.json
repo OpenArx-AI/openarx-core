@@ -1,0 +1,27 @@
+{
+  "name": "@openarx/api",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "migrate": "tsx src/db/migrate.ts",
+    "setup-qdrant": "tsx src/db/setup-qdrant.ts",
+    "test": "tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "@qdrant/js-client-rest": "^1.13.0",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "devDependencies": {
+    "@openarx/types": "workspace:*",
+    "@types/pg": "^8.11.11",
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}

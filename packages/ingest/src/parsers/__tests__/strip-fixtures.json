@@ -1,0 +1,92 @@
+[
+  {
+    "name": "section_with_formula",
+    "input": "\\section{Introduction}\nSome text about $E=mc^2$ and more.",
+    "expected": "\\section{Introduction}\nSome text about $E=mc^2$ and more.",
+    "note": "Section header and inline math preserved as-is"
+  },
+  {
+    "name": "formatting_unwrap",
+    "input": "This is \\textbf{bold} and \\emph{italic} and \\texttt{code}.",
+    "expected": "This is bold and italic and code.",
+    "note": "Formatting commands unwrapped, content kept"
+  },
+  {
+    "name": "latex_comments",
+    "input": "Real text here.\n% This is a comment\nMore text.\nPartial % inline comment",
+    "expected": "Real text here.\n\nMore text.\nPartial",
+    "note": "Full-line and inline comments removed"
+  },
+  {
+    "name": "verb_pipe_delimiter",
+    "input": "Use \\verb|\\citep| for citations and \\verb|\\citet| for text citations.",
+    "expected": "Use \\citep for citations and \\citet for text citations.",
+    "note": "\\verb with pipe delimiter unwrapped"
+  },
+  {
+    "name": "verb_plus_delimiter",
+    "input": "The command \\verb+some_code()+ does something.",
+    "expected": "The command some_code() does something.",
+    "note": "\\verb with + delimiter unwrapped"
+  },
+  {
+    "name": "footnote_unwrap",
+    "input": "Main text\\footnote{This is important context.} continues here.",
+    "expected": "Main text (This is important context.) continues here.",
+    "note": "Footnote unwrapped to parenthetical"
+  },
+  {
+    "name": "cite_preserved",
+    "input": "As shown by~\\cite{vaswani2017attention} and \\citep{brown2020language}.",
+    "expected": "As shown by~\\cite{vaswani2017attention} and \\citep{brown2020language}.",
+    "note": "Citation commands preserved for enrichment"
+  },
+  {
+    "name": "display_math_preserved",
+    "input": "The equation is:\n\\[\n  E = mc^2\n\\]\nwhich is famous.",
+    "expected": "The equation is:\n\\[\n  E = mc^2\n\\]\nwhich is famous.",
+    "note": "Display math preserved as-is"
+  },
+  {
+    "name": "label_removed",
+    "input": "\\section{Method}\\label{sec:method}\nWe propose a new approach.",
+    "expected": "\\section{Method}\nWe propose a new approach.",
+    "note": "Labels removed (not useful for text)"
+  },
+  {
+    "name": "blockquote_unwrap",
+    "input": "As stated: \\blockquote{Recurrent neural networks have been firmly established.}",
+    "expected": "As stated: Recurrent neural networks have been firmly established.",
+    "note": "Blockquote unwrapped to plain text"
+  },
+  {
+    "name": "layout_commands_removed",
+    "input": "\\noindent\\bigskip\nText after layout.\\vspace{1em}\nMore text.",
+    "expected": "\nText after layout.\nMore text.",
+    "note": "Layout commands removed, text preserved"
+  },
+  {
+    "name": "figure_with_caption",
+    "input": "See below:\n\\begin{figure}[ht]\n\\centering\n\\includegraphics[width=0.5\\linewidth]{fig1.pdf}\n\\caption{Overview of architecture}\n\\end{figure}\nText continues.",
+    "expected": "See below:\n[Figure: Overview of architecture]\nText continues.",
+    "note": "Figure environment replaced with caption text"
+  },
+  {
+    "name": "cref_removed",
+    "input": "As shown in \\Cref{sec:method} and \\cref{fig:overview}, the results in \\ref{tab:results}.",
+    "expected": "As shown in  and , the results in .",
+    "note": "Cross-references removed (no meaning without labels)"
+  },
+  {
+    "name": "url_preserved",
+    "input": "Available at \\url{https://github.com/example/repo} and \\href{https://arxiv.org}{arXiv}.",
+    "expected": "Available at \\url{https://github.com/example/repo} and \\href{https://arxiv.org}{arXiv}.",
+    "note": "URLs and hyperlinks preserved for extraction"
+  },
+  {
+    "name": "nested_footnote",
+    "input": "The method\\footnote{Following e.g. the proof of \\citet{parasolver25}.} works well.",
+    "expected": "The method (Following e.g. the proof of \\citet{parasolver25}.) works well.",
+    "note": "Footnote with citation inside — footnote unwrapped, citation preserved"
+  }
+]
