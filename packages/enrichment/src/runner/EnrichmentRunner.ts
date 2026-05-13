@@ -10,7 +10,7 @@
 import { createChildLogger } from '../lib/logger.js';
 import { createOpenAlexClient } from '../sources/openalex.js';
 import { createUnpaywallClient } from '../sources/unpaywall.js';
-import { createCoreClient } from '../sources/core.js';
+import { createCoreClient, type CoreClient } from '../sources/core.js';
 import { createPmcClient } from '../sources/pmc.js';
 import { createRateLimiter, DEFAULT_LIMITS } from '../lib/rate-limiter.js';
 import { runEnrichmentLoop, DEFAULT_LOOP_CONFIG } from './enrichment-loop.js';
@@ -48,9 +48,31 @@ export class EnrichmentRunner {
     const dataDir = opts?.dataDir ?? process.env.RUNNER_DATA_DIR ?? '/mnt/storagebox/arxiv';
     const email = process.env.ENRICHMENT_EMAIL ?? 'hello@openarx.ai';
     const coreApiKey = process.env.CORE_API_KEY;
+    const coreDisabled = process.env.ENRICHMENT_DISABLE_CORE === '1';
 
-    if (!coreApiKey) {
+    if (!coreDisabled && !coreApiKey) {
       throw new Error('CORE_API_KEY is required. Register at https://core.ac.uk/services/api');
+    }
+
+    // When CORE is temporarily disabled (e.g. expired API key, awaiting
+    // renewal) we substitute a stub client that returns the 'not_found'
+    // result shape without making any HTTP request. Downstream aggregation
+    // already handles 'not_found' gracefully. Re-enable by removing the env
+    // flag and restoring CORE_API_KEY.
+    const coreClient: CoreClient = coreDisabled
+      ? {
+          lookup: async (doi: string) => ({
+            status: 'not_found' as const,
+            doi,
+            coreId: null,
+            locations: [],
+            raw: null,
+          }),
+        }
+      : createCoreClient({ apiKey: coreApiKey! });
+
+    if (coreDisabled) {
+      log.warn('CORE source disabled via ENRICHMENT_DISABLE_CORE=1 — stub client in use');
     }
 
     const rateLimiter = createRateLimiter({
@@ -61,7 +83,7 @@ export class EnrichmentRunner {
     this.enrichDeps = {
       openalex: createOpenAlexClient({ email }),
       unpaywall: createUnpaywallClient({ email }),
-      core: createCoreClient({ apiKey: coreApiKey }),
+      core: coreClient,
       pmc: createPmcClient(),
       rateLimiter,
       dataDir,

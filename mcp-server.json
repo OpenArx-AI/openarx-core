@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { randomUUID } from 'node:crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -122,19 +123,26 @@ async function main(): Promise<void> {
   const PORTAL_ISSUER = process.env.PORTAL_OAUTH_ISSUER ?? 'https://portal.openarx.ai';
   const MCP_RESOURCE = process.env.MCP_PUBLIC_URL ?? 'https://mcp.openarx.ai';
 
-  // Authorization Server Metadata — tells clients where to authenticate
-  app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
-    res.json({
-      issuer: PORTAL_ISSUER,
-      authorization_endpoint: `${PORTAL_ISSUER}/oauth/authorize`,
-      token_endpoint: `${PORTAL_ISSUER}/oauth/token`,
-      registration_endpoint: `${PORTAL_ISSUER}/oauth/register`,
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      token_endpoint_auth_methods_supported: ['client_secret_post'],
-      code_challenge_methods_supported: ['S256'],
-      scopes_supported: ['mcp:read'],
-    });
+  // Authorization Server Metadata — proxied from Portal so this endpoint
+  // always reflects the canonical AS configuration without drift. We used to
+  // hardcode this here, but Portal-side updates (new scopes, new auth methods,
+  // service_documentation field, etc.) left this copy stale. Discovery is a
+  // low-frequency event (once per client connection), so an extra localhost
+  // hop to Portal is negligible.
+  app.get('/.well-known/oauth-authorization-server', async (_req: Request, res: Response) => {
+    try {
+      const upstream = await fetch(`${PORTAL_ISSUER}/.well-known/oauth-authorization-server`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      res.status(upstream.status);
+      const contentType = upstream.headers.get('content-type');
+      if (contentType) res.setHeader('Content-Type', contentType);
+      const body = await upstream.text();
+      res.send(body);
+    } catch (err) {
+      console.error('[discovery-proxy] AS metadata fetch failed:', err instanceof Error ? err.message : err);
+      res.status(502).json({ error: 'discovery_proxy_error' });
+    }
   });
 
   // OAuth proxy: Claude.ai sends OAuth requests to MCP domain instead of Portal.
@@ -189,13 +197,20 @@ async function main(): Promise<void> {
     }
   });
 
-  // Protected Resource Metadata — tells clients this resource requires OAuth2
-  // Also handles path-specific variant (Inspector appends MCP path: /.well-known/oauth-protected-resource/v1/mcp)
+  // Protected Resource Metadata — tells clients this resource requires OAuth2.
+  // Also handles path-specific variant (Inspector appends MCP path:
+  // /.well-known/oauth-protected-resource/v1/mcp).
+  //
+  // scopes_supported lists the scopes a client can request to access THIS
+  // resource (per RFC 9728 §3.2.1). We have three production profiles —
+  // consumer (/v1) requires mcp:read, publisher (/pub) requires mcp:publish,
+  // governance (/gov) requires mcp:governance. All three must be advertised
+  // so clients know they can request the broader scopes.
   app.use('/.well-known/oauth-protected-resource', (_req: Request, res: Response) => {
     res.json({
       resource: MCP_RESOURCE,
       authorization_servers: [PORTAL_ISSUER],
-      scopes_supported: ['mcp:read'],
+      scopes_supported: ['mcp:read', 'mcp:publish', 'mcp:governance'],
       bearer_methods_supported: ['header'],
     });
   });
@@ -343,8 +358,160 @@ async function main(): Promise<void> {
 
   // ── Profile-routed MCP endpoint (Streamable HTTP, stateless) ──
 
-  app.post('/:profile/mcp', express.json(), async (req: Request, res: Response) => {
+  // Unsupported HTTP methods on /:profile/mcp must return 405 Method Not
+  // Allowed + Allow header per RFC 9110 §15.5.5 — not 404 (which would imply
+  // the route doesn't exist at all). Mounted BEFORE the per-method handlers
+  // so unknown methods short-circuit before auth / rate-limit / body-parser.
+  // OPTIONS is already handled upstream by the CORS middleware. openarx-d30n /
+  // QA WAVE2-002.
+  app.all('/:profile/mcp', (req: Request, res: Response, next: NextFunction) => {
+    if (req.method === 'POST' || req.method === 'OPTIONS') {
+      next();
+      return;
+    }
+    res.set('Allow', 'POST, OPTIONS');
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: `Method ${req.method} not allowed` },
+      id: null,
+    });
+  });
+
+  // Content-Type guard: reject non-JSON before express.json() / envelope
+  // validator run. Previously the SDK transport itself returned 415, but my
+  // envelope validator (added for WAVE2-001) now intercepts the empty-body
+  // case first and emits -32600 — wrong, distinguishable from envelope shape
+  // errors. Explicit 415 + -32000 here preserves spec-correct behavior.
+  // openarx-1ozx / QA WAVE2-004.
+  const checkContentType = (req: Request, res: Response, next: NextFunction): void => {
+    const ct = String(req.headers['content-type'] ?? '').toLowerCase();
+    if (!ct.includes('application/json')) {
+      res.status(415).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Unsupported Media Type: Content-Type must be application/json' },
+        id: null,
+      });
+      return;
+    }
+    next();
+  };
+
+  // Route-scoped error handler: body-parser throws SyntaxError on malformed
+  // JSON. Express's default would return an HTML 400 page; JSON-RPC clients
+  // expect a JSON-RPC envelope with code -32700. Scoped to the MCP route only
+  // so other endpoints (Portal HTML, internal API) keep their default behaviour.
+  // openarx-1fcy / QA WAVE2-003.
+  const handleJsonParseError = (
+    err: unknown,
+    _req: Request,
+    res: Response,
+    next: NextFunction,
+  ): void => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32700, message: 'Parse error' },
+        id: null,
+      });
+      return;
+    }
+    next(err);
+  };
+
+  // JSON-RPC envelope validator: valid JSON but malformed envelope shape
+  // (missing method, wrong jsonrpc value, etc.) must be reported as -32600
+  // Invalid Request per JSON-RPC 2.0 §5.1 — not -32700 (which is reserved for
+  // genuine parse failures). openarx-wc9c / QA WAVE2-001.
+  const validateJsonRpcEnvelope = (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): void => {
+    const sendInvalidRequest = (): void => {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32600, message: 'Invalid Request' },
+        id: null,
+      });
+    };
+    const checkOne = (msg: unknown): boolean => {
+      if (msg === null || typeof msg !== 'object') return false;
+      const m = msg as Record<string, unknown>;
+      if (m.jsonrpc !== '2.0') return false;
+      if (typeof m.method !== 'string') return false;
+      if ('id' in m && m.id !== null && typeof m.id !== 'string' && typeof m.id !== 'number') {
+        return false;
+      }
+      return true;
+    };
+    const body = req.body;
+    if (Array.isArray(body)) {
+      if (body.length === 0) {
+        sendInvalidRequest();
+        return;
+      }
+      for (const msg of body) {
+        if (!checkOne(msg)) {
+          sendInvalidRequest();
+          return;
+        }
+      }
+    } else if (body && typeof body === 'object') {
+      if (!checkOne(body)) {
+        sendInvalidRequest();
+        return;
+      }
+    } else {
+      sendInvalidRequest();
+      return;
+    }
+    next();
+  };
+
+  app.post('/:profile/mcp', checkContentType, express.json(), handleJsonParseError, validateJsonRpcEnvelope, async (req: Request, res: Response) => {
     requestCount++;
+
+    // SDK's StreamableHTTPServerTransport requires Accept to include BOTH
+    // application/json AND text/event-stream (MCP spec 2025-03-26+). Registry
+    // bots (Smithery, etc.) and many JSON-RPC clients send only
+    // application/json, which produces a 406 with a non-JSON-RPC body — clients
+    // misread that as serverInfo:null. Silently augment Accept here so the SDK
+    // accepts the request and responds in SSE format. Modern JSON-RPC libraries
+    // parse the SSE envelope and extract the JSON payload.
+    //
+    // Note: must mutate BOTH `req.headers` (for any Express middleware that
+    // consults it) AND `req.rawHeaders` (the array @hono/node-server reads
+    // when SDK's StreamableHTTPServerTransport converts the Node request to
+    // a Web Standard Request internally — see hono's request.js, which
+    // iterates `incoming.rawHeaders` and ignores `incoming.headers`).
+    //
+    // openarx-v9qh / QA P0-1.
+    const accept = String(req.headers.accept ?? '');
+    const hasJson = accept.includes('application/json');
+    const hasSse = accept.includes('text/event-stream');
+    if (!hasJson || !hasSse) {
+      // Build augmented header preserving any other values the client sent
+      const additions: string[] = [];
+      if (!hasJson) additions.push('application/json');
+      if (!hasSse) additions.push('text/event-stream');
+      const augmented = accept.length > 0
+        ? `${accept}, ${additions.join(', ')}`
+        : additions.join(', ');
+      req.headers.accept = augmented;
+      const raw = req.rawHeaders;
+      let found = false;
+      for (let i = 0; i < raw.length; i += 2) {
+        if (raw[i].toLowerCase() === 'accept') {
+          raw[i + 1] = augmented;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        raw.push('Accept', augmented);
+      }
+    }
+
     const profileId = String(req.params.profile);
     const profile = getProfile(profileId);
 
@@ -368,9 +535,20 @@ async function main(): Promise<void> {
       return;
     }
 
+    // Hybrid: we're architecturally stateless (a fresh transport per request,
+    // no in-memory session state we care about), but spec-strict 2025-03-26+
+    // MCP clients expect a Mcp-Session-Id header on the initialize response.
+    // Setting sessionIdGenerator to a UUID generator makes the SDK include the
+    // header, then we patch validateSession to a no-op so subsequent requests
+    // (which the client may send with or without Mcp-Session-Id) are not
+    // rejected for missing/mismatched session ID. openarx-hjek / QA P1-1.
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless
+      sessionIdGenerator: () => randomUUID(),
     });
+    const internalTransport = (transport as unknown as {
+      _webStandardTransport: { validateSession: () => undefined };
+    })._webStandardTransport;
+    internalTransport.validateSession = () => undefined;
 
     const server = new McpServer({
       name: `openarx-${profile.id}`,
