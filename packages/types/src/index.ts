@@ -310,7 +310,7 @@ export interface ChunkContext {
   totalChunks: number;
   summary?: string;
   keyConcept?: string;
-  contentType?: string;    // 'theoretical' | 'methodology' | 'experimental' | 'results' | 'survey' | 'background' | 'other'
+  contentType?: string;    // 'abstract' | 'theoretical' | 'methodology' | 'experimental' | 'results' | 'survey' | 'background' | 'other'
   entities?: string[];     // key named entities: method names, dataset names, metric names
   selfContained?: boolean; // true if chunk can be understood without surrounding context
 }
@@ -430,6 +430,18 @@ export interface ModelOptions {
   maxTokens?: number;
   temperature?: number;
   model?: string;
+  /**
+   * Force structured JSON output (Gemini / Vertex AI). When set, the model
+   * is constrained to produce JSON conforming to `responseSchema` instead
+   * of free text. Eliminates "model returned almost-valid JSON" parse
+   * failures and lets the schema enforce required fields.
+   *
+   * Set this together with `responseSchema`. Typically:
+   *   responseMimeType: 'application/json'
+   *   responseSchema: { type: 'OBJECT', required: [...], properties: {...} }
+   */
+  responseMimeType?: string;
+  responseSchema?: unknown;
 }
 
 export interface ModelResponse {
@@ -530,4 +542,90 @@ export interface PipelineContext {
 export interface PipelineStep<TIn, TOut> {
   name: string;
   process(input: TIn, context: PipelineContext): Promise<TOut>;
+}
+
+// ── Multi-source ingest (compliance epic openarx-7nv) ─────────────────────
+//
+// document_locations stores all known locations of a document across
+// different sources (arxiv, unpaywall, openalex, core, pmc, ...). Each
+// row represents "we know this document is at <source> with <license> and
+// <version>, downloaded file is at <file_path>". The primary row (is_primary=true)
+// records the source we originally ingested from. Schema: see
+// packages/api/src/db/migrations/021_source_registry_document_locations.sql.
+// Architecture: see docs/multi_source_ingest.md.
+
+/** How the license value for this location was determined. */
+export type LicenseSource = 'document' | 'source_default' | 'unknown';
+
+/** Which version of the work this location represents. */
+export type LocationVersion =
+  | 'preprint'
+  | 'accepted'
+  | 'published'
+  | 'oa_copy';
+
+/** What kind of host serves this location. */
+export type HostType =
+  | 'repository'   // arxiv, institutional repos
+  | 'publisher'    // journal sites
+  | 'aggregator';  // CORE, OpenAlex
+
+export interface DocumentLocation {
+  id: string;
+  documentId: string;
+  sourceId: string;                  // FK to source_registry.source_id
+  sourceIdentifier: string | null;   // arxivId, pmcid, doi, openalex_id, etc.
+  sourceUrl: string | null;
+  licenseRaw: string | null;         // license string as provided by source
+  licenseCanonical: string | null;   // normalized SPDX identifier
+  licenseSource: LicenseSource;
+  version: LocationVersion | null;
+  isPrimary: boolean;                // exactly one true per document_id (enforced by partial unique index)
+  isOa: boolean;
+  hostType: HostType | null;
+  filePath: string | null;           // local disk path if downloaded; NULL if URL-only
+  metadata: Record<string, unknown>;
+  fetchedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface SourceRegistry {
+  sourceId: string;
+  displayName: string;
+  baseLicense: string | null;        // default license fallback for documents from this source
+  enabled: boolean;
+  config: Record<string, unknown>;   // API endpoints, rate limits, extraction rules
+  createdAt: Date;
+}
+
+export interface DocumentLocationStore {
+  /** Insert a new location row. Returns the persisted row (with id + createdAt). */
+  save(location: Omit<DocumentLocation, 'id' | 'createdAt'>): Promise<DocumentLocation>;
+
+  /** All known locations for a document, primary first, then by created_at ascending. */
+  getByDocumentId(documentId: string): Promise<DocumentLocation[]>;
+
+  /** The is_primary=true location for a document, or null if none. */
+  getPrimary(documentId: string): Promise<DocumentLocation | null>;
+
+  /**
+   * The best OA location with a downloaded file. Used by the canServeFile
+   * output gate (openarx-p51d). Returns null if no servable OA copy exists.
+   * Selection order: is_primary=true first, then earliest created_at.
+   */
+  findServableLocation(documentId: string): Promise<DocumentLocation | null>;
+
+  /** Delete all locations for a document. Returns number of rows deleted. */
+  deleteByDocumentId(documentId: string): Promise<number>;
+}
+
+export interface SourceRegistryStore {
+  /** Get a single source by id. Cached in memory after first load. */
+  getSource(sourceId: string): Promise<SourceRegistry | null>;
+
+  /** All sources where enabled=true. Cached. */
+  listEnabled(): Promise<SourceRegistry[]>;
+
+  /** Reload cache from DB. Use after source_registry edits. */
+  refresh(): Promise<void>;
 }

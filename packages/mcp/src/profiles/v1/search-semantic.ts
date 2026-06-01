@@ -44,7 +44,7 @@ export function registerSearchSemantic(server: McpServer, ctx: AppContext): void
         'Filter chunks by type. Use [methodology] for HOW researchers approach a problem; [results] for OUTCOMES; [survey, background] for context',
       ),
       entities: z.array(z.string()).optional().describe(
-        'Filter chunks mentioning specific entities (method names like "BERT", datasets like "SQuAD", metrics like "BLEU"). Case-insensitive match',
+        'Soft filter by entity (method names like "BERT", datasets like "SQuAD", metrics like "BLEU"), case-insensitive. Matching chunks rank first; chunks with no entities recorded (legacy gap) fall to the bottom rather than being dropped; chunks with non-matching entities are excluded.',
       ),
       diversifyBy: z.enum(['document', 'keyConcept', 'contentType']).default('document').describe(
         "'document' (default): max N chunks per paper. 'keyConcept': diversify by main idea. 'contentType': mix methodology/results/etc.",

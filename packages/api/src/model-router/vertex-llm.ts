@@ -41,15 +41,19 @@ export interface VertexLlmConfig {
 }
 
 interface VertexResponse {
-  candidates: Array<{
+  candidates?: Array<{
     content: { parts: Array<{ text: string }> };
     finishReason?: string;
   }>;
-  usageMetadata: {
+  usageMetadata?: {
     promptTokenCount: number;
     candidatesTokenCount: number;
     totalTokenCount: number;
   };
+  // Present (instead of candidates) when the prompt is blocked by a safety /
+  // recitation filter — Vertex returns promptFeedback with a blockReason and
+  // NO candidates array.
+  promptFeedback?: { blockReason?: string; safetyRatings?: unknown };
 }
 
 interface ServiceAccountKey {
@@ -181,8 +185,20 @@ export class VertexLlm {
       `vertex-${task}`,
     );
 
-    const text = result.candidates[0]?.content?.parts?.[0]?.text ?? '';
-    const finishReason = result.candidates[0]?.finishReason;
+    // Guard: Vertex omits `candidates` entirely when the prompt is blocked by
+    // a safety/recitation filter (returns promptFeedback.blockReason instead).
+    // `result.candidates[0]` without this guard throws "Cannot read properties
+    // of undefined (reading '0')" — observed on a handful of chunks (e.g.
+    // defamation-related text). Treat a candidate-less response as empty output
+    // with a synthetic finishReason so callers fail gracefully instead of
+    // crashing the whole batch.
+    if (!result.candidates || result.candidates.length === 0) {
+      const blockReason = result.promptFeedback?.blockReason;
+      console.warn(`[vertex:${this.authMode}] No candidates in response (blockReason=${blockReason ?? 'unknown'}), model=${model}`);
+    }
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    const finishReason = result.candidates?.[0]?.finishReason
+      ?? (!result.candidates?.length ? `BLOCKED:${result.promptFeedback?.blockReason ?? 'no_candidates'}` : undefined);
     const inputTokens = result.usageMetadata?.promptTokenCount ?? 0;
     const outputTokens = result.usageMetadata?.candidatesTokenCount ?? 0;
     const rates = COST_PER_MILLION[model] ?? { input: 0.075, output: 0.30 };
@@ -226,9 +242,32 @@ export class VertexLlm {
           temperature: options?.temperature ?? 0,
           // Disable thinking/reasoning — not needed for chunking/enrichment tasks.
           // Thinking tokens consume output budget and cause MAX_TOKENS truncation.
+          //
+          // For Gemini 3 family (current default model gemini-3-flash-preview),
+          // `thinkingBudget: 0` is a NO-OP — the model thinks anyway and the
+          // budget field is silently ignored. Only `thinkingLevel` (Gemini 3
+          // syntax) actually disables thinking.
+          //
+          // Cannot set both fields together — API rejects with 400 ("thinking
+          // budget and thinking level are not supported together"). 'minimal'
+          // is the lowest accepted value ('off' returns 400 invalid value).
+          //
+          // Empirical (2026-05-24): on identical math-heavy prompt with
+          // gemini-3-flash-preview, thinkingBudget=0 took 68s elapsed,
+          // thinkingLevel=minimal took 12s (5× faster). The 68s difference
+          // was spent on hidden thinking that consumed the output budget on
+          // large prompts and caused MAX_TOKENS truncation.
           thinkingConfig: {
-            thinkingBudget: 0,
+            thinkingLevel: 'minimal',
           },
+          // Structured output: when both fields are set the model is
+          // constrained to emit JSON matching responseSchema. Eliminates the
+          // class of silent parse failures observed in openarx-dlv6 (Gemini
+          // sometimes returned almost-valid JSON, parseResponse caught the
+          // exception, and the fallback paragraph splitter produced chunks
+          // with null meta).
+          ...(options?.responseMimeType ? { responseMimeType: options.responseMimeType } : {}),
+          ...(options?.responseSchema ? { responseSchema: options.responseSchema } : {}),
         },
       }),
     });
@@ -238,6 +277,30 @@ export class VertexLlm {
       throw new Error(`Vertex AI failed (${resp.status}): ${body.slice(0, 200)}`);
     }
 
-    return (await resp.json()) as VertexResponse;
+    // Fetch text then parse so we can recover from a known Vertex serialization
+    // quirk: when the LLM emits a lone Unicode surrogate codepoint, Vertex
+    // sometimes encodes it literally (e.g. `\uD83D` with no pair) inside the
+    // outer response. V8 JSON.parse rejects that per the ES2017 spec with
+    // "unsupported Unicode escape sequence" — failing every caller (chunker,
+    // backfill, enrichment) on otherwise-valid responses. Fast-path stays
+    // JSON.parse; only on failure do we sanitize surrogates (→ U+FFFD) and
+    // retry. Idempotent for well-formed responses.
+    const text = await resp.text();
+    try {
+      return JSON.parse(text) as VertexResponse;
+    } catch (e1) {
+      const sanitized = text.replace(/\\u([0-9a-fA-F]{4})/g, (match, hex: string) => {
+        const cp = parseInt(hex, 16);
+        if (cp >= 0xd800 && cp <= 0xdfff) return '\\ufffd';
+        return match;
+      });
+      try {
+        return JSON.parse(sanitized) as VertexResponse;
+      } catch (e2) {
+        const msg1 = (e1 as Error).message;
+        const msg2 = (e2 as Error).message;
+        throw new Error(`Vertex response parse failed: ${msg1} (sanitized retry: ${msg2}) head="${text.slice(0, 120)}" tail="${text.slice(-120)}"`);
+      }
+    }
   }
 }

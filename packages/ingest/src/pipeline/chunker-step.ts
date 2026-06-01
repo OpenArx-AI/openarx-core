@@ -42,8 +42,245 @@ interface ChunkJson {
 }
 
 const VALID_CONTENT_TYPES = new Set([
-  'theoretical', 'methodology', 'experimental', 'results', 'survey', 'background', 'other',
+  'theoretical', 'methodology', 'experimental', 'results', 'survey', 'background', 'abstract', 'other',
 ]);
+
+/**
+ * Strip bytes/sequences that Postgres rejects in TEXT columns.
+ *
+ * Origin: with structured-output schema enforcement (openarx-dlv6), Gemini
+ * occasionally emits NUL bytes (U+0000) and other invalid-in-PG character
+ * sequences inside string fields. Prior to schema enforcement these landed
+ * inside JSON that JSON.parse couldn't read, fell into paragraph-splitter
+ * fallback, and never reached the database. With schema, JSON.parse succeeds
+ * → the bytes propagate → PG INSERT fails with one of:
+ *   - "invalid byte sequence for encoding UTF8: 0x00"
+ *   - "unsupported Unicode escape sequence"
+ *
+ * Sanitization removes:
+ *   - U+0000 NULL bytes (PG TEXT cannot store these)
+ *   - Lone high-surrogates not followed by low (invalid UTF-16 in JSON)
+ *   - Lone low-surrogates without preceding high
+ *   - Other control chars except \t \n \r (cosmetic, not strictly required)
+ */
+export function sanitizeForPg(s: string): string {
+  // PG rejects two distinct things; treat them with the right primitive:
+  //
+  //   (1) "unsupported Unicode escape sequence" — lone surrogates (D800-DFFF
+  //       not in a valid pair) that can't be encoded as valid UTF-8.
+  //       WHATWG's TextEncoder.encode replaces them with U+FFFD (replacement
+  //       char) per spec, giving us a tested standard implementation rather
+  //       than a hand-rolled char-by-char loop.
+  //
+  //   (2) "invalid byte sequence for encoding UTF8: 0x00" — NUL byte (U+0000).
+  //       NUL is a valid Unicode codepoint, so TextEncoder won't touch it;
+  //       it's just a PG TEXT column restriction. Strip explicitly.
+  const validUtf8 = new TextDecoder('utf-8').decode(new TextEncoder().encode(s));
+  return validUtf8.replace(/\u0000/g, '');
+}
+
+function sanitizeChunkJson(c: ChunkJson): ChunkJson {
+  return {
+    ...c,
+    section: typeof c.section === 'string' ? sanitizeForPg(c.section) : c.section,
+    text: typeof c.text === 'string' ? sanitizeForPg(c.text) : c.text,
+    summary: typeof c.summary === 'string' ? sanitizeForPg(c.summary) : c.summary,
+    key_concept: typeof c.key_concept === 'string' ? sanitizeForPg(c.key_concept) : c.key_concept,
+    content_type: typeof c.content_type === 'string' ? sanitizeForPg(c.content_type) : c.content_type,
+    entities: Array.isArray(c.entities)
+      ? c.entities.filter((e): e is string => typeof e === 'string').map(sanitizeForPg)
+      : c.entities,
+  };
+}
+
+function sanitizeMetadata(m: Partial<ExtractedMetadata> | undefined): ExtractedMetadata {
+  return {
+    code_urls: Array.isArray(m?.code_urls) ? m!.code_urls.filter((u): u is string => typeof u === 'string').map(sanitizeForPg) : [],
+    dataset_mentions: Array.isArray(m?.dataset_mentions) ? m!.dataset_mentions.filter((d): d is string => typeof d === 'string').map(sanitizeForPg) : [],
+    benchmark_mentions: Array.isArray(m?.benchmark_mentions) ? m!.benchmark_mentions.filter((b): b is string => typeof b === 'string').map(sanitizeForPg) : [],
+  };
+}
+
+/**
+ * Structured-output schema for the chunker LLM call (openarx-dlv6).
+ *
+ * Passed via ModelOptions.responseSchema with responseMimeType=application/json.
+ * The Vertex AI runtime constrains the model to emit JSON matching this shape
+ * and fails the request if the model cannot comply — which eliminates the
+ * class of silent parse failures previously seen (Gemini returning
+ * almost-valid JSON that crashed JSON.parse and fell back to paragraph
+ * splitting with null meta).
+ *
+ * Required per-chunk fields: section, text, summary, key_concept,
+ * content_type, self_contained. `entities` is intentionally NOT required
+ * (legitimately empty for non-entity-bearing content).
+ *
+ * content_type uses an enum constraint matching VALID_CONTENT_TYPES (minus
+ * 'abstract' — abstract chunks bypass this path).
+ *
+ * Lab experiment (2026-05-23, 70 sections × 4 prompt variants) confirmed
+ * this schema lifts parse-success from ~43% (current prompt, no schema)
+ * to ~90% with no quality regression and no cost increase.
+ */
+const CHUNKER_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  required: ['chunks'],
+  properties: {
+    chunks: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        required: ['section', 'text', 'summary', 'key_concept', 'content_type', 'self_contained'],
+        properties: {
+          section: { type: 'STRING' },
+          text: { type: 'STRING' },
+          summary: { type: 'STRING' },
+          key_concept: { type: 'STRING' },
+          content_type: {
+            type: 'STRING',
+            enum: ['theoretical', 'methodology', 'experimental', 'results', 'survey', 'background', 'other'],
+          },
+          entities: { type: 'ARRAY', items: { type: 'STRING' } },
+          self_contained: { type: 'BOOLEAN' },
+        },
+      },
+    },
+    metadata: {
+      type: 'OBJECT',
+      properties: {
+        code_urls: { type: 'ARRAY', items: { type: 'STRING' } },
+        dataset_mentions: { type: 'ARRAY', items: { type: 'STRING' } },
+        benchmark_mentions: { type: 'ARRAY', items: { type: 'STRING' } },
+      },
+    },
+  },
+};
+
+/**
+ * Diagnostic logging for the null-context investigation (openarx-3me1 follow-up).
+ * Gated by env var CHUNKER_DIAG_LOG=1 — off by default in production, enabled
+ * during controlled small ingests. Emits one structured line per chunk
+ * creation event and per LLM batch response, so we can later aggregate by
+ * pathId × meta-shape and see where null context originates.
+ */
+const CHUNKER_DIAG_LOG = process.env.CHUNKER_DIAG_LOG === '1';
+
+type ChunkCreationPath =
+  | 'abstract-heuristic'        // chunker-step.ts createAbstractChunk path
+  | 'llm-batch-success'         // line 280 — successful LLM call, chunks have meta
+  | 'llm-retry-success'         // line 233 — retry with fallback model succeeded
+  | 'fallback-after-retry-truncate'  // line 248 — retry also MAX_TOKENS → paragraph split
+  | 'fallback-after-exception'; // line 294 — exception in LLM path → paragraph split
+
+interface ChunkDiagCtx {
+  docId: string;
+  sourceId?: string;
+  section: string;
+  pos: number;
+  contentLen: number;
+  meta?: ChunkJson | null;
+}
+
+interface DiagLogger {
+  info(msg: string, data?: unknown): void;
+}
+
+function diagChunkCreated(logger: DiagLogger, path: ChunkCreationPath, ctx: ChunkDiagCtx): void {
+  if (!CHUNKER_DIAG_LOG) return;
+  const meta = ctx.meta;
+  logger.info('diag.chunk_created', {
+    diag: 'chunk_created',
+    path,
+    docId: ctx.docId,
+    sourceId: ctx.sourceId,
+    section: ctx.section.slice(0, 80),
+    position: ctx.pos,
+    contentLen: ctx.contentLen,
+    hasMeta: meta != null,
+    summaryPresent: !!meta?.summary,
+    keyConceptPresent: !!meta?.key_concept,
+    contentTypeRaw: meta?.content_type ?? null,
+    contentTypeValid: !!(meta?.content_type && VALID_CONTENT_TYPES.has(meta.content_type)),
+    selfContainedPresent: typeof meta?.self_contained === 'boolean',
+    entitiesCount: Array.isArray(meta?.entities) ? meta.entities.length : 0,
+  });
+}
+
+function diagLlmResponse(
+  logger: DiagLogger,
+  sourceId: string,
+  batchSize: number,
+  parsedChunks: ChunkJson[],
+  validatedCount: number,
+): void {
+  if (!CHUNKER_DIAG_LOG) return;
+  const summaryCount = parsedChunks.filter(c => !!c.summary).length;
+  const keyConceptCount = parsedChunks.filter(c => !!c.key_concept).length;
+  const validCtCount = parsedChunks.filter(c => c.content_type && VALID_CONTENT_TYPES.has(c.content_type)).length;
+  const invalidCtValues = [...new Set(parsedChunks
+    .map(c => c.content_type)
+    .filter((ct): ct is string => !!ct && !VALID_CONTENT_TYPES.has(ct)))];
+  logger.info('diag.llm_response_parsed', {
+    diag: 'llm_response_parsed',
+    sourceId,
+    batchSize,
+    chunksReturned: parsedChunks.length,
+    chunksAfterValidation: validatedCount,
+    chunksWithSummary: summaryCount,
+    chunksWithKeyConcept: keyConceptCount,
+    chunksWithValidContentType: validCtCount,
+    invalidContentTypeValues: invalidCtValues,
+  });
+}
+
+/**
+ * Heuristic context for abstract chunks. Abstract chunks bypass the LLM
+ * enrichment step (LLM is overkill for a self-contained summary), so we
+ * populate the predictable fields directly:
+ *   - contentType: 'abstract'  (was undefined → null in API responses)
+ *   - selfContained: true      (abstracts are standalone by design)
+ *   - summary: first sentence  (cheap proxy; the abstract IS already a summary)
+ *
+ * keyConcept and entities require LLM and are intentionally left undefined.
+ * Clients should treat absence as "not extracted" rather than "no concept".
+ */
+export function buildAbstractChunkContext(
+  abstract: string,
+  documentTitle: string,
+  totalChunks: number,
+): {
+  documentTitle: string;
+  sectionName: string;
+  sectionPath: string;
+  positionInDocument: number;
+  totalChunks: number;
+  summary: string;
+  contentType: 'abstract';
+  selfContained: true;
+} {
+  return {
+    documentTitle,
+    sectionName: 'Abstract',
+    sectionPath: 'Abstract',
+    positionInDocument: 0,
+    totalChunks,
+    summary: firstSentence(abstract, 250),
+    contentType: 'abstract',
+    selfContained: true,
+  };
+}
+
+function firstSentence(text: string, maxChars: number): string {
+  const trimmed = text.trim().replace(/\s+/g, ' ');
+  // Pull first sentence end (. ! ?) followed by space or EOL. If the LaTeX/PDF
+  // parser left no terminal punctuation, fall back to the whole text capped.
+  const match = trimmed.match(/^[\s\S]*?[.!?](?=\s|$)/);
+  let candidate = match ? match[0] : trimmed;
+  if (candidate.length > maxChars) {
+    candidate = candidate.slice(0, maxChars).trim() + '...';
+  }
+  return candidate;
+}
 
 interface ExtractedMetadata {
   code_urls: string[];
@@ -82,10 +319,18 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
     const chunks: Chunk[] = [];
     let position = 0;
 
-    // Abstract → single chunk (already self-contained, skip LLM)
+    // Abstract → single chunk (already self-contained, skip LLM enrichment but
+    // populate context fields via buildAbstractChunkContext heuristic so
+    // downstream clients (search, find_evidence, get_document) see the same
+    // shape as enriched body chunks instead of all-null context fields
+    // (PF-003).
     if (parsed.abstract?.trim()) {
-      chunks.push(this.createChunk(document.id, 'Abstract', parsed.abstract, position++, 'Abstract'));
-      logger.debug('Abstract added as chunk');
+      diagChunkCreated(logger, 'abstract-heuristic', {
+        docId: document.id, sourceId: document.sourceId, section: 'Abstract',
+        pos: position, contentLen: parsed.abstract.length, meta: null,
+      });
+      chunks.push(this.createAbstractChunk(document.id, parsed.abstract, position++, ''));
+      logger.debug('Abstract added as chunk (heuristic context populated)');
     }
 
     // Flatten sections
@@ -109,7 +354,34 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
     const batches = this.groupIntoBatches(substantive);
     logger.info(`Chunking ${nonEmpty.length} sections in ${batches.length} batches`);
 
-    const chunkerOptions = context.config.chunkerOptions as ModelOptions | undefined;
+    // Base chunking call: NO responseSchema parameter.
+    //
+    // The `responseSchema` PARAMETER auto-enables Gemini-3 thinking (openarx-cmnj),
+    // which on math/LaTeX-dense batches inflates output to the 65K MAX_TOKENS cap
+    // (~$1.46/doc vs ~$0.06 on light docs; 60% of heavy batches truncated). The
+    // schema is still fully described in the prompt (buildPrompt MUST-markers),
+    // which keeps meta ~100% complete — verified on a 5-doc heavy / 8-doc light
+    // experiment (2026-06-01). temperature=1 (Gemini-3 recommended) minimised
+    // JSON split-failures in that test.
+    //
+    // The trade-off the schema PARAMETER was hiding: ~15-25% of heavy LaTeX
+    // batches emit an invalid JSON escape (single backslash on a `\command`,
+    // finishReason=STOP). We detect that (hasValidChunkJson) and retry the batch
+    // on gemini-3.1-pro-preview WITH the schema (correct JSON serialisation of
+    // LaTeX-heavy text). Backslash preservation on the no-schema path measured
+    // 98.8% with zero control-char corruption, so successfully-parsed chunks are
+    // safe; only the hard parse-failures pay the pro retry.
+    const callerOptions = context.config.chunkerOptions as ModelOptions | undefined;
+    const chunkerOptions: ModelOptions = {
+      temperature: 1,
+      ...(callerOptions ?? {}),
+    };
+    // Schema-constrained options for the correctness-retry only (pro fallback).
+    const retrySchemaOptions: ModelOptions = {
+      ...chunkerOptions,
+      responseMimeType: 'application/json',
+      responseSchema: CHUNKER_RESPONSE_SCHEMA,
+    };
 
     // Track where each batch's chunks start in the array
     const batchBounds: number[] = [];
@@ -144,17 +416,26 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
 
         // Per-batch output validation
         const outputRatio = response.inputTokens > 0 ? response.outputTokens / response.inputTokens : 1;
-        if (response.finishReason === 'MAX_TOKENS') {
-          // Fallback: retry with a more capable model before paragraph splitting
+        // Trigger the pro correctness-retry on EITHER:
+        //  - MAX_TOKENS (truncated output — rare without the schema param), OR
+        //  - unparseable JSON (the no-schema LaTeX-escape failure mode,
+        //    finishReason=STOP but JSON.parse rejects the bad `\command` escape).
+        // The retry uses the SCHEMA (retrySchemaOptions) so pro emits correctly
+        // escaped JSON for the LaTeX-heavy text the base call tripped on.
+        const baseParseable = this.hasValidChunkJson(response.text);
+        if (response.finishReason === 'MAX_TOKENS' || !baseParseable) {
+          // Fallback: retry with a more capable model (schema-constrained) before
+          // paragraph splitting.
           const fallbackModel = 'gemini-3.1-pro-preview';
-          logger.warn(`LLM output truncated (MAX_TOKENS) for batch of ${batch.length} sections (${response.inputTokens} in → ${response.outputTokens} out). Retrying with ${fallbackModel}...`);
+          const reason = response.finishReason === 'MAX_TOKENS' ? 'MAX_TOKENS' : 'unparseable-json';
+          logger.warn(`Chunking base call needs retry (${reason}) for batch of ${batch.length} sections (${response.inputTokens} in → ${response.outputTokens} out). Retrying with ${fallbackModel} + schema...`);
 
-          // Debug log: write prompt + responses for truncated batches
+          // Debug log: write prompt + responses for failed batches
           this.debugLogBatch(document.sourceId, prompt, response.text, response, null, null);
 
           try {
             const retryStart = performance.now();
-            const retryResponse = await modelRouter.complete('chunking', prompt, { ...chunkerOptions, model: fallbackModel });
+            const retryResponse = await modelRouter.complete('chunking', prompt, { ...retrySchemaOptions, model: fallbackModel });
             const retryDurationMs = Math.round(performance.now() - retryStart);
 
             await costTracker.record('chunking', retryResponse.model, retryResponse.provider ?? 'openrouter',
@@ -163,8 +444,8 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
             // Debug log: fallback response
             this.debugLogBatch(document.sourceId, null, null, null, retryResponse.text, retryResponse);
 
-            if (retryResponse.finishReason === 'MAX_TOKENS') {
-              logger.warn(`Fallback model ${fallbackModel} also truncated (${retryResponse.outputTokens} out). Falling back to paragraph splitting.`);
+            if (retryResponse.finishReason === 'MAX_TOKENS' || !this.hasValidChunkJson(retryResponse.text)) {
+              logger.warn(`Fallback model ${fallbackModel} did not yield parseable chunks (finishReason=${retryResponse.finishReason}, ${retryResponse.outputTokens} out). Falling back to paragraph splitting.`);
             } else {
               logger.info(`Fallback model ${fallbackModel} succeeded (${retryResponse.outputTokens} out, finishReason=${retryResponse.finishReason})`);
               // Use the retry response instead — parse it and continue normally
@@ -175,8 +456,13 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
               const retryPathByName = new Map<string, string>();
               for (const s of batch) { retryPathByName.set(s.name, s.path); retryPathByName.set(s.path, s.path); }
               const { validated: retryValidated } = this.enforceSectionBoundaries(retryChunks, batch);
+              diagLlmResponse(logger, document.sourceId, batch.length, retryChunks, retryValidated.length);
               for (const item of retryValidated) {
                 const path = retryPathByName.get(item.section) ?? item.section;
+                diagChunkCreated(logger, 'llm-retry-success', {
+                  docId: document.id, sourceId: document.sourceId, section: item.section,
+                  pos: position, contentLen: item.text.length, meta: item,
+                });
                 chunks.push(this.createChunk(document.id, item.section, item.text, position++, path, item));
               }
               continue; // success — skip to next batch
@@ -192,6 +478,10 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
           for (const section of batch) {
             const paragraphs = splitter(section.content);
             for (const para of paragraphs) {
+              diagChunkCreated(logger, 'fallback-after-retry-truncate', {
+                docId: document.id, sourceId: document.sourceId, section: section.name,
+                pos: position, contentLen: para.length, meta: null,
+              });
               chunks.push(this.createChunk(document.id, section.name, para, position++, section.path));
             }
           }
@@ -222,8 +512,13 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
           pathByName.set(s.path, s.path);
         }
 
+        diagLlmResponse(logger, document.sourceId, batch.length, parsedChunks, validated.length);
         for (const item of validated) {
           const path = pathByName.get(item.section) ?? item.section;
+          diagChunkCreated(logger, 'llm-batch-success', {
+            docId: document.id, sourceId: document.sourceId, section: item.section,
+            pos: position, contentLen: item.text.length, meta: item,
+          });
           chunks.push(this.createChunk(document.id, item.section, item.text, position++, path, item));
         }
 
@@ -238,6 +533,10 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
         for (const section of batch) {
           const paragraphs = splitter(section.content);
           for (const para of paragraphs) {
+            diagChunkCreated(logger, 'fallback-after-exception', {
+              docId: document.id, sourceId: document.sourceId, section: section.name,
+              pos: position, contentLen: para.length, meta: null,
+            });
             chunks.push(this.createChunk(document.id, section.name, para, position++, section.path));
           }
         }
@@ -413,16 +712,20 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
     return `Split the following paper sections into semantic units.
 Each unit = one complete thought/claim/concept. Preserve original text exactly.
 Target 100-500 words per chunk. Keep formulas with their explanations.
-CRITICAL: Every chunk MUST end at a complete sentence boundary. Never cut a sentence in the middle — always include the full sentence ending with a period, question mark, or other terminal punctuation.
-For LaTeX source: do not split inside \\begin{...}...\\end{...} environments, math blocks ($...$, \\[...\\]), figure/table captions, or \\item lists. Keep these atomic — include the full environment in one chunk.
-For each chunk, provide:
-- summary: 1-2 sentences capturing the core claim.
-- key_concept: the main idea in 3-5 words.
-- content_type: one of "theoretical", "methodology", "experimental", "results", "survey", "background", "other".
-- entities: array of key named entities mentioned in this chunk — method names (e.g. "BERT", "LoRA"), dataset names (e.g. "ImageNet", "SQuAD"), metric names (e.g. "BLEU", "F1"). Only proper names, not generic terms like "neural network".
-- self_contained: true if this chunk can be understood on its own without reading previous chunks, false if it depends on prior context.
-CRITICAL: Each chunk MUST belong to exactly ONE section. Never combine text from different sections into one chunk. If a section boundary falls mid-thought, end the chunk at the boundary and start a new chunk in the next section.
-For "section", use the EXACT section header as shown (including any ">" hierarchy).
+
+CRITICAL chunking rules:
+- Every chunk MUST end at a complete sentence boundary. Never cut a sentence in the middle.
+- For LaTeX source: do NOT split inside \\begin{...}...\\end{...} environments, math blocks ($...$, \\[...\\]), figure/table captions, or \\item lists. Keep these atomic — include the full environment in one chunk.
+- Each chunk MUST belong to exactly ONE section. Never combine text from different sections into one chunk.
+- For "section", use the EXACT section header as shown (including any ">" hierarchy).
+
+CRITICAL: For EVERY chunk you MUST populate ALL of the following fields. Do NOT omit any required field.
+
+1. summary (REQUIRED, string): 1-2 sentences capturing the core claim. For pure-formula or proof chunks, summarize what the formula/proof establishes (e.g. "Defines the cross-entropy loss used during training" or "Proves convergence of Algorithm 1 under Assumption 2").
+2. key_concept (REQUIRED, string): the main idea in 3-5 words. For pure-formula chunks, name the formula or concept (e.g. "cross-entropy loss", "diffusion equation", "convergence proof").
+3. content_type (REQUIRED, enum): exactly one of "theoretical", "methodology", "experimental", "results", "survey", "background", "other". Use "theoretical" for proofs, derivations, and pure-formula chunks. Use "other" only as last resort when no other category fits.
+4. entities (array of strings): named entities mentioned — method names (e.g. "BERT", "LoRA"), dataset names ("ImageNet", "SQuAD"), metric names ("BLEU", "F1"). Only proper names, not generic terms like "neural network". Empty array [] is acceptable when no proper names appear.
+5. self_contained (REQUIRED, boolean): true if this chunk can be understood standalone, false if it depends on prior context.
 
 Document: "${title}"
 Sections:
@@ -433,6 +736,31 @@ Return ONLY a JSON object with two keys:
 2. "metadata": {"code_urls": ["https://github.com/..."], "dataset_mentions": ["ImageNet", ...], "benchmark_mentions": ["BLEU", ...]}
 
 For metadata, extract ONLY what is explicitly mentioned in the text above. Return empty arrays if nothing found.`;
+  }
+
+  /**
+   * Strict check: does `text` parse to JSON with at least one chunk that has a
+   * non-empty `text`? Unlike parseResponse (which silently paragraph-splits on
+   * failure), this returns false so the caller can route a failed batch to the
+   * schema-constrained pro retry instead of accepting null-meta paragraph chunks.
+   * Mirrors parseResponse's accepted shapes ({chunks:[...]} and bare array).
+   */
+  private hasValidChunkJson(text: string): boolean {
+    let cleaned = text.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    }
+    try {
+      const parsed = JSON.parse(cleaned) as unknown;
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).chunks : null);
+      return Array.isArray(arr) && arr.some(
+        (c) => c && typeof (c as ChunkJson).text === 'string' && ((c as ChunkJson).text as string).length > 0,
+      );
+    } catch {
+      return false;
+    }
   }
 
   private parseResponse(text: string, fallbackSections: FlatSection[], sourceFormat?: string): ChunkerResponse {
@@ -452,16 +780,17 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
         if (Array.isArray(chunks) && chunks.length > 0) {
           // Validate every chunk has a non-empty .text field (not just chunks[0]).
           // Malformed chunks (missing/empty text) would crash downstream .replace() calls.
-          const validChunks = chunks.filter(c => c && typeof c.text === 'string' && c.text.length > 0);
+          // Sanitize all string fields for PG TEXT compatibility (strip NUL,
+          // lone surrogates, control chars) — see sanitizeForPg comment.
+          const validChunks = chunks
+            .filter(c => c && typeof c.text === 'string' && c.text.length > 0)
+            .map(sanitizeChunkJson)
+            .filter(c => typeof c.text === 'string' && c.text.length > 0); // re-check after sanitize
           if (validChunks.length > 0) {
             const meta = obj.metadata as Partial<ExtractedMetadata> | undefined;
             return {
               chunks: validChunks,
-              metadata: {
-                code_urls: meta?.code_urls ?? [],
-                dataset_mentions: meta?.dataset_mentions ?? [],
-                benchmark_mentions: meta?.benchmark_mentions ?? [],
-              },
+              metadata: sanitizeMetadata(meta),
             };
           }
           // All chunks malformed — fall through to paragraph splitting
@@ -470,7 +799,10 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
 
       // Old format: ChunkJson[] array (backward compatibility)
       if (Array.isArray(parsed) && parsed.length > 0) {
-        const validChunks = (parsed as ChunkJson[]).filter(c => c && typeof c.text === 'string' && c.text.length > 0);
+        const validChunks = (parsed as ChunkJson[])
+          .filter(c => c && typeof c.text === 'string' && c.text.length > 0)
+          .map(sanitizeChunkJson)
+          .filter(c => typeof c.text === 'string' && c.text.length > 0);
         if (validChunks.length > 0) {
           return { chunks: validChunks, metadata: { ...EMPTY_METADATA } };
         }
@@ -479,7 +811,9 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
       // Fall through to paragraph splitting
     }
 
-    // Fallback: paragraph splitting (LaTeX-aware if applicable)
+    // Fallback: paragraph splitting (LaTeX-aware if applicable).
+    // Source content can also contain NUL bytes / stray surrogates (rare,
+    // but seen in arXiv PDFs); sanitize for consistency with the JSON path.
     const result: ChunkJson[] = [];
     const splitter = sourceFormat === 'latex'
       ? (t: string) => this.splitLatex(t)
@@ -487,7 +821,7 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
     for (const section of fallbackSections) {
       const paragraphs = splitter(section.content);
       for (const para of paragraphs) {
-        result.push({ section: section.name, text: para });
+        result.push({ section: sanitizeForPg(section.name), text: sanitizeForPg(para) });
       }
     }
     return { chunks: result, metadata: { ...EMPTY_METADATA } };
@@ -538,6 +872,35 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
     }
 
     return result;
+  }
+
+  /**
+   * Abstract chunks bypass the LLM enrichment step but should still surface
+   * a populated context (contentType=abstract, selfContained=true, summary).
+   * documentTitle is set later (during indexer write) — we leave it empty
+   * here matching the existing createChunk pattern.
+   */
+  private createAbstractChunk(
+    documentId: string,
+    abstract: string,
+    position: number,
+    documentTitle: string,
+  ): Chunk {
+    const ctx = buildAbstractChunkContext(abstract, documentTitle, 0);
+    return {
+      id: randomUUID(),
+      version: 1,
+      createdAt: new Date(),
+      documentId,
+      content: abstract,
+      context: {
+        ...ctx,
+        positionInDocument: position,
+      },
+      vectors: {},
+      metrics: {},
+      qdrantPointId: randomUUID(),
+    };
   }
 
   private createChunk(

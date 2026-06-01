@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../../context.js';
-import { deduplicateByDocument, fetchDocuments, embedQuery, jsonResult, computeCanServeFile } from './helpers.js';
+import { deduplicateByDocument, fetchDocuments, embedQuery, jsonResult, computeCanServeFile, computeIndexingLimitation } from './helpers.js';
 
 export function registerFindRelated(server: McpServer, ctx: AppContext): void {
   server.tool(
@@ -202,6 +202,7 @@ function formatRelated(
     ? doc.abstract.slice(0, 500) + '...'
     : doc.abstract ?? null;
 
+  const limitation = computeIndexingLimitation(doc);
   const base: Record<string, unknown> = {
     documentId: doc.id,
     documentTitle: doc.title,
@@ -212,6 +213,8 @@ function formatRelated(
     sourceUrl: doc.sourceUrl,
     license: doc.license ?? null,
     indexingTier: doc.indexingTier ?? 'full',
+    indexingLimitedBy: limitation?.limitedBy ?? null,
+    indexingLimitedNote: limitation?.note ?? null,
     score,
     matchReason,
   };

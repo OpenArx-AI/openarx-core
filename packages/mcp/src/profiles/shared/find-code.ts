@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Document, CodeLink, DatasetLink, BenchmarkResult } from '@openarx/types';
 import type { AppContext } from '../../context.js';
-import { deduplicateByDocument, fetchDocuments, jsonResult, computeCanServeFile } from './helpers.js';
+import { deduplicateByDocument, fetchDocuments, jsonResult, computeCanServeFile, computeIndexingLimitation } from './helpers.js';
 import { recordEmbed } from '../../lib/usage-tracker.js';
 
 export function registerFindCode(server: McpServer, ctx: AppContext): void {
@@ -206,6 +206,7 @@ function formatResult(
   }
 
   const limit = detail === 'full' ? Number.POSITIVE_INFINITY : 3;
+  const limitation = computeIndexingLimitation(doc);
   const result: Record<string, unknown> = {
     documentId: doc.id,
     documentTitle: doc.title,
@@ -213,6 +214,8 @@ function formatResult(
     license: doc.license ?? null,
     indexingTier: doc.indexingTier ?? 'full',
     canServeFile: computeCanServeFile(doc),
+    indexingLimitedBy: limitation?.limitedBy ?? null,
+    indexingLimitedNote: limitation?.note ?? null,
     codeLinks: code.slice(0, limit),
     codeLinksCount: code.length,
     datasetLinks: datasets.slice(0, limit),

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ChunkContext } from '@openarx/types';
 import type { AppContext } from '../../context.js';
-import { jsonResult, formatDoc, truncateChunk } from './helpers.js';
+import { jsonResult, formatDoc, truncateChunk, computeIndexingLimitation, computeCanServeFile } from './helpers.js';
 import { loadCachedSearchPool } from './search-helpers.js';
 
 const CONTENT_TYPE_ENUM = z.enum([
@@ -29,7 +29,7 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
         'DEFAULT FALSE — metadata only. Set true for chunk content. Combine with chunkContentTypes/chunkLimit for filtered retrieval. (search v2 changed default; pre-2026-05 v1 always returned chunks.)',
       ),
       chunkContentTypes: z.array(CONTENT_TYPE_ENUM).optional().describe(
-        'Filter chunks by type. Implies includeChunks=true.',
+        "Soft filter chunks by type. Implies includeChunks=true. Matched chunks return first; legacy chunks with NULL contentType are also included as 'unknown' tier (sorted after matches) — they are not silently dropped. Chunks with an explicit different contentType are excluded. Response includes strictMatchedChunks + unknownChunksIncluded counts.",
       ),
       chunkLimit: z.number().int().min(1).max(200).default(20).describe(
         'Max chunks returned when includeChunks=true (or filter is set)',
@@ -73,9 +73,13 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
       if (wantChunks) {
         const conds: string[] = ['document_id = $1', 'is_latest = true'];
         const params: unknown[] = [doc.id];
+        let contentTypeFilterIdx: number | null = null;
         if (chunkContentTypes && chunkContentTypes.length > 0) {
           params.push(chunkContentTypes);
-          conds.push(`context->>'contentType' = ANY($${params.length}::text[])`);
+          contentTypeFilterIdx = params.length;
+          // SOFT FILTER: include matched contentType OR null/missing (legacy
+          // chunks). Explicit non-matching contentType is excluded.
+          conds.push(`(context->>'contentType' = ANY($${contentTypeFilterIdx}::text[]) OR context->>'contentType' IS NULL)`);
         }
 
         // Importance ordering: chunkIds from cached search pool filtered to this doc
@@ -116,11 +120,16 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
           rows = r.rows;
         } else {
           params.push(chunkLimit);
+          // SOFT FILTER tier ordering: matched contentType first, then
+          // unknown (null) tier. Then by position within each tier.
+          const tierOrder = contentTypeFilterIdx !== null
+            ? `(context->>'contentType' = ANY($${contentTypeFilterIdx}::text[])) DESC NULLS LAST, `
+            : '';
           const sql = `
             SELECT id, content, context, position, section_path
             FROM chunks
             WHERE ${conds.join(' AND ')}
-            ORDER BY position NULLS LAST
+            ORDER BY ${tierOrder}position NULLS LAST
             LIMIT $${params.length}
           `;
           const r = await ctx.pool.query<ChunkRow>(sql, params);
@@ -138,6 +147,15 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
         );
         response.totalChunks = parseInt(totalRes.rows[0]?.count ?? '0', 10);
         response.matchedChunks = rows.length;
+
+        // Soft-filter telemetry: when a contentType filter is active, surface
+        // how many returned chunks are explicit matches vs unknown-tier
+        // (legacy null contentType). Helps callers decide whether to broaden.
+        if (contentTypeFilterIdx !== null) {
+          const unknown = rows.filter((r) => !r.context?.contentType).length;
+          response.unknownChunksIncluded = unknown;
+          response.strictMatchedChunks = rows.length - unknown;
+        }
       } else {
         // Metadata-only path — surface helpful counts so agents don't
         // need a follow-up call to know whether body content exists
@@ -180,6 +198,7 @@ function formatDocByDetail(
   }
 
   // standard — trim multi-source map, full author records, externalIds
+  const limitation = computeIndexingLimitation(doc);
   return {
     id: doc.id,
     title: doc.title,
@@ -191,6 +210,9 @@ function formatDocByDetail(
     sourceId: doc.sourceId,
     license: doc.license ?? null,
     indexingTier: doc.indexingTier ?? 'full',
+    canServeFile: computeCanServeFile(doc),
+    indexingLimitedBy: limitation?.limitedBy ?? null,
+    indexingLimitedNote: limitation?.note ?? null,
     codeLinks: doc.codeLinks,
     datasetLinks: doc.datasetLinks,
     benchmarkResults: doc.benchmarkResults,
@@ -219,7 +241,7 @@ function formatChunk(
       position: row.position ?? ctx.positionInDocument ?? 0,
       summary: ctx.summary ?? null,
       keyConcept: ctx.keyConcept ?? null,
-      contentType: ctx.contentType ?? null,
+      contentType: ctx.contentType ?? 'unknown',
     },
   };
 

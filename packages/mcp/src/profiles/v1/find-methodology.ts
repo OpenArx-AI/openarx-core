@@ -60,13 +60,29 @@ export function registerFindMethodology(server: McpServer, ctx: AppContext): voi
         finalScore: r.score,
       }));
 
+      // Track candidate counts at each filter stage — used to build an
+      // actionable hint when results come back empty (PF-001).
+      const counts: CandidatesConsidered = {
+        vectorCandidates: vectorRaw.length,
+        methodologyClassified: 0,
+        entityFiltered: 0,
+        docFiltered: 0,
+        final: 0,
+      };
+
       chunks = await hydrateChunkContexts(chunks, ctx);
 
-      // Filter to methodology chunks
-      chunks = applyChunkContextFilters(chunks, {
+      // Filter to methodology chunks (contentType only, no entities yet)
+      const methodologyOnly = applyChunkContextFilters(chunks, {
         contentType: ['methodology'],
-        ...(entitiesFilter.length > 0 ? { entities: entitiesFilter } : {}),
       });
+      counts.methodologyClassified = methodologyOnly.length;
+
+      // Apply entity filter (dataset / metric / framework) on top
+      chunks = entitiesFilter.length > 0
+        ? applyChunkContextFilters(methodologyOnly, { entities: entitiesFilter })
+        : methodologyOnly;
+      counts.entityFiltered = chunks.length;
 
       // Doc-level filters
       const candidateDocIds = [...new Set(chunks.map((c) => c.documentId))];
@@ -84,6 +100,7 @@ export function registerFindMethodology(server: McpServer, ctx: AppContext): voi
         if (dateToMs && ms > dateToMs) return false;
         return true;
       });
+      counts.docFiltered = chunks.length;
 
       // One methodology chunk per document (top-scoring)
       const seen = new Set<string>();
@@ -94,6 +111,7 @@ export function registerFindMethodology(server: McpServer, ctx: AppContext): voi
         perDoc.push(c);
         if (perDoc.length >= limit) break;
       }
+      counts.final = perDoc.length;
 
       // Optional LLM extraction of method_name + key_idea (standard/full)
       const extractions = new Map<string, MethodExtraction>();
@@ -146,14 +164,76 @@ export function registerFindMethodology(server: McpServer, ctx: AppContext): voi
         };
       });
 
+      const hint = results.length === 0
+        ? buildEmptyResultHint(counts, { dataset, metric, framework, categories, dateFrom, dateTo })
+        : null;
+
       return jsonResult({
         task,
         dataset: dataset ?? null,
         metric: metric ?? null,
         results,
+        candidatesConsidered: counts,
+        ...(hint ? { hint } : {}),
       });
     },
   );
+}
+
+interface CandidatesConsidered {
+  /** Raw count from vector search (the POOL we started with). */
+  vectorCandidates: number;
+  /** Chunks that passed the contentType=methodology classifier filter. */
+  methodologyClassified: number;
+  /** Chunks remaining after entity (dataset/metric/framework) filter. */
+  entityFiltered: number;
+  /** Chunks remaining after document-level filters (categories, dates). */
+  docFiltered: number;
+  /** Final returned count (after one-chunk-per-doc dedup + limit). */
+  final: number;
+}
+
+interface EmptyHintFilters {
+  dataset?: string;
+  metric?: string;
+  framework?: string;
+  categories?: string[];
+  dateFrom?: string;
+  dateTo?: string;
+}
+
+/**
+ * Produce an actionable diagnostic message when `results=[]`. Inspects the
+ * funnel stage that first hit zero and recommends a specific corrective
+ * action (broaden query, drop filter, try alternative tool). Returned
+ * alongside `candidatesConsidered` so clients can verify the reasoning.
+ */
+function buildEmptyResultHint(counts: CandidatesConsidered, filters: EmptyHintFilters): string {
+  if (counts.vectorCandidates === 0) {
+    return 'Vector search returned no chunks for this query. The query may be too narrow or use unfamiliar terms. Try a broader phrasing or omit specific jargon.';
+  }
+  if (counts.methodologyClassified === 0) {
+    return `Vector search found ${counts.vectorCandidates} candidate chunks, but NONE were classified as contentType=methodology and NONE had unknown/legacy classification either. The corpus likely has only background or related-work coverage on this topic. Try search() with contentType=['methodology'] for a looser match, or explore_topic() to survey the area.`;
+  }
+  if (counts.entityFiltered === 0) {
+    const activeEntityFilters = [
+      filters.dataset && `dataset='${filters.dataset}'`,
+      filters.metric && `metric='${filters.metric}'`,
+      filters.framework && `framework='${filters.framework}'`,
+    ].filter(Boolean).join(', ');
+    return `Found ${counts.methodologyClassified} methodology chunks, but none matched your entity filters (${activeEntityFilters || 'unknown'}). The dataset/metric/framework name may not appear verbatim in those chunks. Try removing those filters or use a looser name.`;
+  }
+  if (counts.docFiltered === 0) {
+    const activeDocFilters = [
+      filters.categories?.length && `categories=[${filters.categories.join(',')}]`,
+      filters.dateFrom && `dateFrom=${filters.dateFrom}`,
+      filters.dateTo && `dateTo=${filters.dateTo}`,
+    ].filter(Boolean).join(', ');
+    return `Found ${counts.entityFiltered} methodology chunks, but all were filtered out by document constraints (${activeDocFilters || 'unknown'}). Loosen the filters: omit categories or widen the date range.`;
+  }
+  // Should not reach here unless dedup produced 0 from non-empty docFiltered,
+  // which means every chunk was for the same document and limit absorbed it.
+  return 'Internal classification dropped all candidates after deduplication. This is unexpected for a non-empty filtered pool; please report.';
 }
 
 async function extractMethod(

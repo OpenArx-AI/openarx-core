@@ -27,6 +27,9 @@
     "test:abstract-tier-upgrade": "node --test --import tsx src/pipeline/__tests__/abstract-tier-upgrade.test.ts",
     "test:migrate-embeddings": "node --test --import tsx src/scripts/__tests__/migrate-embeddings.test.ts",
     "test:license": "node --test --import tsx src/lib/__tests__/license-normalizer.test.ts",
+    "test:embed-text-builder": "node --test --import tsx src/pipeline/__tests__/embed-text-builder.test.ts",
+    "test:arxiv-source-detect": "node --test --import tsx src/sources/__tests__/arxiv-source-detect.test.ts",
+    "test:parse-strategy-extract": "node --test --import tsx src/parsers/__tests__/parse-strategy-extract.test.ts",
     "runner": "node dist/scripts/runner.js",
     "cli": "node dist/scripts/cli.js"
   },

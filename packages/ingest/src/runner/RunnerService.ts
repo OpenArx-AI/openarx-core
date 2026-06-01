@@ -39,6 +39,36 @@ const log = createChildLogger('runner-service');
 const RATE_LIMIT_MS = 3000;
 const DATA_DIR = process.env.RUNNER_DATA_DIR ?? join(process.cwd(), 'data/samples/arxiv');
 
+/**
+ * Burst-failure detection thresholds.
+ *
+ * The day-walk producers in fetchBackfill / fetchDateRange wrap each day in
+ * a try/catch and continue on error. When the underlying error source is fast
+ * (e.g. Postgres ECONNREFUSED has no I/O delay), the catch+continue ripples
+ * through hundreds of remaining days in milliseconds and the run finalizes as
+ * 'completed' instead of 'failed' — see openarx-68f9 root cause.
+ *
+ * Guard: if N consecutive day-iterations fail within a short window, treat
+ * this as an infrastructure-level failure, break the loop, surface the cause,
+ * and finalize the run as 'failed' with metrics.auto_stop carrying the
+ * specific reason and last-error message.
+ */
+const DAY_FAILURE_BURST_THRESHOLD = 5;
+const DAY_FAILURE_BURST_WINDOW_MS = 60_000;
+
+/**
+ * Set by a producer when it bails out because consecutive day-failures
+ * within DAY_FAILURE_BURST_WINDOW_MS exceed the threshold. Surfaced up to
+ * runAllDirections so the finalize block can mark the run as failed and
+ * write the cause into pipeline_runs.metrics.auto_stop.
+ */
+export interface InfraFailure {
+  reason: string;          // e.g. 'consecutive_day_failures'
+  count: number;           // number of consecutive failures observed
+  windowMs: number;        // span of the burst from first to last failure
+  lastError: string;       // error message from the most recent failure
+}
+
 function minDate(a: Date | null, b: Date | null): Date | null {
   if (!a) return b;
   if (!b) return a;
@@ -587,6 +617,11 @@ export class RunnerService {
         }
       }
 
+      // Track infra-failure surfaced by either pass — used to mark the run
+      // as 'failed' in the finalize block instead of silently 'completed'
+      // (openarx-68f9).
+      let infraFailure: InfraFailure | undefined;
+
       // Forward pass — fetch newest papers (no date window needed)
       if ((direction === 'forward' || direction === 'mixed') && remaining > 0 && !this.stopRequested) {
         const result = await this.fetchForward(runId, remaining);
@@ -608,10 +643,16 @@ export class RunnerService {
         totalSkipped += result.skipped;
         dateFrom = minDate(dateFrom, result.dateFrom);
         dateTo = maxDate(dateTo, result.dateTo);
+        if (result.infraFailure) infraFailure = result.infraFailure;
       }
 
-      // Finalize
-      const finalStatus = this.stopRequested ? 'stopped' : 'completed';
+      // Finalize — distinguish three outcomes:
+      //   stopped    — operator explicitly stopped
+      //   failed     — infrastructure burst detected (consecutive day-failures)
+      //   completed  — normal end (range exhausted or limit hit)
+      const finalStatus = this.stopRequested
+        ? 'stopped'
+        : (infraFailure ? 'failed' : 'completed');
 
       const costResult = await query<{ total: string }>(
         `SELECT COALESCE(SUM(cost) FILTER (WHERE cost = cost), 0) as total FROM processing_costs
@@ -619,20 +660,32 @@ export class RunnerService {
         [runId],
       );
 
+      // If we hit an infra burst, record the specific cause in metrics so
+      // operators can see WHY the run was marked failed. Pattern matches the
+      // existing fail_rate_exceeded auto_stop marker.
+      const metricsUpdate = infraFailure
+        ? JSON.stringify({ auto_stop: infraFailure })
+        : null;
+
       await query(
         `UPDATE pipeline_runs SET
           status = $1, finished_at = now(),
           date_from = $2, date_to = $3,
           docs_fetched = $4, docs_processed = $5, docs_failed = $6, docs_skipped = $7,
-          total_cost = $8
-         WHERE id = $9`,
+          total_cost = $8,
+          metrics = CASE
+            WHEN $9::jsonb IS NULL THEN metrics
+            ELSE COALESCE(metrics, '{}'::jsonb) || $9::jsonb
+          END
+         WHERE id = $10`,
         [finalStatus, dateFrom, dateTo, totalFetched, totalProcessed, totalFailed, totalSkipped,
-         parseFloat(costResult.rows[0]?.total ?? '0'), runId],
+         parseFloat(costResult.rows[0]?.total ?? '0'), metricsUpdate, runId],
       );
 
       log.info({
         runId, status: finalStatus, totalProcessed, totalFailed, totalSkipped,
         dateFrom: dateFrom?.toISOString(), dateTo: dateTo?.toISOString(),
+        ...(infraFailure ? { autoStop: infraFailure } : {}),
       }, 'Ingest finished');
 
     } catch (err) {
@@ -902,6 +955,7 @@ export class RunnerService {
   ): Promise<{
     fetched: number; processed: number; failed: number; skipped: number;
     dateFrom: Date | null; dateTo: Date | null;
+    infraFailure?: InfraFailure;
   }> {
     // Date range mode: walk forward from dateFrom to dateTo (for gap filling)
     if (dateFromOverride) {
@@ -930,6 +984,11 @@ export class RunnerService {
     const stopDay = { value: false };
     const MAX_DAYS = 60;
 
+    // Burst-failure detection state. See openarx-68f9 and InfraFailure type.
+    let infraFailure: InfraFailure | undefined;
+    let consecutiveFailures = 0;
+    let firstFailureAt: number | null = null;
+
     // ─── Producer: walk through days, download and push to shared channel ───
     const producer = async (): Promise<void> => {
       try {
@@ -947,20 +1006,46 @@ export class RunnerService {
             );
             if (covResult.rows[0]?.status === 'complete') {
               log.info({ date: dayStr }, 'Backfill: day already complete in coverage map, skipping');
+              consecutiveFailures = 0;
+              firstFailureAt = null;
               continue;
             }
 
             const { total } = await this.arxivSource.searchByDateWindow(dayStr, 0, 1, this.abortController.signal);
             if (total === 0) {
               log.info({ date: dayStr }, 'Backfill: empty day, skipping');
+              consecutiveFailures = 0;
+              firstFailureAt = null;
               continue;
             }
 
             log.info({ date: dayStr, total, remaining: counters.remaining }, 'Backfill: processing day');
             await this.produceDayDownloads(runId, dayStr, total, ch, counters, stopDay);
             await this.refreshCoverageForDate(fmtDate);
+            consecutiveFailures = 0;
+            firstFailureAt = null;
           } catch (err) {
-            log.error({ date: dayStr, err: err instanceof Error ? err.message : String(err) }, 'Day processing failed, continuing to next day');
+            if (consecutiveFailures === 0) firstFailureAt = Date.now();
+            consecutiveFailures++;
+            const message = err instanceof Error ? err.message : String(err);
+            log.error({ date: dayStr, err: message, consecutiveFailures }, 'Day processing failed, continuing to next day');
+
+            // Burst detection: N consecutive failures within window → infra issue.
+            if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
+                firstFailureAt !== null &&
+                Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
+              const windowMs = Date.now() - firstFailureAt;
+              log.error({ consecutiveFailures, windowMs, lastError: message },
+                'Consecutive day failures within burst window — likely infrastructure issue, bailing out');
+              infraFailure = {
+                reason: 'consecutive_day_failures',
+                count: consecutiveFailures,
+                windowMs,
+                lastError: message,
+              };
+              stopDay.value = true;
+              break;
+            }
           }
         }
       } finally {
@@ -1022,7 +1107,7 @@ export class RunnerService {
 
     await Promise.all([producer(), consumer()]);
 
-    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo };
+    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo, infraFailure };
   }
 
   /**
@@ -1034,7 +1119,7 @@ export class RunnerService {
   /** Targeted date range backfill — walks forward from dateFrom to dateTo with shared-channel sliding window. */
   private async fetchDateRange(
     runId: string, limit: number, from: string, to: string,
-  ): Promise<{ fetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null }> {
+  ): Promise<{ fetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null; infraFailure?: InfraFailure }> {
     const startDate = new Date(from);
     const endDate = new Date(to);
 
@@ -1042,6 +1127,11 @@ export class RunnerService {
     const ch = new Channel<DownloadedItem>(800);
     const counters = { remaining: limit, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
     const stopDay = { value: false };
+
+    // Burst-failure detection state. See openarx-68f9 and InfraFailure type.
+    let infraFailure: InfraFailure | undefined;
+    let consecutiveFailures = 0;
+    let firstFailureAt: number | null = null;
 
     // ─── Producer: walk forward from dateFrom to dateTo, push to shared channel ───
     const producer = async (): Promise<void> => {
@@ -1063,17 +1153,46 @@ export class RunnerService {
             );
             if (covResult.rows[0]?.status === 'complete') {
               log.info({ date: dayStr }, 'Date range: day already complete, skipping');
+              consecutiveFailures = 0;
+              firstFailureAt = null;
               continue;
             }
 
             const { total } = await this.arxivSource.searchByDateWindow(dayStr, 0, 1, this.abortController.signal);
-            if (total === 0) { log.info({ date: dayStr }, 'Date range: empty day'); continue; }
+            if (total === 0) {
+              log.info({ date: dayStr }, 'Date range: empty day');
+              consecutiveFailures = 0;
+              firstFailureAt = null;
+              continue;
+            }
 
             log.info({ date: dayStr, total, remaining: counters.remaining }, 'Date range: processing day');
             await this.produceDayDownloads(runId, dayStr, total, ch, counters, stopDay);
             await this.refreshCoverageForDate(fmtDate);
+            consecutiveFailures = 0;
+            firstFailureAt = null;
           } catch (err) {
-            log.error({ date: dayStr, err: err instanceof Error ? err.message : String(err) }, 'Day processing failed, continuing to next day');
+            if (consecutiveFailures === 0) firstFailureAt = Date.now();
+            consecutiveFailures++;
+            const message = err instanceof Error ? err.message : String(err);
+            log.error({ date: dayStr, err: message, consecutiveFailures }, 'Day processing failed, continuing to next day');
+
+            // Burst detection: N consecutive failures within window → infra issue.
+            if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
+                firstFailureAt !== null &&
+                Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
+              const windowMs = Date.now() - firstFailureAt;
+              log.error({ consecutiveFailures, windowMs, lastError: message },
+                'Consecutive day failures within burst window — likely infrastructure issue, bailing out');
+              infraFailure = {
+                reason: 'consecutive_day_failures',
+                count: consecutiveFailures,
+                windowMs,
+                lastError: message,
+              };
+              stopDay.value = true;
+              break;
+            }
           }
         }
       } finally {
@@ -1134,7 +1253,7 @@ export class RunnerService {
 
     await Promise.all([producer(), consumer()]);
 
-    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo };
+    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo, infraFailure };
   }
 
   /**

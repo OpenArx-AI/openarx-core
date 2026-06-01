@@ -265,31 +265,36 @@ export class ArxivSource {
       }, null, 2),
     );
 
-    // Step 2: Detect format and extract LaTeX if available
+    // Step 2: Verify archive integrity + detect format from tar header listing.
+    // We do NOT extract here — parse-strategy extracts on-demand and cleans up
+    // after parse (openarx-yvkp). Persistent source/ was a near-exact duplicate
+    // of eprint and accounted for ~4 TB on storagebox.
     const sources: DocumentSources = {};
     let sourceFormat: 'latex' | 'pdf' = 'pdf';
 
     const isGzip = await this.isGzipFile(eprintPath);
     if (isGzip) {
-      // tar.gz → extract LaTeX source
       const sourceDir = join(paperDir, 'source');
-      await mkdir(sourceDir, { recursive: true });
       try {
-        await execFileAsync('tar', ['xzf', eprintPath, '-C', sourceDir]);
-        // Count .tex files and find root
-        const rootTex = await this.findRootTex(sourceDir);
-        const texCount = await this.countFiles(sourceDir, '.tex');
-
-        sources.latex = {
-          path: sourceDir,
-          rootTex: rootTex ?? undefined,
-          manifest: await this.hasManifest(sourceDir),
-          texFiles: texCount,
-        };
-        sourceFormat = 'latex';
-        log.info({ arxivId: entry.arxivId, rootTex, texFiles: texCount }, 'LaTeX source extracted');
+        const filenames = await listArchiveContents(eprintPath);
+        if (filenames.length === 0) throw new Error('empty archive');
+        const { isLatex, texFiles, hasManifest } = detectLatexFromTarListing(filenames);
+        if (isLatex) {
+          sources.latex = {
+            // Pointer to where source/ WILL be materialized at parse time. The
+            // directory does not exist on disk yet — parse-strategy will create
+            // and tear it down. rootTex is auto-detected at parse time.
+            path: sourceDir,
+            manifest: hasManifest,
+            texFiles,
+          };
+          sourceFormat = 'latex';
+          log.info({ arxivId: entry.arxivId, texFiles, manifest: hasManifest }, 'LaTeX archive verified (lazy extract)');
+        } else {
+          log.info({ arxivId: entry.arxivId, archiveFiles: filenames.length }, 'No .tex files in archive — treating as PDF-only');
+        }
       } catch (err) {
-        log.warn({ arxivId: entry.arxivId, err: (err as Error).message }, 'Failed to extract e-print, treating as PDF-only');
+        log.warn({ arxivId: entry.arxivId, err: (err as Error).message }, 'eprint archive verification failed, treating as PDF-only');
       }
     }
 
@@ -382,16 +387,19 @@ export class ArxivSource {
       return { hasLatex: false };
     }
 
-    // Extract LaTeX source
+    // Verify archive + detect from listing only. parse-strategy extracts lazily
+    // when actually parsing (openarx-yvkp). Caller still receives sourcePath as
+    // the canonical pointer (even though dir doesn't exist yet on disk).
     const sourceDir = join(paperDir, 'source');
-    await mkdir(sourceDir, { recursive: true });
-    await execFileAsync('tar', ['xzf', eprintPath, '-C', sourceDir]);
-
-    const rootTex = await this.findRootTex(sourceDir);
-    const manifest = await this.hasManifest(sourceDir);
-    const texFiles = await this.countFiles(sourceDir, '.tex');
-
-    return { hasLatex: true, sourcePath: sourceDir, rootTex: rootTex ?? undefined, manifest, texFiles };
+    const filenames = await listArchiveContents(eprintPath);
+    if (filenames.length === 0) {
+      throw new Error('eprint archive is empty');
+    }
+    const { isLatex, texFiles, hasManifest } = detectLatexFromTarListing(filenames);
+    if (!isLatex) {
+      return { hasLatex: false };
+    }
+    return { hasLatex: true, sourcePath: sourceDir, manifest: hasManifest, texFiles };
   }
 
   // ─── Helpers ─────────────────────────────────────────────
@@ -476,49 +484,37 @@ export class ArxivSource {
     return buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
   }
 
-  private async findRootTex(dir: string): Promise<string | null> {
-    // Try 00README.json manifest first (89% of arXiv archives have it)
-    try {
-      const { readFile } = await import('node:fs/promises');
-      const manifest = JSON.parse(await readFile(join(dir, '00README.json'), 'utf-8'));
-      const toplevel = manifest.sources?.find(
-        (s: { usage: string; filename: string }) => s.usage === 'toplevel',
-      );
-      if (toplevel?.filename) return toplevel.filename;
-    } catch {
-      // No manifest or parse error — use fallback
-    }
+}
 
-    // Fallback: grep for \documentclass
-    try {
-      const { stdout } = await execFileAsync('grep', ['-rl', '\\\\documentclass', dir, '--include=*.tex']);
-      const files = stdout.trim().split('\n').filter(Boolean);
-      if (files.length > 0) {
-        const { basename } = await import('node:path');
-        return basename(files[0]);
-      }
-    } catch {
-      // No .tex files found
-    }
+// ─── Tar listing helpers (exported for testing) ──────────────
 
-    return null;
-  }
+/**
+ * Read the file listing of a tar.gz archive WITHOUT extracting it.
+ * Faster than extraction (reads only the tar headers, ~50ms even for large
+ * archives) and avoids materializing transient source/ directories on disk.
+ * Throws on a non-tar / corrupted archive.
+ */
+export async function listArchiveContents(archivePath: string): Promise<string[]> {
+  const { stdout } = await execFileAsync('tar', ['-tzf', archivePath]);
+  return stdout
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
-  private async hasManifest(dir: string): Promise<boolean> {
-    try {
-      await stat(join(dir, '00README.json'));
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async countFiles(dir: string, ext: string): Promise<number> {
-    try {
-      const { stdout } = await execFileAsync('find', [dir, '-name', `*${ext}`, '-type', 'f']);
-      return stdout.trim().split('\n').filter(Boolean).length;
-    } catch {
-      return 0;
-    }
-  }
+/**
+ * Pure-function detection from a tar archive's filename listing.
+ * Used during ingest to set sources.latex.manifest + texFiles without
+ * extracting (saves ~4 TB on storagebox vs. persisting source/ directories).
+ */
+export function detectLatexFromTarListing(filenames: string[]): {
+  isLatex: boolean;
+  texFiles: number;
+  hasManifest: boolean;
+} {
+  const texFiles = filenames.filter((f) => f.toLowerCase().endsWith('.tex')).length;
+  const hasManifest = filenames.some(
+    (f) => f === '00README.json' || f.endsWith('/00README.json'),
+  );
+  return { isLatex: texFiles > 0, texFiles, hasManifest };
 }

@@ -8,13 +8,33 @@
  * Selector: by document.sourceFormat. LaTeX falls back to PDF on error.
  */
 
-import { stat } from 'node:fs/promises';
+import { access, mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { Document, ParsedDocument, PipelineContext, ParsedSection } from '@openarx/types';
 import { parseLatexSource } from './latex-parser.js';
 import { ParserStep } from '../pipeline/parser-step.js';
 import { parseWithMathpix } from './mathpix-parser.js';
 import { parseMarkdownFile } from './markdown-parser.js';
 import { createChildLogger } from '../lib/logger.js';
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Returns true iff the directory exists AND has at least one entry. Used as
+ * the lazy-extract guard: if the materialized `source/` is already present
+ * (legacy doc, or just-extracted by a prior attempt), parsing reads from it
+ * directly; otherwise we extract the sibling `eprint` archive first.
+ */
+async function dirIsNonEmpty(path: string): Promise<boolean> {
+  try {
+    const entries = await readdir(path);
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 const log = createChildLogger('parse-strategy');
 
@@ -42,16 +62,52 @@ export class LatexStrategy implements ParseStrategy {
       throw new Error('No LaTeX source path');
     }
 
-    const parsed = await parseLatexSource(latexSource.path, latexSource.rootTex);
+    // Lazy-extract policy (openarx-yvkp): ingest no longer persists source/
+    // alongside eprint. Here we ensure source/ exists for parsing — either
+    // it's already there (legacy or just-extracted) or we extract eprint
+    // ourselves. Either way, after parsing we delete source/ so storagebox
+    // doesn't accumulate near-duplicates of eprint (~4 TB reclaim).
+    const sourceDir = latexSource.path;
+    const eprintPath = join(dirname(sourceDir), 'eprint');
 
-    // Guard: text size check
-    const totalChars = countTextChars(parsed.sections);
-    if (totalChars > GUARD_MAX_TEX_CHARS) {
-      throw new Error(`text_exceeded: LaTeX text ${totalChars} chars (limit ${GUARD_MAX_TEX_CHARS})`);
+    const alreadyPresent = await dirIsNonEmpty(sourceDir);
+    if (!alreadyPresent) {
+      try {
+        await mkdir(sourceDir, { recursive: true });
+        await execFileAsync('tar', ['xzf', eprintPath, '-C', sourceDir]);
+        context.logger.info(`Lazy-extracted ${eprintPath} → ${sourceDir}`);
+      } catch (err) {
+        // Cleanup an empty/half-extracted dir before bubbling the error.
+        await rm(sourceDir, { recursive: true, force: true }).catch(() => undefined);
+        throw new Error(
+          `Failed to extract eprint for LaTeX parse: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
-    context.logger.info(`LaTeX parse complete: ${parsed.sections.length} sections, ${parsed.references.length} refs, ${parsed.formulas.length} formulas`);
-    return parsed;
+    try {
+      const parsed = await parseLatexSource(sourceDir, latexSource.rootTex);
+
+      // Guard: text size check
+      const totalChars = countTextChars(parsed.sections);
+      if (totalChars > GUARD_MAX_TEX_CHARS) {
+        throw new Error(`text_exceeded: LaTeX text ${totalChars} chars (limit ${GUARD_MAX_TEX_CHARS})`);
+      }
+
+      context.logger.info(`LaTeX parse complete: ${parsed.sections.length} sections, ${parsed.references.length} refs, ${parsed.formulas.length} formulas`);
+      return parsed;
+    } finally {
+      // Cleanup source/ unconditionally — keep eprint as the canonical archive.
+      // Guard: only delete if eprint is still accessible (defensive: never leave
+      // the doc with neither archive nor extracted source).
+      try {
+        await access(eprintPath);
+        await rm(sourceDir, { recursive: true, force: true });
+        context.logger.debug(`Cleaned up ${sourceDir} (eprint retained)`);
+      } catch {
+        context.logger.warn(`Skipping cleanup of ${sourceDir} — eprint missing or inaccessible`);
+      }
+    }
   }
 }
 
@@ -79,10 +135,18 @@ export class PdfStrategy implements ParseStrategy {
       context,
     );
 
-    // Mathpix fallback for math-heavy papers
+    // Mathpix fallback for math-heavy papers.
+    //
+    // MATHPIX_DISABLE=1 short-circuits the call without removing the API
+    // credentials — same pattern as ENRICHMENT_DISABLE_CORE. Used when the
+    // operator wants to temporarily turn Mathpix off (cost spike, API
+    // outage, account billing block) while keeping MATHPIX_APP_ID/KEY
+    // available for easy re-enable.
     const mathDensity = estimateMathDensity(parsed.sections);
     const grobidTextChars = countTextChars(parsed.sections);
-    if (mathDensity > 0.3 && process.env.MATHPIX_APP_ID) {
+    if (mathDensity > 0.3 && process.env.MATHPIX_APP_ID && process.env.MATHPIX_DISABLE === '1') {
+      context.logger.info(`Math-heavy paper (density=${mathDensity.toFixed(2)}) — Mathpix disabled via MATHPIX_DISABLE=1, using GROBID output as-is`);
+    } else if (mathDensity > 0.3 && process.env.MATHPIX_APP_ID && process.env.MATHPIX_DISABLE !== '1') {
       if (grobidTextChars > GUARD_MAX_TEXT_CHARS) {
         context.logger.warn(`Skipping Mathpix: GROBID text too large (${grobidTextChars} chars)`);
       } else {

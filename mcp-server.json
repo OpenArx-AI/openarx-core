@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -101,7 +101,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Filter chunks mentioning specific entities (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"). Case-insensitive match"
+              "description": "Soft filter by entity (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"), case-insensitive. Matching chunks rank first; chunks with no entities recorded (legacy gap) fall to the bottom rather than being dropped; chunks with non-matching entities are excluded."
             },
             "diversifyBy": {
               "type": "string",
@@ -199,7 +199,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Filter chunks mentioning specific entities (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"). Case-insensitive match"
+              "description": "Soft filter by entity (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"), case-insensitive. Matching chunks rank first; chunks with no entities recorded (legacy gap) fall to the bottom rather than being dropped; chunks with non-matching entities are excluded."
             },
             "diversifyBy": {
               "type": "string",
@@ -315,7 +315,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Filter chunks mentioning specific entities (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"). Case-insensitive match"
+              "description": "Soft filter by entity (method names like \"BERT\", datasets like \"SQuAD\", metrics like \"BLEU\"), case-insensitive. Matching chunks rank first; chunks with no entities recorded (legacy gap) fall to the bottom rather than being dropped; chunks with non-matching entities are excluded."
             },
             "diversifyBy": {
               "type": "string",
@@ -491,7 +491,7 @@
       },
       {
         "name": "find_evidence",
-        "description": "Fact-check or substantiate a claim against the corpus. Given a textual claim, retrieves and CLASSIFIES evidence into supporting / contradicting / neutral groups. Uses HyDE (hypothetical document expansion) — server generates plausible supporting/contradicting text, embeds, retrieves, then ranks by relation to original claim. Returns chunks with selfContained flag (safe-to-cite indicator). Use for fact-verification, controversy mapping, 'is this claim known?' queries. Modes: 'fast' (~3s, score-based grouping) / 'deep' (~10s, adds NLI classification pass for higher precision).",
+        "description": "Fact-check or substantiate a claim against the corpus. Given a textual claim, retrieves and CLASSIFIES evidence into supporting / contradicting / neutral groups. Uses HyDE (hypothetical document expansion) — server generates plausible supporting/contradicting text, embeds, retrieves, then ranks by relation to original claim. Returns chunks with selfContained flag (safe-to-cite indicator). Use for fact-verification, controversy mapping, 'is this claim known?' queries. Modes: 'fast' (~3s, symmetric-by-construction grouping) / 'deep' (~10s, independent NLI classification). IMPORTANT: in 'fast' mode the supporting/contradicting counts are approximately balanced BY CONSTRUCTION and do NOT reflect actual literature distribution. Use 'deep' when measuring controversy balance, literature distribution, or any claim of the form 'the field is split N:M on this'.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -506,7 +506,7 @@
                 "deep"
               ],
               "default": "fast",
-              "description": "'fast' (~3s): score-vector-based grouping — APPROXIMATE; may misclassify chunks that mention the topic but logically point the other way (e.g. a paper explaining 'BN is bad in transformers' may land in the contradicting bucket for an 'LN > BN' claim). 'deep' (~10s): adds LLM NLI classification for higher precision. Use 'deep' when classification accuracy matters."
+              "description": "'fast' (~3s): retrieval uses symmetric HyDE pools — top-20 chunks against the supporting-hypothetical plus top-20 against the contradicting-hypothetical, then each chunk is assigned to the bucket whose HyDE-vector it scored higher against. Because the retrieval pool is symmetric and the classification mirrors the retrieval direction, supporting/contradicting counts come out approximately balanced regardless of the actual distribution of evidence in the corpus (a topic that is 90% supported in the literature will still show a ~1:1 split here). Use fast mode for 'is there evidence on either side?', not for 'how is the field actually split?'. May also misclassify chunks that mention the topic but logically point the other way (e.g. a paper explaining 'BN is bad in transformers' may land in the contradicting bucket for an 'LN > BN' claim). 'deep' (~10s): adds an independent per-chunk LLM NLI classification on top of the union pool, so counts reflect actual semantic distribution and can be arbitrarily asymmetric. Use 'deep' whenever classification accuracy or distribution shape matters — including controversy mapping and any analysis that interprets the supporting/contradicting ratio as a signal about the field."
             },
             "categories": {
               "type": "array",
@@ -604,7 +604,7 @@
       },
       {
         "name": "explore_topic",
-        "description": "Map the conceptual landscape around a topic. Instead of returning a ranked list of papers, returns N distinct conceptual clusters with representative chunks. Built on keyConcept LLM-extracted markers diversification. Use for \"what approaches exist to X\" queries — answers with thematic map rather than ranked list. Better than search when you want breadth over depth.",
+        "description": "Map the conceptual landscape around a topic. Instead of returning a ranked list of papers, returns N distinct conceptual clusters with representative chunks. Built on keyConcept LLM-extracted markers diversification. Use for \"what approaches exist to X\" queries — answers with thematic map rather than ranked list. Better than search when you want breadth over depth. Temporal bias note: for topics with dense recent literature (e.g. current LLM research), the default ordering favors recent papers because vector similarity finds them first; specify dateTo for historical exploration of mature topics, or dateFrom+dateTo to slice a specific era. Diversification cap (maxClustersPerPaper) limits how many clusters can have the same source paper as representative chunk — protects against single-paper dominance.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -618,6 +618,13 @@
               "maximum": 15,
               "default": 5,
               "description": "Number of distinct conceptual approaches to return"
+            },
+            "maxClustersPerPaper": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 2,
+              "description": "Diversification cap: maximum clusters that may use the same source paper as representative chunk. Lower = more paper diversity across clusters; higher = allow dominant papers to be representative in more clusters. Default 2."
             },
             "categories": {
               "type": "array",
@@ -687,7 +694,7 @@
                   "other"
                 ]
               },
-              "description": "Filter chunks by type (methodology / results / theoretical / experimental / survey / background / other)"
+              "description": "Soft filter chunks by type (methodology / results / theoretical / experimental / survey / background / other). Matched chunks return first; legacy chunks with NULL contentType are included as 'unknown' tier (sorted after matches) — they are not silently dropped. Chunks with an explicit different contentType are excluded. Response includes strictMatchedChunks + unknownChunksIncluded counts."
             },
             "section": {
               "type": "string",
@@ -698,7 +705,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Only chunks mentioning these entities (case-insensitive ANY match)"
+              "description": "Soft filter by entity (case-insensitive ANY match). Chunks mentioning a listed entity return first; chunks with NO entities recorded (legacy, ~23% of corpus) are included after as 'unknown' tier rather than dropped; only chunks that have entities none of which match are excluded."
             },
             "detail": {
               "type": "string",
@@ -945,7 +952,7 @@
                   "other"
                 ]
               },
-              "description": "Filter chunks by type. Implies includeChunks=true."
+              "description": "Soft filter chunks by type. Implies includeChunks=true. Matched chunks return first; legacy chunks with NULL contentType are also included as 'unknown' tier (sorted after matches) — they are not silently dropped. Chunks with an explicit different contentType are excluded. Response includes strictMatchedChunks + unknownChunksIncluded counts."
             },
             "chunkLimit": {
               "type": "integer",

@@ -25,13 +25,13 @@ export function registerGetChunks(server: McpServer, ctx: AppContext): void {
     {
       documentId: z.string().uuid().describe('Document UUID (from a prior search result)'),
       contentType: z.array(CONTENT_TYPE_ENUM).optional().describe(
-        'Filter chunks by type (methodology / results / theoretical / experimental / survey / background / other)',
+        "Soft filter chunks by type (methodology / results / theoretical / experimental / survey / background / other). Matched chunks return first; legacy chunks with NULL contentType are included as 'unknown' tier (sorted after matches) — they are not silently dropped. Chunks with an explicit different contentType are excluded. Response includes strictMatchedChunks + unknownChunksIncluded counts.",
       ),
       section: z.string().optional().describe(
         'Section name or path prefix (e.g. "Methods" or "3.")',
       ),
       entities: z.array(z.string()).optional().describe(
-        'Only chunks mentioning these entities (case-insensitive ANY match)',
+        "Soft filter by entity (case-insensitive ANY match). Chunks mentioning a listed entity return first; chunks with NO entities recorded (legacy, ~23% of corpus) are included after as 'unknown' tier rather than dropped; only chunks that have entities none of which match are excluded.",
       ),
       detail: z.enum(['minimal', 'standard', 'full']).default('standard').describe(
         "'minimal' = section + summary only. 'standard' = + content. 'full' = + entities/selfContained/totalChunks",
@@ -55,20 +55,31 @@ export function registerGetChunks(server: McpServer, ctx: AppContext): void {
       const conds: string[] = ['document_id = $1', 'is_latest = true'];
       const params: unknown[] = [documentId];
 
+      let contentTypeFilterIdx: number | null = null;
       if (contentType && contentType.length > 0) {
         params.push(contentType);
-        conds.push(`context->>'contentType' = ANY($${params.length}::text[])`);
+        contentTypeFilterIdx = params.length;
+        // SOFT FILTER: matched contentType OR null/missing (legacy chunks).
+        // Explicit non-matching contentType is excluded.
+        conds.push(`(context->>'contentType' = ANY($${contentTypeFilterIdx}::text[]) OR context->>'contentType' IS NULL)`);
       }
       if (section) {
         params.push(`${section}%`);
         conds.push(`(section_path ILIKE $${params.length} OR context->>'sectionPath' ILIKE $${params.length})`);
       }
+      let entitiesFilterIdx: number | null = null;
       if (entities && entities.length > 0) {
-        // Match any entity in chunk's entities array (case-insensitive)
         params.push(entities.map((e) => e.toLowerCase()));
-        conds.push(`EXISTS (
-          SELECT 1 FROM jsonb_array_elements_text(coalesce(context->'entities', '[]'::jsonb)) e
-          WHERE LOWER(e) = ANY($${params.length}::text[])
+        entitiesFilterIdx = params.length;
+        // SOFT FILTER (mirror contentType): keep chunks with a matching entity
+        // OR with NO entities recorded (null/empty — ~23% legacy gap). Drop
+        // only chunks that HAVE entities none of which match.
+        conds.push(`(
+          EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(coalesce(context->'entities', '[]'::jsonb)) e
+            WHERE LOWER(e) = ANY($${entitiesFilterIdx}::text[])
+          )
+          OR coalesce(jsonb_array_length(context->'entities'), 0) = 0
         )`);
       }
 
@@ -121,11 +132,25 @@ export function registerGetChunks(server: McpServer, ctx: AppContext): void {
         rows = r.rows;
       } else {
         params.push(limit);
+        // SOFT FILTER tier ordering: positive matches first, then unknown
+        // (null contentType / no-entities) tier, then by position. A chunk is
+        // "fully matched" only if it positively matches every active soft
+        // filter; otherwise (matched on one, unknown on another) it sorts after.
+        const tierParts: string[] = [];
+        if (contentTypeFilterIdx !== null) {
+          tierParts.push(`(context->>'contentType' = ANY($${contentTypeFilterIdx}::text[]))`);
+        }
+        if (entitiesFilterIdx !== null) {
+          tierParts.push(`EXISTS (SELECT 1 FROM jsonb_array_elements_text(coalesce(context->'entities','[]'::jsonb)) e WHERE LOWER(e) = ANY($${entitiesFilterIdx}::text[]))`);
+        }
+        const tierOrder = tierParts.length > 0
+          ? `(${tierParts.join(' AND ')}) DESC NULLS LAST, `
+          : '';
         const sql = `
           SELECT id, content, context, position, section_path
           FROM chunks
           WHERE ${conds.join(' AND ')}
-          ORDER BY position NULLS LAST
+          ORDER BY ${tierOrder}position NULLS LAST
           LIMIT $${params.length}
         `;
         const r = await ctx.pool.query<ChunkRow>(sql, params);
@@ -142,6 +167,11 @@ export function registerGetChunks(server: McpServer, ctx: AppContext): void {
         chunkOrder: importanceOrder ? 'importance' : 'position',
         chunks,
       };
+      if (contentTypeFilterIdx !== null) {
+        const unknown = rows.filter((r) => !r.context?.contentType).length;
+        response.unknownChunksIncluded = unknown;
+        response.strictMatchedChunks = rows.length - unknown;
+      }
       if (importanceFallbackReason) response.chunkOrderNote = importanceFallbackReason;
       return jsonResult(response);
     },
@@ -170,7 +200,7 @@ function formatChunk(
       position: row.position ?? ctx.positionInDocument ?? 0,
       summary: ctx.summary ?? null,
       keyConcept: ctx.keyConcept ?? null,
-      contentType: ctx.contentType ?? null,
+      contentType: ctx.contentType ?? 'unknown',
     },
   };
 

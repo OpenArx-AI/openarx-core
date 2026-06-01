@@ -7,7 +7,8 @@
  * Design ref: docs/compliance/enrichment_worker_design.md (D2–D6, D11)
  */
 
-import { query } from '@openarx/api';
+import { query, PgDocumentLocationStore } from '@openarx/api';
+import type { HostType, LocationVersion } from '@openarx/types';
 import { normalizeLicense, isOpenLicense, computeEffectiveLicense } from '@openarx/ingest';
 import { createChildLogger } from './logger.js';
 
@@ -178,20 +179,34 @@ async function downloadToAlt(
 
 // ── DB helpers ──────────────────────────────────────────────
 
+const locationStore = new PgDocumentLocationStore();
+
 async function insertDocumentLocation(
   documentId: string,
   loc: OaLocation,
   licenseSpdx: string,
   filePath: string | null,
 ): Promise<void> {
-  await query(
-    `INSERT INTO document_locations
-       (document_id, source_id, source_url, license_raw, license_canonical,
-        version, host_type, is_oa, is_primary, file_path, fetched_at, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, $8, now(), now())`,
-    [documentId, loc.source, loc.url, loc.license, licenseSpdx,
-     loc.version, loc.hostType, filePath],
-  );
+  // Enrichment-discovered locations are always non-primary OA copies. Primary
+  // location is written by the ingest path (openarx-745). License source is
+  // 'document' here — the value came from the location's own metadata
+  // (Unpaywall/OpenAlex/CORE/PMC each report their location's license).
+  await locationStore.save({
+    documentId,
+    sourceId: loc.source,
+    sourceIdentifier: null,
+    sourceUrl: loc.url,
+    licenseRaw: loc.license,
+    licenseCanonical: licenseSpdx,
+    licenseSource: 'document',
+    version: (loc.version ?? null) as LocationVersion | null,
+    isPrimary: false,
+    isOa: true,
+    hostType: (loc.hostType ?? null) as HostType | null,
+    filePath,
+    metadata: {},
+    fetchedAt: new Date(),
+  });
 }
 
 /**

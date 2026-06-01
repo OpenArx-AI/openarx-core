@@ -12,9 +12,14 @@
 
 import { randomUUID, createHash } from 'node:crypto';
 import { createReadStream, statSync } from 'node:fs';
-import { access, constants, mkdir, writeFile, stat, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, constants, mkdir, writeFile, stat, readdir, mkdtemp, rm, realpath } from 'node:fs/promises';
+import { join, dirname, normalize, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import archiver from 'archiver';
+
+const execFileAsync = promisify(execFile);
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type { AppContext } from './context.js';
@@ -430,12 +435,27 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
         const latexInfo = sources?.latex;
         if (!latexInfo?.path) { res.status(404).json({ error: 'not_found' }); return; }
         const latexPath = latexInfo.path;
-        try { await access(latexPath, constants.R_OK); } catch { res.status(404).json({ error: 'file_not_found' }); return; }
 
-        // Check if directory (arXiv source archive) or single file (portal inline)
+        // Prefer eprint archive when available (lazy-extract policy openarx-yvkp):
+        // ingest no longer persists source/ alongside eprint. The archive carries
+        // the same data in a more compact form, so we stream it directly to the
+        // client. Fallback to legacy zip-on-fly for docs that still have source/
+        // but no eprint (older portal-inline submissions, or edge cases).
+        const paperDir = dirname(latexPath);
+        const eprintPath = join(paperDir, 'eprint');
+        let eprintExists = false;
+        try { await access(eprintPath, constants.R_OK); eprintExists = true; } catch { /* fall through */ }
+        if (eprintExists) {
+          res.setHeader('Content-Type', 'application/gzip');
+          res.setHeader('Content-Disposition', `attachment; filename="${oarxId}-source.tar.gz"`);
+          createReadStream(eprintPath).pipe(res);
+          return;
+        }
+
+        // Legacy fallback: source/ dir or single .tex still on disk.
+        try { await access(latexPath, constants.R_OK); } catch { res.status(404).json({ error: 'file_not_found' }); return; }
         const fileStat = await stat(latexPath);
         if (fileStat.isDirectory()) {
-          // Zip the directory
           res.setHeader('Content-Type', 'application/zip');
           res.setHeader('Content-Disposition', `attachment; filename="${oarxId}-source.zip"`);
           const archive = archiver('zip', { zlib: { level: 6 } });
@@ -444,7 +464,6 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
           archive.directory(latexPath, false);
           await archive.finalize();
         } else {
-          // Single .tex file
           res.setHeader('Content-Type', 'application/x-tex; charset=utf-8');
           res.setHeader('Content-Disposition', `attachment; filename="${oarxId}.tex"`);
           createReadStream(latexPath).pipe(res);
@@ -454,6 +473,126 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     } catch (err) {
       console.error('[internal/download] Error:', err instanceof Error ? err.message : err);
       res.status(500).json({ error: 'server_error' });
+    }
+  });
+
+  // ── GET /documents/:id/source-file ──────────────────────
+  //
+  // Extract a single file from the eprint archive on-demand and stream it.
+  // Used when callers want main.tex or a specific figure from inside the
+  // tarball without downloading the whole bundle. Tmp dir is cleaned up
+  // after the response completes (whether by normal flush or client abort).
+  //
+  // Path is REQUIRED and must be a relative path inside the archive. Path
+  // traversal (..) and absolute paths are rejected up-front; after extract,
+  // realpath confirms the file stays inside the scratch dir (defends against
+  // symlinks embedded in the archive).
+  router.get('/documents/:id/source-file', async (req: Request, res: Response) => {
+    let tmpDir: string | null = null;
+    const cleanup = async (): Promise<void> => {
+      if (!tmpDir) return;
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+      tmpDir = null;
+    };
+    try {
+      const id = String(req.params.id);
+      const requestedPath = req.query.path;
+      if (typeof requestedPath !== 'string' || requestedPath.length === 0) {
+        res.status(400).json({ error: 'invalid_request', message: 'path query param required' });
+        return;
+      }
+      // Reject path traversal + absolute paths BEFORE we touch the filesystem.
+      // normalize() resolves any '..' segments; we forbid the result containing
+      // any '..' or starting at root.
+      const normalized = normalize(requestedPath);
+      if (
+        normalized.startsWith(sep) ||
+        normalized === '..' ||
+        normalized.startsWith('..' + sep) ||
+        normalized.split(sep).includes('..')
+      ) {
+        res.status(400).json({ error: 'path_traversal', message: 'path must be a relative file inside the archive' });
+        return;
+      }
+
+      const doc = await ctx.documentStore.getById(id);
+      if (!doc || doc.deletedAt) {
+        res.status(404).json({ error: 'not_found', message: 'Document not found' });
+        return;
+      }
+
+      const sources = (doc as unknown as Record<string, unknown>).sources as
+        Record<string, { path?: string }> | undefined;
+      const latexInfo = sources?.latex;
+      if (!latexInfo?.path) {
+        res.status(404).json({ error: 'not_found', message: 'No LaTeX source for this document' });
+        return;
+      }
+      const eprintPath = join(dirname(latexInfo.path), 'eprint');
+      try { await access(eprintPath, constants.R_OK); } catch {
+        res.status(404).json({ error: 'not_found', message: 'eprint archive not on disk' });
+        return;
+      }
+
+      // Cleanup hooks: fire on both normal flush and client disconnect.
+      // rm is idempotent (and the closure nulls tmpDir after first run).
+      res.on('close', () => { void cleanup(); });
+      res.on('finish', () => { void cleanup(); });
+
+      tmpDir = await mkdtemp(join(tmpdir(), 'openarx-serve-'));
+      // Full extract is simpler than selective: arXiv tarballs often store
+      // entries with a leading "./" prefix, which makes selective extract
+      // unreliable across tar implementations. Worst-case ~30 MB per
+      // concurrent request — acceptable for an internal serving path.
+      try {
+        await execFileAsync('tar', ['xzf', eprintPath, '-C', tmpDir]);
+      } catch (err) {
+        res.status(500).json({ error: 'extract_failed', message: `Could not extract eprint: ${err instanceof Error ? err.message : String(err)}` });
+        await cleanup();
+        return;
+      }
+
+      // Realpath check: after extract, the materialized file must be inside
+      // tmpDir. A symlink in the archive pointing outside (e.g. /etc/passwd)
+      // would survive selective extract — this check rejects it.
+      const extractedPath = join(tmpDir, normalized);
+      let resolved: string;
+      try {
+        resolved = await realpath(extractedPath);
+      } catch {
+        res.status(404).json({ error: 'not_found', message: 'Extracted file not accessible' });
+        await cleanup();
+        return;
+      }
+      const tmpReal = await realpath(tmpDir);
+      if (!resolved.startsWith(tmpReal + sep) && resolved !== tmpReal) {
+        res.status(400).json({ error: 'symlink_escape', message: 'Refusing to serve file that escapes the archive' });
+        await cleanup();
+        return;
+      }
+
+      const fileStat = await stat(resolved);
+      if (!fileStat.isFile()) {
+        res.status(400).json({ error: 'not_a_file', message: 'Path resolves to non-regular file' });
+        await cleanup();
+        return;
+      }
+
+      // Inferred content-type by extension; client should not rely on it.
+      const lower = normalized.toLowerCase();
+      const contentType =
+        lower.endsWith('.tex') ? 'application/x-tex; charset=utf-8' :
+        lower.endsWith('.bib') ? 'application/x-bibtex; charset=utf-8' :
+        lower.endsWith('.pdf') ? 'application/pdf' :
+        lower.endsWith('.json') ? 'application/json; charset=utf-8' :
+        'application/octet-stream';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${normalized.replace(/[^a-zA-Z0-9._-]/g, '_')}"`);
+      createReadStream(resolved).pipe(res);
+    } catch (err) {
+      console.error('[internal/source-file] Error:', err instanceof Error ? err.message : err);
+      await cleanup();
+      if (!res.headersSent) res.status(500).json({ error: 'server_error' });
     }
   });
 

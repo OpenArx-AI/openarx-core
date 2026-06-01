@@ -4,6 +4,8 @@ export { PgDocumentStore } from './storage/document-store.js';
 export { QdrantVectorStore } from './storage/vector-store.js';
 export { SearchStore, type BM25Result } from './storage/search-store.js';
 export { PgChunkStore, type ChunkStatusCounts } from './storage/chunk-store.js';
+export { PgDocumentLocationStore } from './storage/document-location-store.js';
+export { PgSourceRegistryStore } from './storage/source-registry-store.js';
 export {
   createInitialReview,
   triggerReview,
@@ -64,4 +66,6 @@ export {
   type EmbedModel,
   type EmbedderImpl,
   type RerankResponse,
+  retry,
+  type RetryOptions,
 } from './model-router/index.js';

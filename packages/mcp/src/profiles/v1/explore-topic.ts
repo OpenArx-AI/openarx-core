@@ -7,7 +7,7 @@ import { hydrateChunkContexts, type RankedChunk } from '../shared/search-helpers
 export function registerExploreTopic(server: McpServer, ctx: AppContext): void {
   server.tool(
     'explore_topic',
-    'Map the conceptual landscape around a topic. Instead of returning a ranked list of papers, returns N distinct conceptual clusters with representative chunks. Built on keyConcept LLM-extracted markers diversification. Use for "what approaches exist to X" queries — answers with thematic map rather than ranked list. Better than search when you want breadth over depth.',
+    'Map the conceptual landscape around a topic. Instead of returning a ranked list of papers, returns N distinct conceptual clusters with representative chunks. Built on keyConcept LLM-extracted markers diversification. Use for "what approaches exist to X" queries — answers with thematic map rather than ranked list. Better than search when you want breadth over depth. Temporal bias note: for topics with dense recent literature (e.g. current LLM research), the default ordering favors recent papers because vector similarity finds them first; specify dateTo for historical exploration of mature topics, or dateFrom+dateTo to slice a specific era. Diversification cap (maxClustersPerPaper) limits how many clusters can have the same source paper as representative chunk — protects against single-paper dominance.',
     {
       concept: z.string().describe(
         'Topic or research question to explore (e.g. "in-context learning", "retrieval augmented generation")',
@@ -15,13 +15,16 @@ export function registerExploreTopic(server: McpServer, ctx: AppContext): void {
       clusterCount: z.number().int().min(3).max(15).default(5).describe(
         'Number of distinct conceptual approaches to return',
       ),
+      maxClustersPerPaper: z.number().int().min(1).max(10).default(2).describe(
+        'Diversification cap: maximum clusters that may use the same source paper as representative chunk. Lower = more paper diversity across clusters; higher = allow dominant papers to be representative in more clusters. Default 2.',
+      ),
       categories: z.array(z.string()).optional().describe('arXiv category filter'),
       dateFrom: z.string().optional().describe('Filter: published on or after (ISO date)'),
       dateTo: z.string().optional().describe('Filter: published on or before (ISO date)'),
       detail: z.enum(['minimal', 'standard', 'full']).default('standard'),
       vectorModel: z.enum(['gemini', 'specter2']).default('gemini'),
     },
-    async ({ concept, clusterCount, categories, dateFrom, dateTo, detail, vectorModel }) => {
+    async ({ concept, clusterCount, maxClustersPerPaper, categories, dateFrom, dateTo, detail, vectorModel }) => {
       const { vector, vectorName } = await embedQuery(concept, vectorModel, ctx);
 
       // Pull a wide candidate pool — we need enough variety for clustering.
@@ -72,12 +75,54 @@ export function registerExploreTopic(server: McpServer, ctx: AppContext): void {
       // Score clusters: by max-chunk-score within cluster (relevance) and
       // chunk-count (volume). Sort by relevance×log(volume).
       const clusterRanked = [...byConcept.entries()].map(([_keyLower, clusterChunks]) => {
-        const top = clusterChunks.reduce((a, b) => a.finalScore > b.finalScore ? a : b);
+        // Sort cluster's chunks once so we can pick an alternative representative
+        // when the top one is already at the per-paper cap (diversification).
+        const sortedChunks = [...clusterChunks].sort((a, b) => b.finalScore - a.finalScore);
+        const top = sortedChunks[0];
         const score = top.finalScore * Math.log2(clusterChunks.length + 1);
-        return { keyLower: _keyLower, originalKey: top.context.keyConcept ?? '', clusterChunks, top, score };
+        return {
+          keyLower: _keyLower,
+          originalKey: top.context.keyConcept ?? '',
+          clusterChunks,
+          sortedChunks,
+          top,
+          score,
+        };
       }).sort((a, b) => b.score - a.score);
 
-      const topClusters = clusterRanked.slice(0, clusterCount);
+      // Diversification: enforce maxClustersPerPaper on representative chunks.
+      // Walk clusters in score order; for each, try to use top-scoring chunk as
+      // representative, but if that chunk's documentId is already at the cap,
+      // fall through to the next-best chunk in the cluster whose doc isn't
+      // capped yet. Drop the cluster entirely only if every chunk's doc is
+      // capped (rare — implies very few unique source papers in the topic).
+      const perPaperReprCount = new Map<string, number>();
+      const topClusters: typeof clusterRanked = [];
+      let clustersSkippedForDiversity = 0;
+      for (const cluster of clusterRanked) {
+        if (topClusters.length >= clusterCount) break;
+        let chosenRepr: RankedChunk | null = null;
+        for (const candidate of cluster.sortedChunks) {
+          const count = perPaperReprCount.get(candidate.documentId) ?? 0;
+          if (count < maxClustersPerPaper) {
+            chosenRepr = candidate;
+            break;
+          }
+        }
+        if (!chosenRepr) {
+          // Every chunk in cluster comes from a paper already at the cap.
+          clustersSkippedForDiversity += 1;
+          continue;
+        }
+        perPaperReprCount.set(chosenRepr.documentId, (perPaperReprCount.get(chosenRepr.documentId) ?? 0) + 1);
+        topClusters.push({
+          ...cluster,
+          top: chosenRepr,
+          // Re-score cluster around the chosen representative so the response
+          // surfaces the representative's actual score, not the displaced one.
+          score: chosenRepr.finalScore * Math.log2(cluster.clusterChunks.length + 1),
+        });
+      }
 
       const clusters = topClusters.map((cl) => {
         const top = cl.top;
@@ -133,6 +178,10 @@ export function registerExploreTopic(server: McpServer, ctx: AppContext): void {
       return jsonResult({
         concept,
         totalClustersFound: clusterRanked.length,
+        clustersReturned: clusters.length,
+        ...(clustersSkippedForDiversity > 0
+          ? { clustersSkippedForDiversity, diversificationNote: `${clustersSkippedForDiversity} candidate cluster(s) were skipped because all their representative-eligible chunks came from papers already at maxClustersPerPaper=${maxClustersPerPaper}. Raise the cap to surface more clusters from dominant papers.` }
+          : {}),
         clusters,
       });
     },

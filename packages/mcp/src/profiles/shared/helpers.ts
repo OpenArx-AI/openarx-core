@@ -65,7 +65,51 @@ export function computeCanServeFile(doc: Document): boolean {
   return isOpenLicense(doc.license as SpdxLicense);
 }
 
+/**
+ * Surface to clients WHY a document is at abstract_only tier. Lets agents
+ * distinguish 'still being processed' from 'legally cannot be indexed beyond
+ * abstract' — different actions are appropriate (wait vs use external source).
+ *
+ * Classification logic:
+ *   - tier=full → null (no limitation)
+ *   - tier=abstract_only + non-open license → 'license' (intentional compliance gate)
+ *   - tier=abstract_only + open/unknown license + status=ready → 'pipeline'
+ *     (unexpected; pipeline produced abstract_only despite open license)
+ *   - tier=abstract_only + status!=ready → 'pending' (still being processed)
+ */
+export interface IndexingLimitation {
+  limitedBy: 'license' | 'pipeline' | 'pending';
+  note: string;
+}
+
+export function computeIndexingLimitation(doc: Document): IndexingLimitation | null {
+  const tier = doc.indexingTier ?? 'full';
+  if (tier === 'full') return null;
+
+  const license = doc.license;
+  if (license && license !== 'NOASSERTION' && !isOpenLicense(license as SpdxLicense)) {
+    return {
+      limitedBy: 'license',
+      note: `${license} restricts derivative works or commercial use; only the abstract is indexable under fair-use carve-outs. Full text available at the source URL.`,
+    };
+  }
+
+  // tier is abstract_only but license is open/unknown — either pipeline isn't
+  // finished yet, or it ran and produced abstract_only for some non-license reason.
+  if (doc.status !== 'ready') {
+    return {
+      limitedBy: 'pending',
+      note: `Document is still being processed (status=${doc.status}); full text will become available after the pipeline finishes.`,
+    };
+  }
+  return {
+    limitedBy: 'pipeline',
+    note: 'Document was processed but full-text extraction is unavailable for this paper. This is unexpected for an open-license document — report if persistent.',
+  };
+}
+
 export function formatDoc(doc: Document): Record<string, unknown> {
+  const limitation = computeIndexingLimitation(doc);
   return {
     id: doc.id,
     title: doc.title,
@@ -82,5 +126,7 @@ export function formatDoc(doc: Document): Record<string, unknown> {
     licenses: doc.licenses ?? {},
     indexingTier: doc.indexingTier ?? 'full',
     canServeFile: computeCanServeFile(doc),
+    indexingLimitedBy: limitation?.limitedBy ?? null,
+    indexingLimitedNote: limitation?.note ?? null,
   };
 }

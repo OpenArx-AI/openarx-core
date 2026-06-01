@@ -32,7 +32,8 @@ import { access, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseWithStrategy } from '../parsers/parse-strategy.js';
 import { ParserStep } from './parser-step.js';
-import { ChunkerStep } from './chunker-step.js';
+import { ChunkerStep, buildAbstractChunkContext } from './chunker-step.js';
+import { buildEmbedText } from './embed-text-builder.js';
 import { EnricherStep } from './enricher-step.js';
 import { IndexerStep } from './indexer-step.js';
 import { TranslationStep } from './translation-step.js';
@@ -330,14 +331,7 @@ export async function embedGeminiWorker(item: WorkItem, steps: PipelineSteps): P
 
   const { logger, costTracker } = context;
 
-  const texts = chunks.map((chunk) => {
-    const title = chunk.context.documentTitle || '';
-    const section = chunk.context.sectionPath || chunk.context.sectionName || '';
-    if (chunk.context.summary && chunk.context.keyConcept) {
-      return `${title}. ${section}. [${chunk.context.keyConcept}] ${chunk.context.summary}\n${chunk.content}`;
-    }
-    return `${title}. ${section}. ${chunk.content}`;
-  });
+  const texts = chunks.map((chunk) => buildEmbedText(chunk));
 
   logger.info(`Embedding ${chunks.length} chunks with ${INGEST_GEMINI_MODEL} via embed-service${steps.bypassEmbedCache ? ' (bypassCache)' : ''}`);
   const t0 = performance.now();
@@ -412,14 +406,7 @@ export async function embedSpecterWorker(item: WorkItem, steps: PipelineSteps): 
   const { context, chunks } = item;
   if (!chunks || chunks.length === 0) return;
 
-  const texts = chunks.map((chunk) => {
-    const title = chunk.context.documentTitle || '';
-    const section = chunk.context.sectionPath || chunk.context.sectionName || '';
-    if (chunk.context.summary && chunk.context.keyConcept) {
-      return `${title}. ${section}. [${chunk.context.keyConcept}] ${chunk.context.summary}\n${chunk.content}`;
-    }
-    return `${title}. ${section}. ${chunk.content}`;
-  });
+  const texts = chunks.map((chunk) => buildEmbedText(chunk));
 
   try {
     context.logger.info(`Embedding ${chunks.length} chunks with SPECTER2 via embed-service${steps.bypassEmbedCache ? ' (bypassCache)' : ''}`);
@@ -627,20 +614,16 @@ export async function abstractChunkWorker(item: WorkItem, steps: PipelineSteps):
 
   const { randomUUID } = await import('node:crypto');
 
-  // Create a single chunk from the abstract with stable qdrantPointId
+  // Create a single chunk from the abstract with stable qdrantPointId.
+  // Context is populated via buildAbstractChunkContext heuristic — same
+  // shape as full-tier abstract chunks (PF-003).
   item.chunks = [{
     id: randomUUID(),
     version: 1,
     createdAt: new Date(),
     documentId: doc.id,
     content: abstract,
-    context: {
-      documentTitle: doc.title,
-      sectionName: 'Abstract',
-      sectionPath: 'Abstract',
-      positionInDocument: 0,
-      totalChunks: 1,
-    },
+    context: buildAbstractChunkContext(abstract, doc.title, 1),
     vectors: {},
     metrics: {},
     qdrantPointId: randomUUID(),

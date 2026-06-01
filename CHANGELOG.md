@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-06-01
+
+Patch release. Search-quality improvements (soft metadata filtering),
+on-demand source-file access over MCP, and reliability/cost fixes in the
+ingest chunking and LaTeX parsing stages.
+
+### Added
+- **On-demand source files over MCP** — documents can return their
+  original LaTeX source and individual source files on request, served
+  lazily from the archived upload instead of a persisted copy.
+- **Embedding text builder** — dedicated, tested construction of the
+  text passed to the embedding models, shared across pipeline stages.
+
+### Changed
+- **Soft metadata filtering in search** — filtering chunks by
+  `contentType` or `entities` no longer silently drops chunks that lack
+  that metadata. Matching chunks rank first; chunks with unknown
+  metadata are kept in a lower "unknown" tier rather than excluded, and
+  responses report how many unknown-tier chunks were included. Applies
+  to `get_chunks`, `search`, `find_methodology`, `find_evidence`, and
+  related tools.
+- **Tool manifest** (`mcp-server.json`) regenerated to match the
+  deployed governance server — updated tool descriptions and input
+  schemas.
+
+### Fixed
+- **Chunking stability and cost** — the chunker no longer constrains the
+  primary model call with a structured-output schema parameter, which on
+  math/LaTeX-dense papers inflated output and caused truncation. It now
+  validates the returned JSON and retries only the failed batches on a
+  higher-capability model with the schema, keeping chunk metadata
+  complete while avoiding the truncation/retry storm.
+- **LaTeX parsing robustness** — eprint archives are extracted on demand
+  for parsing and cleaned up afterward; a content-empty LaTeX parse now
+  falls back to the PDF path, so papers whose body lives in an
+  un-included supplement file still produce chunks.
+- **Resilience to blocked model responses** — the model client now
+  handles responses with no candidates (safety/recitation blocks)
+  gracefully instead of throwing.
+
 ## [0.1.1] — 2026-05-13
 
 Patch release. MCP transport conformance against the registry test

@@ -73,3 +73,4 @@ export { RerankerClient } from './reranker-client.js';
 export type { RerankResult, RerankResponse } from './reranker-client.js';
 export { EmbeddingPool } from './embedding-pool.js';
 export { EmbedClient, type EmbedClientConfig, type EmbedClientRequestOverrides, type EmbedModel } from './embed-client.js';
+export { retry, type RetryOptions } from './retry.js';

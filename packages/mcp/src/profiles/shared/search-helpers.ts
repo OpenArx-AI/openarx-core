@@ -13,7 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Document, ChunkContext } from '@openarx/types';
 import type { AppContext } from '../../context.js';
-import { computeCanServeFile, truncateChunk } from './helpers.js';
+import { computeCanServeFile, computeIndexingLimitation, truncateChunk } from './helpers.js';
 import { getRedis } from '../../lib/redis.js';
 
 const SEARCH_POOL_TTL_SEC = 300;
@@ -92,13 +92,26 @@ export async function hydrateChunkContexts(
 
 /**
  * Filter chunks by chunk-context fields. Both filters are AND-ed.
- *   contentType[] — chunk's contentType must match one of provided values
- *   entities[] — chunk's entities must contain ANY of the provided values
- *                (case-insensitive).
+ *   contentType[] — SOFT FILTER: chunks whose contentType matches go to the
+ *                   matched tier; chunks lacking contentType go to the
+ *                   "unknown" tier (bottom, not dropped); chunks with an
+ *                   explicit DIFFERENT contentType are dropped.
+ *   entities[]   — SOFT FILTER (same shape, openarx soft-entities): chunks
+ *                   with a matching entity → matched; chunks with NO entities
+ *                   recorded (null/empty) → "unknown" tier (bottom, not
+ *                   dropped — ~23% of the corpus has null entities from a
+ *                   legacy ingest gap); chunks that HAVE entities but none
+ *                   match → dropped (genuine mismatch, parallel to a wrong
+ *                   contentType).
  *
- * Chunks lacking the relevant context field are excluded when that filter
- * is active (no false positives for missing data).
+ * Per active soft filter a chunk is MATCH / UNKNOWN / MISMATCH. A chunk is
+ * dropped if ANY active filter is MISMATCH; otherwise it lands in the matched
+ * tier when all active filters are MATCH, or the unknown tier if any is
+ * UNKNOWN. Return order: matched tier first, unknown tier second (each
+ * preserving input order). The caller does not need to re-sort.
  */
+type FilterVerdict = 'match' | 'unknown' | 'mismatch';
+
 export function applyChunkContextFilters(
   chunks: RankedChunk[],
   filters: ChunkContextFilters,
@@ -110,17 +123,43 @@ export function applyChunkContextFilters(
     ? filters.entities.map((e) => e.toLowerCase())
     : null;
 
-  return chunks.filter((c) => {
+  const matched: RankedChunk[] = [];
+  const unknown: RankedChunk[] = [];
+
+  for (const c of chunks) {
+    // contentType verdict
+    let ctVerdict: FilterVerdict = 'match';
     if (ctSet) {
       const ct = c.context.contentType?.toLowerCase();
-      if (!ct || !ctSet.has(ct)) return false;
+      if (!ct) ctVerdict = 'unknown';
+      else if (!ctSet.has(ct)) ctVerdict = 'mismatch';
     }
+    // entities verdict
+    let entVerdict: FilterVerdict = 'match';
     if (entitiesLower) {
       const ents = (c.context.entities ?? []).map((e) => e.toLowerCase());
-      if (!entitiesLower.some((needle) => ents.includes(needle))) return false;
+      if (ents.length === 0) entVerdict = 'unknown';
+      else if (!entitiesLower.some((needle) => ents.includes(needle))) entVerdict = 'mismatch';
     }
-    return true;
-  });
+
+    if (ctVerdict === 'mismatch' || entVerdict === 'mismatch') continue; // drop
+    if (ctVerdict === 'unknown' || entVerdict === 'unknown') unknown.push(c);
+    else matched.push(c);
+  }
+
+  return [...matched, ...unknown];
+}
+
+/**
+ * Count how many chunks in the result list have null/missing contentType
+ * (i.e. were included via the soft-filter "unknown" tier). Useful for
+ * response telemetry so callers can see how much of their result list is
+ * unlabeled legacy data vs explicit matches.
+ */
+export function countUnknownContentType(chunks: RankedChunk[]): number {
+  let n = 0;
+  for (const c of chunks) if (!c.context.contentType) n += 1;
+  return n;
 }
 
 /**
@@ -217,16 +256,19 @@ export function formatSearchResult(
     chunkContext: {
       summary: chunk.context.summary ?? null,
       keyConcept: chunk.context.keyConcept ?? null,
-      contentType: chunk.context.contentType ?? null,
+      contentType: chunk.context.contentType ?? 'unknown',
       sectionPath: chunk.context.sectionPath ?? null,
       position: chunk.context.positionInDocument ?? 0,
     },
   };
 
   if (detail === 'full') {
+    const limitation = computeIndexingLimitation(doc);
     result.licenses = doc.licenses ?? {};
     result.indexingTier = doc.indexingTier ?? 'full';
     result.canServeFile = computeCanServeFile(doc);
+    result.indexingLimitedBy = limitation?.limitedBy ?? null;
+    result.indexingLimitedNote = limitation?.note ?? null;
     result.externalIds = doc.externalIds ?? {};
     result.categories = doc.categories;
     result.authorsFull = doc.authors;
