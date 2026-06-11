@@ -13,6 +13,7 @@ import {
   QdrantVectorStore,
   DefaultModelRouter,
   EmbedClient,
+  computeOarxId,
   query,
   pool,
 } from '@openarx/api';
@@ -23,6 +24,7 @@ import { PwcLoader } from '../pipeline/enricher/pwc-loader.js';
 import { ArxivSource } from '../sources/arxiv-source.js';
 import type { ArxivEntry } from '../sources/arxiv-source.js';
 import { createChildLogger } from '../lib/logger.js';
+import { buildListedRows, buildListedInsertSql, flattenListedRows } from '../lib/listed-registry.js';
 import { Channel } from '../pipeline/channel.js';
 import { initProxyPool } from '../lib/proxy-pool.js';
 import { Semaphore } from '../lib/semaphore.js';
@@ -42,11 +44,12 @@ const DATA_DIR = process.env.RUNNER_DATA_DIR ?? join(process.cwd(), 'data/sample
 /**
  * Burst-failure detection thresholds.
  *
- * The day-walk producers in fetchBackfill / fetchDateRange wrap each day in
- * a try/catch and continue on error. When the underlying error source is fast
- * (e.g. Postgres ECONNREFUSED has no I/O delay), the catch+continue ripples
- * through hundreds of remaining days in milliseconds and the run finalizes as
- * 'completed' instead of 'failed' — see openarx-68f9 root cause.
+ * The registry producer wraps each document download in a try/catch and
+ * continues on error (runRegistryUpdate does the same per day). When the
+ * underlying error source is fast (e.g. Postgres ECONNREFUSED has no I/O
+ * delay), the catch+continue ripples through everything remaining in
+ * milliseconds and the run finalizes as 'completed' instead of 'failed' —
+ * see openarx-68f9 root cause.
  *
  * Guard: if N consecutive day-iterations fail within a short window, treat
  * this as an infrastructure-level failure, break the loop, surface the cause,
@@ -83,6 +86,18 @@ function maxDate(a: Date | null, b: Date | null): Date | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Inclusive list of YYYY-MM-DD days, ascending. */
+function enumerateDays(from: string, to: string): string[] {
+  const days: string[] = [];
+  const d = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  while (d.getTime() <= end.getTime()) {
+    days.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return days;
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -227,9 +242,23 @@ export class RunnerService {
     strategy?: 'license_aware' | 'force_full',
     bypassEmbedCache?: boolean,
     categories?: string[],
+    downloadedFirst?: boolean,
   ): Promise<PipelineRun> {
     if (this.isRunning) {
       throw new Error('Already running. Use "openarx status" to check progress.');
+    }
+
+    // Registry-driven model (openarx-j173): direction is the traversal order
+    // over published_at. Legacy socket values are mapped, not rejected:
+    //   backfill → backward, mixed → forward,
+    //   pending_only → downloaded-backlog-only run (no dates needed).
+    let effectiveDirection: 'forward' | 'backward' = 'forward';
+    let effectiveDownloadedFirst = downloadedFirst === true;
+    if (direction === 'backward' || direction === 'backfill') effectiveDirection = 'backward';
+    else if (direction === 'pending_only') effectiveDownloadedFirst = true;
+
+    if (!dateFrom && !dateTo && !effectiveDownloadedFirst) {
+      throw new Error('At least one of dateFrom/dateTo is required (or set downloadedFirst to process the downloaded backlog only).');
     }
 
     this.stopRequested = false;
@@ -241,11 +270,10 @@ export class RunnerService {
 
     // Create pipeline_run record with launch params in metrics
     const runId = randomUUID();
-    const effectiveDirection = direction ?? 'mixed';
     const effectiveStrategy = strategy ?? 'license_aware';
     const effectiveBypassEmbedCache = bypassEmbedCache === true;
     // No env fallback: if caller didn't pass categories, currentCategories
-    // stays null and post-fetch filter is bypassed (process everything fetched).
+    // stays null and the registry selection takes every category.
     const effectiveCategories = (categories && categories.length > 0)
       ? categories.map((c) => c.trim()).filter(Boolean)
       : null;
@@ -255,6 +283,7 @@ export class RunnerService {
     const runParams: Record<string, unknown> = { limit, strategy: effectiveStrategy };
     if (dateFrom) runParams.dateFrom = dateFrom;
     if (dateTo) runParams.dateTo = dateTo;
+    if (effectiveDownloadedFirst) runParams.downloadedFirst = true;
     if (effectiveBypassEmbedCache) runParams.bypassEmbedCache = true;
     if (effectiveCategories) runParams.categories = effectiveCategories;
     await query(
@@ -265,20 +294,50 @@ export class RunnerService {
     this.currentRunId = runId;
 
     log.info(
-      { runId, limit, direction: effectiveDirection, dateFrom, dateTo, strategy: effectiveStrategy, bypassEmbedCache: effectiveBypassEmbedCache },
+      { runId, limit, direction: effectiveDirection, dateFrom, dateTo, downloadedFirst: effectiveDownloadedFirst, strategy: effectiveStrategy, bypassEmbedCache: effectiveBypassEmbedCache },
       'Ingest started',
     );
 
     // Run in background — don't await
-    if (effectiveDirection === 'pending_only') {
-      this.runPendingOnly(runId).catch((err) => {
-        log.error({ err, runId }, 'pending_only failed unexpectedly');
-      });
-    } else {
-      this.runIngest(runId, limit, effectiveDirection, dateFrom, dateTo).catch((err) => {
-        log.error({ err, runId }, 'Ingest failed unexpectedly');
-      });
+    this.runIngest(runId, limit, effectiveDirection, dateFrom, dateTo, effectiveDownloadedFirst).catch((err) => {
+      log.error({ err, runId }, 'Ingest failed unexpectedly');
+    });
+
+    return this.getRunById(runId);
+  }
+
+  async registryUpdate(params: {
+    dateFrom?: string;
+    dateTo?: string;
+    direction?: 'forward' | 'backward';
+    limit?: number;
+  }): Promise<PipelineRun> {
+    if (this.isRunning) {
+      throw new Error('Already running. Use "openarx status" to check progress.');
     }
+    if (!params.dateFrom && !params.dateTo) {
+      throw new Error('registry-update requires at least one of dateFrom/dateTo.');
+    }
+
+    this.stopRequested = false;
+    this.stopSignal = { requested: false };
+    this.abortController = new AbortController();
+
+    const runId = randomUUID();
+    const direction = params.direction ?? 'forward';
+    const limit = params.limit ?? 100;
+    await query(
+      `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
+       VALUES ($1, 'running', 'registry_update', 'arxiv', '{}', $2::jsonb)`,
+      [runId, JSON.stringify({ params: { dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit } })],
+    );
+    this.currentRunId = runId;
+
+    log.info({ runId, dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit }, 'Registry update started');
+
+    this.runRegistryUpdate(runId, { dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit }).catch((err) => {
+      log.error({ err, runId }, 'Registry update failed unexpectedly');
+    });
 
     return this.getRunById(runId);
   }
@@ -447,10 +506,11 @@ export class RunnerService {
       // Count papers in arXiv for this day (single-call probe to get total)
       const { total: arxivCount } = await this.arxivSource.searchByDateWindow(day, 0, 1, this.abortController.signal);
 
-      // Count papers in our DB for this day
+      // Count papers in our DB for this day. Registry rows (status='listed')
+      // are metadata-only — counting them would mask never-downloaded gaps.
       const dbResult = await query<{ cnt: string }>(
         `SELECT count(*) as cnt FROM documents
-         WHERE source = 'arxiv'
+         WHERE source = 'arxiv' AND status != 'listed'
            AND published_at >= TO_TIMESTAMP($1, 'YYYYMMDD') AT TIME ZONE 'UTC'
            AND published_at < TO_TIMESTAMP($1, 'YYYYMMDD') AT TIME ZONE 'UTC' + INTERVAL '1 day'`,
         [day],
@@ -478,12 +538,18 @@ export class RunnerService {
         const { entries } = await this.arxivSource.searchByDateWindow(day, offset, 200, this.abortController.signal);
         if (entries.length === 0) break;
 
+        // Keep the per-document registry in sync for audited days too.
+        await this.registerListedEntries(entries);
+
         for (const entry of entries) {
           const existing = await this.documentStore.getBySourceId('arxiv', entry.arxivId);
-          if (existing) continue;
+          // Registry rows (status='listed') are still "missing" for audit
+          // purposes — download files into the same row. Everything else
+          // (incl. soft-deleted) is already accounted for.
+          if (existing && !(existing.status === 'listed' && !existing.deletedAt)) continue;
 
           try {
-            await this.arxivSource.downloadAndRegister(entry, this.documentStore);
+            await this.arxivSource.downloadAndRegister(entry, this.documentStore, existing ?? undefined);
             downloaded++;
             log.info({ arxivId: entry.arxivId, day }, 'Audit: downloaded missing paper');
           } catch (err) {
@@ -530,7 +596,7 @@ export class RunnerService {
 
   // ─── Internal ────────────────────────────────────────────
 
-  private async runIngest(runId: string, limit: number, direction: Direction, dateFromOverride?: string, dateToOverride?: string): Promise<void> {
+  private async runIngest(runId: string, limit: number, direction: 'forward' | 'backward', dateFromOverride?: string, dateToOverride?: string, downloadedFirst?: boolean): Promise<void> {
     let remaining = limit;
     let totalFetched = 0;
     let totalProcessed = 0;
@@ -540,8 +606,10 @@ export class RunnerService {
     let dateTo: Date | null = null;
 
     try {
-      // Step 0: Process any existing downloaded papers first
-      if (remaining > 0 && !this.stopRequested) {
+      // Phase A (explicit --downloaded-first flag): drain the downloaded
+      // backlog regardless of dates, within the limit. Replaces both the
+      // old implicit Step 0 and the pending_only direction.
+      if (downloadedFirst && remaining > 0 && !this.stopRequested) {
         const pending = await this.documentStore.listByStatus('downloaded', remaining);
         if (pending.length > 0) {
           log.info({ count: pending.length, remaining }, 'Processing existing downloaded papers');
@@ -617,32 +685,30 @@ export class RunnerService {
         }
       }
 
-      // Track infra-failure surfaced by either pass — used to mark the run
-      // as 'failed' in the finalize block instead of silently 'completed'
-      // (openarx-68f9).
+      // Track infra-failure surfaced by the registry phase — used to mark
+      // the run as 'failed' in the finalize block instead of silently
+      // 'completed' (openarx-68f9).
       let infraFailure: InfraFailure | undefined;
 
-      // Forward pass — fetch newest papers (no date window needed)
-      if ((direction === 'forward' || direction === 'mixed') && remaining > 0 && !this.stopRequested) {
-        const result = await this.fetchForward(runId, remaining);
-        remaining -= result.processed + result.skipped;
-        totalFetched += result.fetched;
-        totalProcessed += result.processed;
-        totalFailed += result.failed;
-        totalSkipped += result.skipped;
-        dateFrom = minDate(dateFrom, result.dateFrom);
-        dateTo = maxDate(dateTo, result.dateTo);
-      }
-
-      // Backfill pass — walk backward day by day with date-window pagination
-      if ((direction === 'backfill' || direction === 'mixed') && remaining > 0 && !this.stopRequested) {
-        const result = await this.fetchBackfill(runId, remaining, dateFromOverride, dateToOverride);
-        totalFetched += result.fetched;
-        totalProcessed += result.processed;
-        totalFailed += result.failed;
-        totalSkipped += result.skipped;
-        dateFrom = minDate(dateFrom, result.dateFrom);
-        dateTo = maxDate(dateTo, result.dateTo);
+      // Registry phase — work straight from the per-document registry
+      // (status IN listed/downloaded within the period), no arXiv listing
+      // fetch. Stops at the limit or when the period is exhausted.
+      if ((dateFromOverride || dateToOverride) && remaining > 0 && !this.stopRequested) {
+        const counters = { remaining, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
+        const result = await this.processRegistryParallel(
+          runId,
+          { dateFrom: dateFromOverride, dateTo: dateToOverride, direction, categories: this.currentCategories },
+          counters,
+        );
+        remaining = counters.remaining;
+        totalFetched += counters.totalFetched;
+        totalProcessed += counters.processed;
+        // counters.failed = pipeline failures (consumer); result.failed =
+        // download failures (producer) — both count as failed docs.
+        totalFailed += counters.failed + result.failed;
+        totalSkipped += counters.skipped;
+        dateFrom = minDate(dateFrom, counters.dateFrom);
+        dateTo = maxDate(dateTo, counters.dateTo);
         if (result.infraFailure) infraFailure = result.infraFailure;
       }
 
@@ -792,560 +858,311 @@ export class RunnerService {
     }
   }
 
-  /**
-   * Process only existing status='downloaded' documents — no fetch from arXiv.
-   *
-   * Used after enrichment worker marks abstract_only documents for re-indexing
-   * (status='downloaded', indexing_tier=NULL). The orchestrator will recompute
-   * the indexing tier based on the now-updated license and route through full pipeline.
-   */
-  private async runPendingOnly(runId: string): Promise<void> {
-    let totalProcessed = 0;
-    let totalFailed = 0;
-    let totalSkipped = 0;
+  /** Rebuild the download request (listing entry) from a registry row. */
+  private docToEntry(doc: Document): ArxivEntry {
+    const pub = doc.publishedAt instanceof Date
+      ? doc.publishedAt.toISOString()
+      : String(doc.publishedAt ?? '');
+    return {
+      arxivId: doc.sourceId,
+      title: doc.title,
+      authors: doc.authors ?? [],
+      abstract: doc.abstract ?? '',
+      categories: doc.categories ?? [],
+      publishedAt: pub,
+      updatedAt: pub,
+      pdfUrl: `https://arxiv.org/pdf/${doc.sourceId}`,
+      doi: doc.externalIds?.doi,
+      journalRef: doc.externalIds?.journal_ref,
+    };
+  }
 
-    try {
-      const pending = await this.documentStore.listByStatus('downloaded', 100_000);
-      if (pending.length === 0) {
-        log.info('pending_only: no downloaded documents to process');
-        await query(
-          `UPDATE pipeline_runs SET status = 'completed', finished_at = now(),
-           docs_processed = 0, docs_failed = 0, docs_skipped = 0
-           WHERE id = $1`,
-          [runId],
-        );
-        return;
+  /**
+   * Registry-driven producer (openarx-j173): selects work straight from the
+   * per-document registry — no arXiv listing fetch. Selection is
+   * self-resuming by construction: processed docs change status and drop out
+   * of the WHERE clause, so re-running the same period continues where the
+   * previous run stopped.
+   *
+   *   status='listed'     → download files into the SAME row (read-modify-write
+   *                         via applyDownloadSuccess), then hand to the channel
+   *   status='downloaded' → hand straight to the channel for processing
+   *
+   * The `seen` set guards against re-selecting docs whose pipeline processing
+   * has not finished yet (status flips to ready/failed only after the
+   * consumer is done with them).
+   */
+  private async produceRegistryDownloads(
+    runId: string,
+    opts: { dateFrom?: string; dateTo?: string; direction: 'forward' | 'backward'; categories: string[] | null },
+    ch: Channel<{ entry: ArxivEntry; doc: Document }>,
+    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
+    stopFlag: { value: boolean },
+  ): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> {
+    let downloaded = 0;
+    let failed = 0;
+    let infraFailure: InfraFailure | undefined;
+    const dlSem = new Semaphore(this.downloadConcurrency);
+    const seen = new Set<string>();
+    const order = opts.direction === 'backward' ? 'DESC' : 'ASC';
+
+    // Burst detection on download failures (openarx-68f9 analogue): a run of
+    // consecutive failures inside a short window means infrastructure trouble
+    // (network, proxies, arXiv), not bad documents.
+    let consecutiveFailures = 0;
+    let firstFailureAt: number | null = null;
+
+    while (counters.remaining > 0 && !this.stopRequested && !stopFlag.value) {
+      const conds = [`source = 'arxiv'`, `status IN ('listed', 'downloaded')`, 'deleted_at IS NULL'];
+      const params: unknown[] = [];
+      if (opts.dateFrom) { params.push(opts.dateFrom); conds.push(`published_at >= $${params.length}::date`); }
+      if (opts.dateTo) { params.push(opts.dateTo); conds.push(`published_at < $${params.length}::date + interval '1 day'`); }
+      if (opts.categories && opts.categories.length > 0) { params.push(opts.categories); conds.push(`categories && $${params.length}`); }
+      if (seen.size > 0) { params.push([...seen]); conds.push(`NOT (id = ANY($${params.length}::uuid[]))`); }
+      params.push(Math.min(200, counters.remaining));
+      const batch = await query<{ id: string }>(
+        `SELECT id FROM documents
+          WHERE ${conds.join(' AND ')}
+          ORDER BY published_at ${order}, id
+          LIMIT $${params.length}`,
+        params,
+      );
+      if (batch.rows.length === 0) break; // period exhausted
+
+      await Promise.allSettled(batch.rows.map(({ id }) => dlSem.withResource(async () => {
+        if (counters.remaining <= 0 || this.stopRequested || stopFlag.value) return;
+        seen.add(id);
+        const doc = await this.documentStore.getById(id);
+        if (!doc || doc.deletedAt) return;
+
+        if (doc.status === 'downloaded') {
+          counters.remaining--;
+          counters.totalFetched++;
+          await ch.send({ entry: this.docToEntry(doc), doc });
+          return;
+        }
+        if (doc.status !== 'listed') return; // raced with another writer
+
+        const entry = this.docToEntry(doc);
+        try {
+          const { document: downloadedDoc } = await this.arxivSource.downloadAndRegister(entry, this.documentStore, doc);
+          counters.remaining--;
+          counters.totalFetched++;
+          downloaded++;
+          consecutiveFailures = 0;
+          firstFailureAt = null;
+          log.info({ arxivId: doc.sourceId, format: downloadedDoc.sourceFormat, remaining: counters.remaining }, 'Downloaded (registry)');
+          await ch.send({ entry, doc: downloadedDoc });
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          log.error({ arxivId: doc.sourceId, err: errMsg }, 'Registry download failed');
+          try { await this.saveFailedDownload(entry, errMsg, doc.id); } catch { /* non-critical */ }
+          failed++;
+          if (consecutiveFailures === 0) firstFailureAt = Date.now();
+          consecutiveFailures++;
+          if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
+              firstFailureAt !== null &&
+              Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
+            log.error({ consecutiveFailures, lastError: errMsg },
+              'Consecutive download failures within burst window — likely infrastructure issue, stopping run');
+            infraFailure = {
+              reason: 'consecutive_day_failures',
+              count: consecutiveFailures,
+              windowMs: Date.now() - firstFailureAt,
+              lastError: errMsg,
+            };
+            stopFlag.value = true;
+          }
+        }
+      })));
+
+      if (seen.size > 100_000) break; // paranoia cap; the limit bounds it anyway
+    }
+
+    return { downloaded, failed, infraFailure };
+  }
+
+  /**
+   * Registry producer + pipeline consumer over a shared channel. The
+   * consumer is the same sliding-window flow the per-day model used:
+   * concurrent doc processing, fail-rate auto-stop, per-date coverage
+   * refresh.
+   */
+  private async processRegistryParallel(
+    runId: string,
+    opts: { dateFrom?: string; dateTo?: string; direction: 'forward' | 'backward'; categories: string[] | null },
+    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
+  ): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> {
+    type DownloadedItem = { entry: ArxivEntry; doc: Document };
+    const ch = new Channel<DownloadedItem>(800);
+    const stopFlag = { value: false };
+
+    const producer = async (): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> => {
+      try {
+        return await this.produceRegistryDownloads(runId, opts, ch, counters, stopFlag);
+      } finally {
+        ch.close();
+      }
+    };
+
+    const consumer = async (): Promise<void> => {
+      const maxConcurrentDocs = parseInt(process.env.PIPELINE_MAX_CONCURRENT_DOCS ?? '10', 10);
+      const docSemaphore = new Semaphore(maxConcurrentDocs);
+      const inFlight: Promise<void>[] = [];
+
+      let item: DownloadedItem | null;
+      while ((item = await ch.receive()) !== null) {
+        if (this.stopRequested || stopFlag.value) break;
+
+        const captured = item;
+        await docSemaphore.acquire();
+
+        const p = (async () => {
+          try {
+            if (this.stopRequested || stopFlag.value) return;
+
+            const result = await this.orchestrator.processOneDoc(captured.doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
+
+            if (result.status === 'ready') {
+              counters.processed++;
+              const pubDate = new Date(captured.entry.publishedAt);
+              counters.dateFrom = minDate(counters.dateFrom, pubDate);
+              counters.dateTo = maxDate(counters.dateTo, pubDate);
+              await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
+            } else if (result.status === 'failed') {
+              counters.failed++;
+            }
+            await this.updateRunProgress(runId, counters.processed, counters.failed, counters.skipped, captured.doc.id);
+
+            const totalAttempted = counters.processed + counters.failed;
+            if (totalAttempted >= 5 && counters.failed / totalAttempted > this.maxFailRate) {
+              log.error({ processed: counters.processed, failed: counters.failed }, 'Fail rate exceeded');
+              await query(
+                `UPDATE pipeline_runs SET metrics = COALESCE(metrics, '{}'::jsonb) || '{"auto_stop": "fail_rate_exceeded"}'::jsonb WHERE id = $1`,
+                [runId],
+              );
+              stopFlag.value = true;
+            }
+          } finally {
+            docSemaphore.release();
+          }
+        })();
+        inFlight.push(p);
       }
 
-      log.info({ count: pending.length }, 'pending_only: processing downloaded docs');
+      // Drain channel to unblock producer's ch.send()
+      while (await ch.receive() !== null) { /* discard */ }
 
-      const report = await this.orchestrator!.processAll(
-        pending.length, 1, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache,
-      );
+      await Promise.allSettled(inFlight);
+    };
 
-      for (const result of report.results) {
-        if (result.status === 'ready') {
-          totalProcessed++;
-          // Update coverage_map breakdown for re-indexed docs
-          const doc = pending.find(d => d.id === result.documentId);
-          if (doc?.publishedAt) {
-            const pubDate = doc.publishedAt instanceof Date ? doc.publishedAt : new Date(doc.publishedAt);
-            await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
+    const [prodResult] = await Promise.all([producer(), consumer()]);
+    return prodResult;
+  }
+
+  /**
+   * Walk arXiv day listings over the period and register every entry in the
+   * per-document registry (status='listed' rows) — the DISCOVERY half of the
+   * registry model; downloading/processing is `ingest`. Days are atomic: a
+   * started day is always finished, the entry limit is checked at day
+   * boundaries. coverage_map.expected is flushed ONCE per day from the full
+   * day's entries (the per-batch overwrite was the openarx-9vqv bug).
+   */
+  private async runRegistryUpdate(
+    runId: string,
+    opts: { dateFrom?: string; dateTo?: string; direction: 'forward' | 'backward'; limit: number },
+  ): Promise<void> {
+    let fetched = 0;
+    let inserted = 0;
+    let daysProcessed = 0;
+    const failedDays: string[] = [];
+
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      // Old-format arXiv ids (pre 2007-04) are not parseable by the entry
+      // parser — clamp the open lower bound there.
+      const lower = opts.dateFrom ?? '2007-04-01';
+      const upper = (opts.dateTo && opts.dateTo < today) ? opts.dateTo : today;
+      const days = enumerateDays(lower, upper);
+      if (opts.direction === 'backward') days.reverse();
+
+      for (const day of days) {
+        if (this.stopRequested || fetched >= opts.limit) break;
+        const dayCompact = day.replace(/-/g, '');
+
+        try {
+          const dayEntries: ArxivEntry[] = [];
+          let offset = 0;
+          let total = Number.MAX_SAFE_INTEGER;
+          while (offset < total && !this.stopRequested) {
+            const { total: t, entries } = await this.arxivSource.searchByDateWindow(dayCompact, offset, 200, this.abortController.signal);
+            total = t;
+            if (entries.length === 0) break;
+            dayEntries.push(...entries);
+            offset += entries.length;
           }
-        } else if (result.status === 'failed') {
-          totalFailed++;
-        } else if (result.status === 'duplicate') {
-          totalSkipped++;
+
+          inserted += await this.registerListedEntries(dayEntries);
+          await this.bumpCoverageExpected(dayCompact, dayEntries);
+          fetched += dayEntries.length;
+          daysProcessed++;
+
+          await query(
+            `UPDATE pipeline_runs SET docs_fetched = $1, docs_processed = $2, backfill_date = $3 WHERE id = $4`,
+            [fetched, inserted, day, runId],
+          );
+          log.info({ day, entries: dayEntries.length, listedInserted: inserted, fetched, limit: opts.limit }, 'registry-update: day complete');
+        } catch (err) {
+          failedDays.push(day);
+          log.error({ day, err: err instanceof Error ? err.message : err }, 'registry-update: day failed, continuing with next day');
         }
       }
 
       const finalStatus = this.stopRequested ? 'stopped' : 'completed';
       await query(
         `UPDATE pipeline_runs SET status = $1, finished_at = now(),
-         docs_processed = $2, docs_failed = $3, docs_skipped = $4
+          docs_fetched = $2, docs_processed = $3,
+          metrics = COALESCE(metrics, '{}'::jsonb) || $4::jsonb
          WHERE id = $5`,
-        [finalStatus, totalProcessed, totalFailed, totalSkipped, runId],
+        [finalStatus, fetched, inserted,
+         JSON.stringify({ days_processed: daysProcessed, listed_inserted: inserted, failed_days: failedDays }),
+         runId],
       );
-
-      log.info({ runId, status: finalStatus, totalProcessed, totalFailed, totalSkipped }, 'pending_only complete');
+      log.info({ runId, status: finalStatus, daysProcessed, fetched, inserted, failedDays }, 'Registry update finished');
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await query(
         `UPDATE pipeline_runs SET status = 'failed', finished_at = now(),
          metrics = COALESCE(metrics, '{}'::jsonb) || $1::jsonb,
-         docs_processed = $2, docs_failed = $3, docs_skipped = $4
-         WHERE id = $5`,
-        [JSON.stringify({ error: errMsg }), totalProcessed, totalFailed, totalSkipped, runId],
+         docs_fetched = $2, docs_processed = $3
+         WHERE id = $4`,
+        [JSON.stringify({ error: errMsg }), fetched, inserted, runId],
       );
-      log.error({ err, runId }, 'pending_only failed');
+      log.error({ err, runId }, 'Registry update failed');
     } finally {
       this.currentRunId = null;
       this.stopRequested = false;
     }
   }
 
-  private async fetchForward(
-    runId: string,
-    limit: number,
-  ): Promise<{
-    fetched: number; processed: number; failed: number; skipped: number;
-    dateFrom: Date | null; dateTo: Date | null;
-  }> {
-    // Determine start date: day after last indexed forward date
-    const cursorResult = await query<{ cursor: string | null }>(
-      `SELECT MAX(date_to) as cursor FROM pipeline_runs
-       WHERE source = 'arxiv' AND status = 'completed'
-         AND direction IN ('forward', 'mixed')`,
-    );
-    let startDate: Date;
-    if (cursorResult.rows[0]?.cursor) {
-      startDate = new Date(cursorResult.rows[0].cursor);
-      startDate.setUTCDate(startDate.getUTCDate() + 1); // Day after last known
-    } else {
-      // Fallback: day after latest published document
-      const docResult = await query<{ latest: Date | null }>(
-        `SELECT MAX(published_at) as latest FROM documents WHERE status = 'ready'`,
-      );
-      if (docResult.rows[0]?.latest) {
-        startDate = new Date(docResult.rows[0].latest);
-        startDate.setUTCDate(startDate.getUTCDate() + 1);
-      } else {
-        startDate = new Date();
-        startDate.setUTCDate(startDate.getUTCDate() - 1); // Yesterday
-      }
-    }
-
-    // End date: yesterday (today's papers may not have e-print ready)
-    const endDate = new Date();
-    endDate.setUTCDate(endDate.getUTCDate() - 1);
-
-    log.info({
-      limit,
-      startDate: startDate.toISOString().slice(0, 10),
-      endDate: endDate.toISOString().slice(0, 10),
-    }, 'Forward: walking from last indexed date to yesterday');
-
-    let remaining = limit;
-    let totalFetched = 0;
-    let processed = 0;
-    let failed = 0;
-    let skipped = 0;
-    let dateFrom: Date | null = null;
-    let dateTo: Date | null = null;
-    const MAX_DAYS = 60;
-
-    for (let dayIdx = 0; dayIdx < MAX_DAYS && remaining > 0 && !this.stopRequested; dayIdx++) {
-      const d = new Date(startDate);
-      d.setUTCDate(d.getUTCDate() + dayIdx);
-      if (d > endDate) break;
-
-      const dayStr = d.toISOString().slice(0, 10).replace(/-/g, '');
-
-      try {
-        const { total } = await this.arxivSource.searchByDateWindow(dayStr, 0, 1, this.abortController.signal);
-        if (total === 0) {
-          log.info({ date: dayStr }, 'Forward: empty day, skipping');
-          continue;
-        }
-
-        log.info({ date: dayStr, total, remaining }, 'Forward: processing day');
-
-        const counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null } = { remaining, totalFetched, processed, failed, skipped, dateFrom, dateTo };
-        const dayResult = await this.processDayParallel(runId, dayStr, total, counters);
-        ({ remaining, totalFetched, processed, failed, skipped, dateFrom, dateTo } = counters);
-
-        const fmtDateFwd = `${dayStr.slice(0, 4)}-${dayStr.slice(4, 6)}-${dayStr.slice(6, 8)}`;
-        await this.refreshCoverageForDate(fmtDateFwd);
-
-        if (dayResult.stopDay) break;
-      } catch (err) {
-        log.error({ date: dayStr, err: err instanceof Error ? err.message : String(err) }, 'Day processing failed, completing with partial results');
-        break;
-      }
-    }
-
-    return { fetched: totalFetched, processed, failed, skipped, dateFrom, dateTo };
-  }
-
-  private async fetchBackfill(
-    runId: string,
-    limit: number,
-    dateFromOverride?: string,
-    dateToOverride?: string,
-  ): Promise<{
-    fetched: number; processed: number; failed: number; skipped: number;
-    dateFrom: Date | null; dateTo: Date | null;
-    infraFailure?: InfraFailure;
-  }> {
-    // Date range mode: walk forward from dateFrom to dateTo (for gap filling)
-    if (dateFromOverride) {
-      log.info({ dateFrom: dateFromOverride, dateTo: dateToOverride, limit }, 'Backfill: targeted date range');
-      return this.fetchDateRange(runId, limit, dateFromOverride, dateToOverride ?? dateFromOverride);
-    }
-
-    // Determine start date: MIN(date_from) from completed runs → YYYYMMDD, subtract 1 day
-    const cursorResult = await query<{ cursor: string | null }>(
-      `SELECT MIN(date_from) as cursor FROM pipeline_runs
-       WHERE source = 'arxiv' AND status = 'completed' AND direction IN ('backfill','mixed')`,
-    );
-    let startDate: Date;
-    if (cursorResult.rows[0]?.cursor) {
-      startDate = new Date(cursorResult.rows[0].cursor);
-      startDate.setUTCDate(startDate.getUTCDate() - 1); // Start 1 day before last known
-    } else {
-      // First run — start from yesterday
-      startDate = new Date();
-      startDate.setUTCDate(startDate.getUTCDate() - 1);
-    }
-
-    type DownloadedItem = { entry: ArxivEntry; doc: Document };
-    const ch = new Channel<DownloadedItem>(800);
-    const counters = { remaining: limit, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
-    const stopDay = { value: false };
-    const MAX_DAYS = 60;
-
-    // Burst-failure detection state. See openarx-68f9 and InfraFailure type.
-    let infraFailure: InfraFailure | undefined;
-    let consecutiveFailures = 0;
-    let firstFailureAt: number | null = null;
-
-    // ─── Producer: walk through days, download and push to shared channel ───
-    const producer = async (): Promise<void> => {
-      try {
-        for (let dayIdx = 0; dayIdx < MAX_DAYS && counters.remaining > 0 && !this.stopRequested && !stopDay.value; dayIdx++) {
-          const d = new Date(startDate);
-          d.setUTCDate(d.getUTCDate() - dayIdx);
-          const dayStr = d.toISOString().slice(0, 10).replace(/-/g, '');
-
-          try {
-            // Skip days already fully covered — no need to hit arXiv API
-            const fmtDate = `${dayStr.slice(0, 4)}-${dayStr.slice(4, 6)}-${dayStr.slice(6, 8)}`;
-            const covResult = await query<{ status: string }>(
-              `SELECT status FROM coverage_map WHERE source = 'arxiv' AND date = $1 LIMIT 1`,
-              [fmtDate],
-            );
-            if (covResult.rows[0]?.status === 'complete') {
-              log.info({ date: dayStr }, 'Backfill: day already complete in coverage map, skipping');
-              consecutiveFailures = 0;
-              firstFailureAt = null;
-              continue;
-            }
-
-            const { total } = await this.arxivSource.searchByDateWindow(dayStr, 0, 1, this.abortController.signal);
-            if (total === 0) {
-              log.info({ date: dayStr }, 'Backfill: empty day, skipping');
-              consecutiveFailures = 0;
-              firstFailureAt = null;
-              continue;
-            }
-
-            log.info({ date: dayStr, total, remaining: counters.remaining }, 'Backfill: processing day');
-            await this.produceDayDownloads(runId, dayStr, total, ch, counters, stopDay);
-            await this.refreshCoverageForDate(fmtDate);
-            consecutiveFailures = 0;
-            firstFailureAt = null;
-          } catch (err) {
-            if (consecutiveFailures === 0) firstFailureAt = Date.now();
-            consecutiveFailures++;
-            const message = err instanceof Error ? err.message : String(err);
-            log.error({ date: dayStr, err: message, consecutiveFailures }, 'Day processing failed, continuing to next day');
-
-            // Burst detection: N consecutive failures within window → infra issue.
-            if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
-                firstFailureAt !== null &&
-                Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
-              const windowMs = Date.now() - firstFailureAt;
-              log.error({ consecutiveFailures, windowMs, lastError: message },
-                'Consecutive day failures within burst window — likely infrastructure issue, bailing out');
-              infraFailure = {
-                reason: 'consecutive_day_failures',
-                count: consecutiveFailures,
-                windowMs,
-                lastError: message,
-              };
-              stopDay.value = true;
-              break;
-            }
-          }
-        }
-      } finally {
-        ch.close();
-      }
-    };
-
-    // ─── Consumer: continuous sliding window across ALL days ───
-    const consumer = async (): Promise<void> => {
-      const maxConcurrentDocs = parseInt(process.env.PIPELINE_MAX_CONCURRENT_DOCS ?? '10', 10);
-      const docSemaphore = new Semaphore(maxConcurrentDocs);
-      const inFlight: Promise<void>[] = [];
-
-      let item: DownloadedItem | null;
-      while ((item = await ch.receive()) !== null) {
-        if (this.stopRequested || stopDay.value) break;
-
-        const captured = item;
-        await docSemaphore.acquire();
-
-        const p = (async () => {
-          try {
-            if (this.stopRequested || stopDay.value) return;
-
-            const result = await this.orchestrator.processOneDoc(captured.doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
-
-            if (result.status === 'ready') {
-              counters.processed++;
-              const pubDate = new Date(captured.entry.publishedAt);
-              counters.dateFrom = minDate(counters.dateFrom, pubDate);
-              counters.dateTo = maxDate(counters.dateTo, pubDate);
-              await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
-            } else if (result.status === 'failed') {
-              counters.failed++;
-            }
-
-            const totalAttempted = counters.processed + counters.failed;
-            if (totalAttempted >= 5 && counters.failed / totalAttempted > this.maxFailRate) {
-              log.error({ processed: counters.processed, failed: counters.failed }, 'Fail rate exceeded');
-              await query(
-                `UPDATE pipeline_runs SET metrics = COALESCE(metrics, '{}'::jsonb) || '{"auto_stop": "fail_rate_exceeded"}'::jsonb WHERE id = $1`,
-                [runId],
-              );
-              stopDay.value = true;
-            }
-          } finally {
-            docSemaphore.release();
-          }
-        })();
-        inFlight.push(p);
-      }
-
-      // Drain remaining channel items to unblock producer's ch.send().
-      // Without this, producer deadlocks on send() because channel is full and nobody reads.
-      while (await ch.receive() !== null) { /* discard */ }
-
-      await Promise.allSettled(inFlight);
-    };
-
-    await Promise.all([producer(), consumer()]);
-
-    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo, infraFailure };
-  }
-
   /**
-   * Download + process a single day's papers with producer-consumer parallelism.
-   * Producer downloads papers and pushes to a bounded channel.
-   * Consumer pulls batches from channel and runs processAll().
-   * Both run concurrently — download doesn't block during processing.
+   * Per-document registry (openarx-tvts): insert a status='listed' row for
+   * every listing entry not yet known in ANY status — metadata only (title,
+   * abstract, authors, categories from the Atom feed), no files. Idempotent:
+   * re-fetching a day inserts nothing for known papers and never resurrects
+   * soft-deleted ones. Non-critical: failure must not block the download pass.
    */
-  /** Targeted date range backfill — walks forward from dateFrom to dateTo with shared-channel sliding window. */
-  private async fetchDateRange(
-    runId: string, limit: number, from: string, to: string,
-  ): Promise<{ fetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null; infraFailure?: InfraFailure }> {
-    const startDate = new Date(from);
-    const endDate = new Date(to);
-
-    type DownloadedItem = { entry: ArxivEntry; doc: Document };
-    const ch = new Channel<DownloadedItem>(800);
-    const counters = { remaining: limit, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
-    const stopDay = { value: false };
-
-    // Burst-failure detection state. See openarx-68f9 and InfraFailure type.
-    let infraFailure: InfraFailure | undefined;
-    let consecutiveFailures = 0;
-    let firstFailureAt: number | null = null;
-
-    // ─── Producer: walk forward from dateFrom to dateTo, push to shared channel ───
-    const producer = async (): Promise<void> => {
-      try {
-        for (let dayIdx = 0; counters.remaining > 0 && !this.stopRequested && !stopDay.value; dayIdx++) {
-          const d = new Date(startDate);
-          d.setUTCDate(d.getUTCDate() + dayIdx);
-          if (d > endDate) break;
-
-          const dayStr = d.toISOString().slice(0, 10).replace(/-/g, '');
-
-          try {
-            const fmtDate = `${dayStr.slice(0, 4)}-${dayStr.slice(4, 6)}-${dayStr.slice(6, 8)}`;
-
-            // Skip days already fully covered
-            const covResult = await query<{ status: string }>(
-              `SELECT status FROM coverage_map WHERE source = 'arxiv' AND date = $1 LIMIT 1`,
-              [fmtDate],
-            );
-            if (covResult.rows[0]?.status === 'complete') {
-              log.info({ date: dayStr }, 'Date range: day already complete, skipping');
-              consecutiveFailures = 0;
-              firstFailureAt = null;
-              continue;
-            }
-
-            const { total } = await this.arxivSource.searchByDateWindow(dayStr, 0, 1, this.abortController.signal);
-            if (total === 0) {
-              log.info({ date: dayStr }, 'Date range: empty day');
-              consecutiveFailures = 0;
-              firstFailureAt = null;
-              continue;
-            }
-
-            log.info({ date: dayStr, total, remaining: counters.remaining }, 'Date range: processing day');
-            await this.produceDayDownloads(runId, dayStr, total, ch, counters, stopDay);
-            await this.refreshCoverageForDate(fmtDate);
-            consecutiveFailures = 0;
-            firstFailureAt = null;
-          } catch (err) {
-            if (consecutiveFailures === 0) firstFailureAt = Date.now();
-            consecutiveFailures++;
-            const message = err instanceof Error ? err.message : String(err);
-            log.error({ date: dayStr, err: message, consecutiveFailures }, 'Day processing failed, continuing to next day');
-
-            // Burst detection: N consecutive failures within window → infra issue.
-            if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
-                firstFailureAt !== null &&
-                Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
-              const windowMs = Date.now() - firstFailureAt;
-              log.error({ consecutiveFailures, windowMs, lastError: message },
-                'Consecutive day failures within burst window — likely infrastructure issue, bailing out');
-              infraFailure = {
-                reason: 'consecutive_day_failures',
-                count: consecutiveFailures,
-                windowMs,
-                lastError: message,
-              };
-              stopDay.value = true;
-              break;
-            }
-          }
-        }
-      } finally {
-        ch.close();
-      }
-    };
-
-    // ─── Consumer: continuous sliding window across ALL days ───
-    const consumer = async (): Promise<void> => {
-      const maxConcurrentDocs = parseInt(process.env.PIPELINE_MAX_CONCURRENT_DOCS ?? '10', 10);
-      const docSemaphore = new Semaphore(maxConcurrentDocs);
-      const inFlight: Promise<void>[] = [];
-
-      let item: DownloadedItem | null;
-      while ((item = await ch.receive()) !== null) {
-        if (this.stopRequested || stopDay.value) break;
-
-        const captured = item;
-        await docSemaphore.acquire();
-
-        const p = (async () => {
-          try {
-            if (this.stopRequested || stopDay.value) return;
-
-            const result = await this.orchestrator.processOneDoc(captured.doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
-
-            if (result.status === 'ready') {
-              counters.processed++;
-              const pubDate = new Date(captured.entry.publishedAt);
-              counters.dateFrom = minDate(counters.dateFrom, pubDate);
-              counters.dateTo = maxDate(counters.dateTo, pubDate);
-              await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
-            } else if (result.status === 'failed') {
-              counters.failed++;
-            }
-
-            const totalAttempted = counters.processed + counters.failed;
-            if (totalAttempted >= 5 && counters.failed / totalAttempted > this.maxFailRate) {
-              log.error({ processed: counters.processed, failed: counters.failed }, 'Fail rate exceeded');
-              await query(
-                `UPDATE pipeline_runs SET metrics = COALESCE(metrics, '{}'::jsonb) || '{"auto_stop": "fail_rate_exceeded"}'::jsonb WHERE id = $1`,
-                [runId],
-              );
-              stopDay.value = true;
-            }
-          } finally {
-            docSemaphore.release();
-          }
-        })();
-        inFlight.push(p);
-      }
-
-      // Drain remaining channel items to unblock producer's ch.send()
-      while (await ch.receive() !== null) { /* discard */ }
-
-      await Promise.allSettled(inFlight);
-    };
-
-    await Promise.all([producer(), consumer()]);
-
-    return { fetched: counters.totalFetched, processed: counters.processed, failed: counters.failed, skipped: counters.skipped, dateFrom: counters.dateFrom, dateTo: counters.dateTo, infraFailure };
-  }
-
-  /**
-   * Download + process a single day's papers with producer-consumer parallelism.
-   * Accepts an external channel + consumer state so the producer can feed docs
-   * across multiple days without waiting for consumer to finish the current day.
-   */
-  private async produceDayDownloads(
-    runId: string,
-    dayStr: string,
-    total: number,
-    ch: Channel<{ entry: ArxivEntry; doc: Document }>,
-    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
-    stopDay: { value: boolean },
-  ): Promise<{ dayDownloaded: number; dayFailed: number; daySkipped: number }> {
-    let dayDownloaded = 0;
-    let dayFailed = 0;
-    let daySkipped = 0;
-    const dlSem = new Semaphore(this.downloadConcurrency);
-
-    // Pre-build category filter set once. null = no filter (process all).
-    const wantCats = this.currentCategories ? new Set(this.currentCategories) : null;
-
-    let offset = 0;
-    while (offset < total && counters.remaining > 0 && !this.stopRequested && !stopDay.value) {
-      const { entries } = await this.arxivSource.searchByDateWindow(dayStr, offset, 200, this.abortController.signal);
-      if (entries.length === 0) break;
-      counters.totalFetched += entries.length;
-
-      // Bump coverage_map.expected per-cat for ALL fetched entries — we
-      // know these papers exist on arxiv this day, regardless of whether we
-      // download/process them. Cross-listed papers count in every cat.
-      await this.bumpCoverageExpected(dayStr, entries);
-
-      // Post-fetch processing filter. wantCats=null → process every paper
-      // (no per-run filter); else keep only ones whose categories intersect.
-      const toProcess: ArxivEntry[] = wantCats
-        ? entries.filter((e) => (e.categories ?? []).some((c) => wantCats.has(c)))
-        : entries;
-      const filteredOut = entries.length - toProcess.length;
-      if (filteredOut > 0) {
-        log.info({ dayStr, fetched: entries.length, processing: toProcess.length, filteredOut }, 'post-fetch category filter applied');
-      }
-
-      await Promise.allSettled(toProcess.map((entry) => dlSem.withResource(async () => {
-        if (counters.remaining <= 0 || this.stopRequested || stopDay.value) return;
-
-        const existing = await this.documentStore.getBySourceId('arxiv', entry.arxivId);
-        if (existing) {
-          if (existing.status === 'download_failed' && existing.retryCount < this.maxDownloadRetries) {
-            try {
-              const { document: doc } = await this.arxivSource.downloadAndRegister(entry, this.documentStore);
-              await query('UPDATE documents SET status = $1, retry_count = retry_count + 1, raw_content_path = $2, sources = $3, source_format = $4 WHERE id = $5',
-                ['downloaded', doc.rawContentPath, JSON.stringify(doc.sources), doc.sourceFormat, existing.id]);
-              counters.remaining--;
-              dayDownloaded++;
-              await ch.send({ entry, doc: { ...doc, id: existing.id } });
-              log.info({ arxivId: entry.arxivId, retry: existing.retryCount + 1 }, 'Retry download succeeded');
-            } catch (err) {
-              await query('UPDATE documents SET retry_count = retry_count + 1 WHERE id = $1', [existing.id]);
-              log.warn({ arxivId: entry.arxivId, retry: existing.retryCount + 1 }, 'Retry download failed again');
-              dayFailed++;
-            }
-          } else {
-            counters.skipped++;
-            daySkipped++;
-          }
-          return;
-        }
-
-        try {
-          const { document: doc } = await this.arxivSource.downloadAndRegister(entry, this.documentStore);
-          counters.remaining--;
-          dayDownloaded++;
-          log.info({ arxivId: entry.arxivId, format: doc.sourceFormat, remaining: counters.remaining }, 'Downloaded');
-          await ch.send({ entry, doc });
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          log.error({ arxivId: entry.arxivId, err: errMsg }, 'Download failed');
-          try { await this.saveFailedDownload(entry, errMsg); } catch { /* non-critical */ }
-          dayFailed++;
-        }
-      })));
-
-      offset += entries.length;
-      await query(
-        `UPDATE pipeline_runs SET backfill_date = $1, backfill_offset = $2 WHERE id = $3`,
-        [dayStr, offset, runId],
-      );
+  private async registerListedEntries(entries: ArxivEntry[]): Promise<number> {
+    if (entries.length === 0) return 0;
+    try {
+      const rows = buildListedRows(entries);
+      const res = await query(buildListedInsertSql(rows.length), flattenListedRows(rows));
+      log.debug({ entries: entries.length, inserted: res.rowCount ?? 0 }, 'listed registry rows inserted');
+      return res.rowCount ?? 0;
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.message : err }, 'registerListedEntries failed (non-critical)');
+      return 0;
     }
-
-    return { dayDownloaded, dayFailed, daySkipped };
   }
 
   /**
@@ -1389,84 +1206,6 @@ export class RunnerService {
     } catch (err) {
       log.warn({ dayStr, err: err instanceof Error ? err.message : err }, 'bumpCoverageExpected failed (non-critical)');
     }
-  }
-
-  /**
-   * Run producer (multi-day) + consumer concurrently with a shared channel.
-   * Producer walks through days, downloading and pushing to channel.
-   * Consumer processes docs individually with sliding window — no batch boundaries.
-   */
-  private async processDayParallel(
-    runId: string,
-    dayStr: string,
-    total: number,
-    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
-  ): Promise<{ dayDownloaded: number; dayFailed: number; daySkipped: number; stopDay: boolean }> {
-    type DownloadedItem = { entry: ArxivEntry; doc: Document };
-    const ch = new Channel<DownloadedItem>(800);
-    const stopDay = { value: false };
-
-    const producer = async (): Promise<{ dayDownloaded: number; dayFailed: number; daySkipped: number }> => {
-      try {
-        return await this.produceDayDownloads(runId, dayStr, total, ch, counters, stopDay);
-      } finally {
-        ch.close();
-      }
-    };
-
-    const consumer = async (): Promise<void> => {
-      const maxConcurrentDocs = parseInt(process.env.PIPELINE_MAX_CONCURRENT_DOCS ?? '10', 10);
-      const docSemaphore = new Semaphore(maxConcurrentDocs);
-      const inFlight: Promise<void>[] = [];
-
-      let item: DownloadedItem | null;
-      while ((item = await ch.receive()) !== null) {
-        if (this.stopRequested || stopDay.value) break;
-
-        const captured = item;
-        await docSemaphore.acquire();
-
-        const p = (async () => {
-          try {
-            if (this.stopRequested || stopDay.value) return;
-
-            const result = await this.orchestrator.processOneDoc(captured.doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
-
-            if (result.status === 'ready') {
-              counters.processed++;
-              const pubDate = new Date(captured.entry.publishedAt);
-              counters.dateFrom = minDate(counters.dateFrom, pubDate);
-              counters.dateTo = maxDate(counters.dateTo, pubDate);
-              await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
-            } else if (result.status === 'failed') {
-              counters.failed++;
-            }
-
-            const totalAttempted = counters.processed + counters.failed;
-            if (totalAttempted >= 5 && counters.failed / totalAttempted > this.maxFailRate) {
-              log.error({ processed: counters.processed, failed: counters.failed }, 'Fail rate exceeded');
-              await query(
-                `UPDATE pipeline_runs SET metrics = COALESCE(metrics, '{}'::jsonb) || '{"auto_stop": "fail_rate_exceeded"}'::jsonb WHERE id = $1`,
-                [runId],
-              );
-              stopDay.value = true;
-            }
-          } finally {
-            docSemaphore.release();
-          }
-        })();
-        inFlight.push(p);
-      }
-
-      // Drain channel to unblock producer's ch.send() (same deadlock fix as fetchBackfill)
-      while (await ch.receive() !== null) { /* discard */ }
-
-      await Promise.allSettled(inFlight);
-    };
-
-    const [dayResult] = await Promise.all([producer(), consumer()]);
-
-    return { ...dayResult, stopDay: stopDay.value };
   }
 
   /**
@@ -1623,9 +1362,19 @@ export class RunnerService {
     );
   }
 
-  private async saveFailedDownload(entry: ArxivEntry, error: string): Promise<void> {
-    const { createHash } = await import('node:crypto');
-    const oarxId = 'oarx-' + createHash('sha256').update(`arxiv:${entry.arxivId}`).digest('hex').slice(0, 8);
+  /**
+   * @param existingId — id of the existing row for this paper (e.g. a
+   * status='listed' registry row). In that case the failure is applied as a
+   * read-modify-write partial UPDATE (applyDownloadFailure): status flips,
+   * the failure is APPENDED to processing_log, nothing else is touched.
+   */
+  private async saveFailedDownload(entry: ArxivEntry, error: string, existingId?: string): Promise<void> {
+    if (existingId) {
+      await this.documentStore.applyDownloadFailure(existingId, error);
+      log.info({ arxivId: entry.arxivId, error }, 'Marked existing row download_failed');
+      return;
+    }
+    const oarxId = computeOarxId('arxiv', entry.arxivId);
     const doc: Document = {
       id: randomUUID(),
       version: 1,

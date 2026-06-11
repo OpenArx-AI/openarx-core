@@ -24,18 +24,25 @@ function parseArgs(): RunnerCommand {
   switch (command) {
     case 'ingest': {
       let limit = 100;
-      let direction: 'forward' | 'backfill' | undefined;
+      let direction: 'forward' | 'backward' | undefined;
       let retry = false;
       let dateFrom: string | undefined;
       let dateTo: string | undefined;
+      let downloadedFirst = false;
       let strategy: 'license_aware' | 'force_full' | undefined;
       let bypassEmbedCache = false;
+      let categories: string[] | undefined;
       for (let i = 1; i < args.length; i++) {
         if (args[i] === '--limit' && args[i + 1]) {
           limit = parseInt(args[i + 1], 10);
           i++;
         } else if (args[i] === '--direction' && args[i + 1]) {
-          direction = args[i + 1] as 'forward' | 'backfill';
+          const v = args[i + 1];
+          if (v !== 'forward' && v !== 'backward') {
+            console.error("Error: --direction must be 'forward' (ascending dates, default) or 'backward'.");
+            process.exit(1);
+          }
+          direction = v;
           i++;
         } else if (args[i] === '--retry') {
           retry = true;
@@ -44,6 +51,11 @@ function parseArgs(): RunnerCommand {
           i++;
         } else if (args[i] === '--dateTo' && args[i + 1]) {
           dateTo = args[i + 1];
+          i++;
+        } else if (args[i] === '--downloaded-first') {
+          downloadedFirst = true;
+        } else if (args[i] === '--categories' && args[i + 1]) {
+          categories = args[i + 1].split(',').map((c) => c.trim()).filter(Boolean);
           i++;
         } else if (args[i] === '--strategy' && args[i + 1]) {
           const v = args[i + 1];
@@ -61,7 +73,42 @@ function parseArgs(): RunnerCommand {
         console.error('Error: --retry and --direction are mutually exclusive.');
         process.exit(1);
       }
-      return { type: 'ingest', limit, direction, retry, dateFrom, dateTo, strategy, bypassEmbedCache };
+      if (!retry && !dateFrom && !dateTo && !downloadedFirst) {
+        console.error('Error: at least one of --dateFrom/--dateTo is required (or --downloaded-first to process the downloaded backlog only).');
+        process.exit(1);
+      }
+      return { type: 'ingest', limit, direction, retry, dateFrom, dateTo, downloadedFirst, strategy, bypassEmbedCache, categories };
+    }
+    case 'registry-update': {
+      let limit = 100;
+      let direction: 'forward' | 'backward' | undefined;
+      let dateFrom: string | undefined;
+      let dateTo: string | undefined;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--limit' && args[i + 1]) {
+          limit = parseInt(args[i + 1], 10);
+          i++;
+        } else if (args[i] === '--direction' && args[i + 1]) {
+          const v = args[i + 1];
+          if (v !== 'forward' && v !== 'backward') {
+            console.error("Error: --direction must be 'forward' or 'backward'.");
+            process.exit(1);
+          }
+          direction = v;
+          i++;
+        } else if (args[i] === '--dateFrom' && args[i + 1]) {
+          dateFrom = args[i + 1];
+          i++;
+        } else if (args[i] === '--dateTo' && args[i + 1]) {
+          dateTo = args[i + 1];
+          i++;
+        }
+      }
+      if (!dateFrom && !dateTo) {
+        console.error('Error: registry-update requires at least one of --dateFrom/--dateTo.');
+        process.exit(1);
+      }
+      return { type: 'registry_update', dateFrom, dateTo, direction, limit };
     }
     case 'status':
       return { type: 'status' };
@@ -111,8 +158,12 @@ function parseArgs(): RunnerCommand {
       return { type: 'doctor', fix, check, limit };
     }
     default:
-      console.error('Usage: openarx <ingest|status|coverage|stop|history|audit|doctor>');
-      console.error('  ingest  --limit N [--direction forward|backfill] [--retry] [--strategy ...] [--bypass-cache]');
+      console.error('Usage: openarx <ingest|registry-update|status|coverage|stop|history|audit|doctor>');
+      console.error('  ingest          --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]');
+      console.error('                  [--categories cs.AI,cs.LG] [--downloaded-first] [--retry] [--strategy ...] [--bypass-cache]');
+      console.error('                  (registry-driven: works from documents with status listed/downloaded, no arXiv listing fetch)');
+      console.error('  registry-update --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]');
+      console.error('                  (fetches arXiv day listings into the registry; days are atomic)');
       console.error('  audit   [--days N] [--date YYYYMMDD]');
       console.error('  doctor  [--fix] [--check <name>] [--limit N]');
       console.error('  status');
@@ -154,6 +205,13 @@ async function main(): Promise<void> {
         console.log(`Ingest started: ${run.id}`);
         console.log(`  Direction: ${run.direction}`);
         console.log(`  Categories: ${run.categories.join(', ')}`);
+        console.log(`  Started: ${formatDate(run.startedAt)}`);
+        console.log('\nUse "openarx status" to check progress.');
+        break;
+      }
+      case 'registry_update': {
+        const run = resp.data as PipelineRun;
+        console.log(`Registry update started: ${run.id}`);
         console.log(`  Started: ${formatDate(run.startedAt)}`);
         console.log('\nUse "openarx status" to check progress.');
         break;

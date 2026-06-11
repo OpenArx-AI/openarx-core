@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -994,10 +994,14 @@
       },
       {
         "name": "find_by_id",
-        "description": "Find a paper by any external identifier: DOI, arXiv ID, Semantic Scholar Corpus ID, DBLP ID. arXiv-style DOIs (10.48550/arXiv.<id>) are auto-resolved to the underlying arxiv_id even if the doi field is not stored.",
+        "description": "Find a paper by any external identifier: OpenArx ID (oarx-…), DOI, arXiv ID, Semantic Scholar Corpus ID, DBLP ID. arXiv-style DOIs (10.48550/arXiv.<id>) are auto-resolved to the underlying arxiv_id even if the doi field is not stored.",
         "inputSchema": {
           "type": "object",
           "properties": {
+            "oarx_id": {
+              "type": "string",
+              "description": "OpenArx ID (e.g. oarx-f629d9b6a1c2e3d4). Legacy 8-hex ids (oarx-f629d9b6) are also accepted and resolved by prefix."
+            },
             "doi": {
               "type": "string",
               "description": "DOI (e.g. 10.1234/...). arXiv-style DOIs (10.48550/arXiv.1706.03762) are auto-resolved to arXiv lookup; non-arXiv DOIs require the doi to be present in externalIds."

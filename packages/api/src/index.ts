@@ -1,6 +1,7 @@
 // @openarx/api — Phase 0 backend
 export { pool, query } from './db/pool.js';
-export { PgDocumentStore } from './storage/document-store.js';
+export { computeOarxId, OARX_ID_RE, LEGACY_OARX_ID_RE, OARX_ID_HEX_LENGTH, LEGACY_OARX_ID_HEX_LENGTH } from './lib/oarx-id.js';
+export { PgDocumentStore, APPLY_DOWNLOAD_SUCCESS_SQL } from './storage/document-store.js';
 export { QdrantVectorStore } from './storage/vector-store.js';
 export { SearchStore, type BM25Result } from './storage/search-store.js';
 export { PgChunkStore, type ChunkStatusCounts } from './storage/chunk-store.js';

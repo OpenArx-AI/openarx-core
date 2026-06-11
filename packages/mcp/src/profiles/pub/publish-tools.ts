@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../../context.js';
-import { query } from '@openarx/api';
+import { query, computeOarxId } from '@openarx/api';
 
 function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
@@ -71,12 +71,12 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       };
 
       // Save document via documentStore (same as ingest-document endpoint)
-      const { createHash, randomUUID } = await import('node:crypto');
+      const { randomUUID } = await import('node:crypto');
       const { mkdir, writeFile } = await import('node:fs/promises');
       const { join } = await import('node:path');
 
       const coreDocId = randomUUID();
-      const oarxId = 'oarx-' + createHash('sha256').update(`portal:${portalDocId}`).digest('hex').slice(0, 8);
+      const oarxId = computeOarxId('portal', portalDocId);
       const docDir = portalDocPath(userId, coreDocId);
       const sourceDir = join(docDir, 'source');
       await mkdir(sourceDir, { recursive: true });
@@ -247,12 +247,12 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
       // Reuse submit_document logic via internal endpoint
       const portalDocId = crypto.randomUUID();
-      const { createHash, randomUUID } = await import('node:crypto');
+      const { randomUUID } = await import('node:crypto');
       const { mkdir, writeFile } = await import('node:fs/promises');
       const { join } = await import('node:path');
 
       const coreDocId = randomUUID();
-      const oarxId = 'oarx-' + createHash('sha256').update(`portal:${portalDocId}`).digest('hex').slice(0, 8);
+      const oarxId = computeOarxId('portal', portalDocId);
       const docDir = portalDocPath(userId, coreDocId);
       const sourceDir = join(docDir, 'source');
       await mkdir(sourceDir, { recursive: true });

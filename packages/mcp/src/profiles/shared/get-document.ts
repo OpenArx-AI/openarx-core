@@ -51,7 +51,10 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
         ? await ctx.documentStore.getById(id)
         : await ctx.documentStore.getBySourceId('arxiv', arxivId!);
 
-      if (!doc || doc.deletedAt) {
+      // status='listed' = registry-only row (metadata from listing, never
+      // downloaded/indexed) — before the per-document registry these papers
+      // were simply absent from the DB, so keep returning not-found.
+      if (!doc || doc.deletedAt || doc.status === 'listed') {
         return jsonResult({ error: 'Document not found' });
       }
 

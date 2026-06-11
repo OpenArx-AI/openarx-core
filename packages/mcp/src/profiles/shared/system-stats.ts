@@ -92,12 +92,14 @@ async function fetchStats(ctx: AppContext): Promise<unknown> {
     // documents_indexed, documents_ready, by indexing tier.
     // Soft-deleted docs must NOT count (contracts/document_soft_delete.md §2)
     // — public counters reflect reachable-to-search documents only.
+    // status='listed' registry rows (metadata only, never downloaded) are
+    // excluded for the same reason — they are not reachable to search.
     ctx.pool.query<{ total: string; ready: string; full_indexed: string; abstract_only: string }>(
       `SELECT count(*)::text as total,
               count(*) FILTER (WHERE status = 'ready')::text as ready,
               count(*) FILTER (WHERE status = 'ready' AND indexing_tier = 'full')::text as full_indexed,
               count(*) FILTER (WHERE status = 'ready' AND (indexing_tier = 'abstract_only' OR indexing_tier IS NULL))::text as abstract_only
-         FROM documents WHERE deleted_at IS NULL`,
+         FROM documents WHERE deleted_at IS NULL AND status != 'listed'`,
     ),
     // chunks breakdown by lifecycle status (openarx-q2eh)
     ctx.pool.query<{

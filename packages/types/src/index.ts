@@ -181,6 +181,11 @@ export interface ProvenanceEntry {
 }
 
 export type DocumentStatus =
+  // Registered from a source listing (arXiv Atom feed): metadata only
+  // (title, abstract, authors, categories), no files on disk yet.
+  // Together with the other statuses this makes `documents` the full
+  // per-document coverage registry — including papers not yet downloaded.
+  | 'listed'
   | 'downloaded'
   | 'download_failed'
   | 'parsing'

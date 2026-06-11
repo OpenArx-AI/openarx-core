@@ -257,8 +257,14 @@ export class VertexLlm {
           // thinkingLevel=minimal took 12s (5× faster). The 68s difference
           // was spent on hidden thinking that consumed the output budget on
           // large prompts and caused MAX_TOKENS truncation.
+          // thinkingLevel is model-dependent: gemini-3.1-pro-preview rejects
+          // 'minimal' (400 "thinking_level MINIMAL is not supported by this
+          // model" — only low/medium/high), while flash accepts it. The chunker's
+          // pro fallback (gemini-3.1-pro-preview) therefore needs 'low', else it
+          // 400s intermittently (~15% of pro retries observed 2026-06-03) and the
+          // batch degrades to paragraph splitting (null-meta). openarx-cmnj.
           thinkingConfig: {
-            thinkingLevel: 'minimal',
+            thinkingLevel: model.includes('pro') ? 'low' : 'minimal',
           },
           // Structured output: when both fields are set the model is
           // constrained to emit JSON matching responseSchema. Eliminates the

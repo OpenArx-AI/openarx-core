@@ -10,7 +10,7 @@
  * GET  /api/internal/documents/:id/pdf   — stream PDF file
  */
 
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { createReadStream, statSync } from 'node:fs';
 import { access, constants, mkdir, writeFile, stat, readdir, mkdtemp, rm, realpath } from 'node:fs/promises';
 import { join, dirname, normalize, sep } from 'node:path';
@@ -24,6 +24,7 @@ import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type { AppContext } from './context.js';
 import type { SearchResult, Document, Author, CodeLink, DatasetLink, BenchmarkResult } from '@openarx/types';
+import { computeOarxId } from '@openarx/api';
 import type { BM25Result, ReportTier } from '@openarx/api';
 import {
   createInitialReview,
@@ -789,7 +790,7 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
       // ── Create document record ──
       const version = (body.version as number) ?? 1;
       const conceptId = (body.concept_id as string) ?? coreDocId;
-      const oarxId = 'oarx-' + createHash('sha256').update(`portal:${portalDocId}`).digest('hex').slice(0, 8);
+      const oarxId = computeOarxId('portal', portalDocId);
 
       const doc: Document = {
         id: coreDocId,

@@ -4,10 +4,11 @@
  *
  * Enrichment worker sets status='downloaded', indexing_tier=NULL when it finds
  * an open OA alternative for an abstract_only document (D6). The main runner
- * picks these up via direction='pending_only'. If they sit > 24 hours,
- * something is wrong (runner not running, or pending_only not triggered).
+ * picks these up via `ingest --downloaded-first` (registry model). If they
+ * sit > 24 hours, something is wrong (runner not running, or the backlog
+ * drain not triggered).
  *
- * Fix: informational — tells operator to run pending_only. No auto-reset.
+ * Fix: informational — tells operator the command to run. No auto-reset.
  */
 
 import { query } from '@openarx/api';
@@ -33,7 +34,7 @@ export function createStuckPendingCheck(_ctx: DoctorContext): CheckModule {
       }
       return {
         status: 'warn',
-        message: `${count} documents waiting for re-indexing >24h — run: openarx ingest --direction pending_only`,
+        message: `${count} documents waiting for re-indexing >24h — run: openarx ingest --downloaded-first`,
         affectedCount: count,
       };
     },
@@ -51,7 +52,7 @@ export function createStuckPendingCheck(_ctx: DoctorContext): CheckModule {
         fixed: 0,
         failed: 0,
         message: count > 0
-          ? `${count} documents pending re-indexing. Run: openarx ingest --direction pending_only`
+          ? `${count} documents pending re-indexing. Run: openarx ingest --downloaded-first`
           : 'No stuck documents',
       };
     },

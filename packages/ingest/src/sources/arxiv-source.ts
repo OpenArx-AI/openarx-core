@@ -11,11 +11,12 @@ import { createWriteStream } from 'node:fs';
 import { pipeline as streamPipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { XMLParser } from 'fast-xml-parser';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Document, DocumentSources } from '@openarx/types';
+import { computeOarxId } from '@openarx/api';
 import type { PgDocumentStore } from '@openarx/api';
 import { createChildLogger } from '../lib/logger.js';
 import { arxivDocPath } from '../utils/doc-path.js';
@@ -80,7 +81,7 @@ export class ArxivSource {
    * Fetch papers SUBMITTED on a specific date (YYYYMMDD) with start offset.
    * For backfill. No category filter — returns ALL arxiv papers submitted
    * that day across every subject group. Caller applies any per-run
-   * category filter post-fetch (in produceDayDownloads).
+   * category filter at registry-selection time (registry-driven ingest).
    */
   async searchByDateWindow(
     date: string,
@@ -196,9 +197,19 @@ export class ArxivSource {
 
   // ─── Download + Register ─────────────────────────────────
 
+  /**
+   * @param existing — the already-known row for (arxiv, arxivId) when there
+   * is one (status='listed' registry row or a download_failed retry). In
+   * that case the result is applied as a read-modify-write partial UPDATE
+   * (applyDownloadSuccess): only download-owned fields are written, fields
+   * this code does not know about are preserved, and licenses/external_ids
+   * are merged on top of the existing values. Without it, a fresh row is
+   * INSERTed via save().
+   */
   async downloadAndRegister(
     entry: ArxivEntry,
     documentStore: PgDocumentStore,
+    existing?: Document,
   ): Promise<DownloadResult> {
     const paperDir = arxivDocPath(entry.arxivId, this.dataDir);
     await mkdir(paperDir, { recursive: true });
@@ -315,20 +326,69 @@ export class ArxivSource {
     sources.pdf = { path: pdfPath, size: pdfStat?.size };
 
     // Step 4: Register in DB
-    const oarxId = 'oarx-' + createHash('sha256').update(`arxiv:${entry.arxivId}`).digest('hex').slice(0, 8);
+    const oarxId = computeOarxId('arxiv', entry.arxivId);
+    const sourceUrl = `https://arxiv.org/abs/${entry.arxivId}`;
+    const publishedAt = new Date(entry.publishedAt);
+    const externalIds = {
+      oarx: oarxId,
+      arxiv: entry.arxivId,
+      ...(entry.doi ? { doi: entry.doi } : {}),
+      ...(entry.journalRef ? { journal_ref: entry.journalRef } : {}),
+    };
+
+    if (existing) {
+      // Read-modify-write onto the known row: only download-owned fields are
+      // written; licenses/external_ids merge ON TOP of existing values, so
+      // the effective license must be computed over the merged map.
+      const mergedLicenses = { ...(existing.licenses ?? {}), ...licenses };
+      const mergedEffective = computeEffectiveLicense(mergedLicenses);
+      await documentStore.applyDownloadSuccess(existing.id, {
+        title: entry.title,
+        authors: entry.authors,
+        abstract: entry.abstract,
+        categories: entry.categories,
+        publishedAt,
+        sourceUrl,
+        rawContentPath: pdfPath,
+        sources,
+        sourceFormat,
+        licenses,
+        license: mergedEffective,
+        externalIds,
+      });
+      const doc: Document = {
+        ...existing,
+        title: entry.title,
+        authors: entry.authors,
+        abstract: entry.abstract,
+        categories: entry.categories,
+        publishedAt,
+        sourceUrl,
+        rawContentPath: pdfPath,
+        structuredContent: null,
+        sources,
+        sourceFormat,
+        status: 'downloaded',
+        licenses: mergedLicenses,
+        license: mergedEffective,
+        externalIds: { ...(existing.externalIds ?? {}), ...externalIds },
+      };
+      return { document: doc, sourceFormat };
+    }
+
     const doc: Document = {
       id: randomUUID(),
       version: 1,
       createdAt: new Date(),
       source: 'arxiv',
       sourceId: entry.arxivId,
-      sourceUrl: `https://arxiv.org/abs/${entry.arxivId}`,
+      sourceUrl,
       oarxId,
       title: entry.title,
       authors: entry.authors,
       abstract: entry.abstract,
       categories: entry.categories,
-      publishedAt: new Date(entry.publishedAt),
+      publishedAt,
       rawContentPath: pdfPath,
       structuredContent: null,
       sources,
@@ -340,12 +400,7 @@ export class ArxivSource {
       processingLog: [],
       processingCost: 0,
       provenance: [],
-      externalIds: {
-        oarx: oarxId,
-        arxiv: entry.arxivId,
-        ...(entry.doi ? { doi: entry.doi } : {}),
-        ...(entry.journalRef ? { journal_ref: entry.journalRef } : {}),
-      },
+      externalIds,
       retryCount: 0,
       // License from arXiv OAI-PMH (multi-source map + computed effective)
       licenses,

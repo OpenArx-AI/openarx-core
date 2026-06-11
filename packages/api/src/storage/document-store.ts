@@ -110,6 +110,24 @@ function rowToDocument(row: DocumentRow): Document {
   };
 }
 
+/**
+ * Read-modify-write invariant (openarx-j173 R1): this statement is the ONLY
+ * write path for downloads landing on existing rows, and it must never grow
+ * a column it does not own. Exported so the unit test can assert the column
+ * list — anyone adding a field here must consciously decide whether the
+ * download step owns it.
+ */
+export const APPLY_DOWNLOAD_SUCCESS_SQL = `UPDATE documents SET
+         status = 'downloaded',
+         title = $2, authors = $3::jsonb, abstract = $4, categories = $5,
+         published_at = $6, source_url = $7,
+         raw_content_path = $8, sources = $9::jsonb, source_format = $10,
+         structured_content = NULL,
+         licenses = COALESCE(licenses, '{}'::jsonb) || $11::jsonb,
+         license = $12,
+         external_ids = COALESCE(external_ids, '{}'::jsonb) || $13::jsonb
+       WHERE id = $1`;
+
 export class PgDocumentStore implements DocumentStore {
   async save(doc: Document): Promise<void> {
     await query(
@@ -215,6 +233,67 @@ export class PgDocumentStore implements DocumentStore {
       [id],
     );
     return result.rows[0] ? rowToDocument(result.rows[0]) : null;
+  }
+
+  /**
+   * Read-modify-write update applied when a download lands on an EXISTING
+   * row (status='listed' registry row or a download_failed retry). Unlike
+   * save() — which overwrites the whole row — this touches ONLY the fields
+   * the download step is responsible for. Fields this code does not know
+   * about (operator marks, future enrichments, oarx_legacy in external_ids)
+   * are preserved by construction:
+   * - external_ids / licenses are MERGED (`||`), new keys win, unknown keys kept
+   * - processing_log / provenance / retry_count / concept_id / oarx_id /
+   *   indexing_tier / created_at are not touched
+   * - structured_content is reset to NULL: previous parse output (if any)
+   *   does not describe the fresh files
+   */
+  async applyDownloadSuccess(id: string, fields: {
+    title: string;
+    authors: Document['authors'];
+    abstract: string;
+    categories: string[];
+    publishedAt: Date;
+    sourceUrl: string;
+    rawContentPath: string;
+    sources: NonNullable<Document['sources']>;
+    sourceFormat: string;
+    /** New license keys to merge (e.g. { arxiv_oai: 'CC-BY-4.0' }). */
+    licenses: Record<string, string>;
+    /** Effective license computed by the caller over the MERGED map. */
+    license: string | null;
+    /** New external id keys to merge (oarx, arxiv, doi, journal_ref). */
+    externalIds: Record<string, string>;
+  }): Promise<void> {
+    await query(
+      APPLY_DOWNLOAD_SUCCESS_SQL,
+      [
+        id, fields.title, JSON.stringify(fields.authors), fields.abstract,
+        fields.categories, fields.publishedAt, fields.sourceUrl,
+        fields.rawContentPath, JSON.stringify(fields.sources), fields.sourceFormat,
+        JSON.stringify(fields.licenses), fields.license,
+        JSON.stringify(fields.externalIds),
+      ],
+    );
+  }
+
+  /**
+   * Read-modify-write counterpart for a FAILED download on an existing row:
+   * flips status and APPENDS the failure to processing_log (history is kept,
+   * unlike the legacy full-overwrite path). Nothing else is touched.
+   */
+  async applyDownloadFailure(id: string, error: string): Promise<void> {
+    const entry: ProcessingLogEntry = {
+      step: 'download', status: 'failed',
+      timestamp: new Date().toISOString(), error,
+    };
+    await query(
+      `UPDATE documents SET
+         status = 'download_failed',
+         processing_log = COALESCE(processing_log, '[]'::jsonb) || $2::jsonb
+       WHERE id = $1`,
+      [id, JSON.stringify([entry])],
+    );
   }
 
   async getBySourceId(

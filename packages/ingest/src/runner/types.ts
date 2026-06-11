@@ -1,6 +1,15 @@
 /** IPC command/response types for runner daemon ↔ CLI communication */
 
-export type Direction = 'forward' | 'backfill' | 'mixed' | 'pending_only';
+/**
+ * Traversal order over the per-document registry (registry-driven ingest,
+ * openarx-j173): 'forward' = ascending published_at (default), 'backward' =
+ * descending.
+ *
+ * Legacy values accepted for socket compatibility and mapped on receipt:
+ * 'backfill' → backward, 'mixed' → forward, 'pending_only' → downloaded-only
+ * run (no dates + downloadedFirst).
+ */
+export type Direction = 'forward' | 'backward' | 'backfill' | 'mixed' | 'pending_only';
 
 /**
  * Indexing strategy for an ingest run.
@@ -15,24 +24,43 @@ export type IngestStrategy = 'license_aware' | 'force_full';
 
 export interface IngestCommand {
   type: 'ingest';
+  /** Max documents taken into work this run. Always applies. Default 100. */
   limit: number;
   direction?: Direction;
   retry?: boolean;
+  /** Period bounds over documents.published_at (inclusive). At least one of
+   *  dateFrom/dateTo is required unless downloadedFirst-only run. */
   dateFrom?: string;
   dateTo?: string;
+  /** Process ALL status='downloaded' docs first (no date filter, within
+   *  limit), then continue with the period. Set alone (no dates) = process
+   *  downloaded backlog only. Replaces the old implicit Step 0 + the
+   *  pending_only direction. */
+  downloadedFirst?: boolean;
   strategy?: IngestStrategy;
   /** When true, runner workers pass {bypassCache: true} to every
    *  embed-service call. Useful for backfills where each chunk text
    *  is unique (cache hit-rate ≈ 0) and writing entries just evicts
    *  warmer search queries. Defaults to false. */
   bypassEmbedCache?: boolean;
-  /** Per-run override of arxiv categories to PROCESS (post-fetch filter).
-   *  Fetch happens unfiltered via OAI-PMH `set=cs`, returning all CS papers.
-   *  Categories listed here decide which fetched papers actually get
-   *  downloaded + indexed. Papers outside this list still bump
-   *  `coverage_map.expected` per-cat (we know they exist on arxiv).
-   *  When omitted, runner falls back to env RUNNER_CATEGORIES. */
+  /** Registry selection filter: only documents whose categories overlap
+   *  this list are taken (documents.categories && $cats). When omitted,
+   *  runner falls back to env RUNNER_CATEGORIES; empty/unset = all. */
   categories?: string[];
+}
+
+/**
+ * Fetch arXiv day listings into the per-document registry (status='listed'
+ * rows). Same period/direction/limit logic as ingest; limit counts fetched
+ * entries but a day is atomic — it is always finished, the limit is checked
+ * at day boundaries. At least one date is required.
+ */
+export interface RegistryUpdateCommand {
+  type: 'registry_update';
+  dateFrom?: string;
+  dateTo?: string;
+  direction?: 'forward' | 'backward';
+  limit?: number;
 }
 
 export interface StopCommand {
@@ -67,6 +95,7 @@ export interface DoctorCommand {
 
 export type RunnerCommand =
   | IngestCommand
+  | RegistryUpdateCommand
   | StopCommand
   | StatusCommand
   | CoverageCommand

@@ -8,7 +8,6 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createContext } from './context.js';
 import { getProfile, getAllProfiles } from './profiles/registry.js';
 import { isTokenTypeSufficient } from './profiles/types.js';
-import { registerPipelineRoutes } from './pipeline-routes.js';
 import { registerInternalRoutes } from './internal-routes.js';
 import { registerAdminRoutes } from './admin-routes.js';
 import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, type TokenInfo } from './portal-auth.js';
@@ -19,7 +18,14 @@ import { UsageTracker, withUsageTracker } from './lib/usage-tracker.js';
 import { incrementCallCounters } from './lib/cost-counters.js';
 import { startRollupTimer } from './lib/cost-rollup.js';
 
-const HOST = process.env.MCP_HOST ?? '127.0.0.1';
+/**
+ * Bind addresses, comma-separated (openarx-76fo). The service must NOT
+ * listen on 0.0.0.0: the public interface is served via a reverse proxy on
+ * loopback, and sibling services reach the internal API over a private
+ * network interface — list exactly those addresses (e.g.
+ * MCP_HOST=127.0.0.1,<private-ip>).
+ */
+const HOSTS = (process.env.MCP_HOST ?? '127.0.0.1').split(',').map((h) => h.trim()).filter(Boolean);
 const PORT = parseInt(process.env.MCP_PORT ?? '3100', 10);
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN ?? '';
 
@@ -715,9 +721,10 @@ async function main(): Promise<void> {
     await transport.handleRequest(req, res, req.body);
   });
 
-  // ── Pipeline API routes (proxied to runner daemon) ─────────────
-
-  registerPipelineRoutes(app);
+  // Pipeline control-plane is NOT exposed over HTTP (openarx-76fo):
+  // Console talks to the runner daemon directly via the unix socket
+  // (/run/openarx/runner.sock). The old /api/pipeline/* gateway let any
+  // valid Bearer (incl. consumer tokens) start/stop ingest runs.
   registerInternalRoutes(app, ctx);
   registerAdminRoutes(app, ctx);
 
@@ -730,21 +737,22 @@ async function main(): Promise<void> {
   // ── Start ──────────────────────────────────────────────────────
 
   const profiles = getAllProfiles();
-  const server = app.listen(PORT, HOST, () => {
-    log(`Listening on http://${HOST}:${PORT}`);
-    for (const p of profiles) {
-      log(`  ${p.id}: http://${HOST}:${PORT}/${p.id}/mcp — ${p.description}`);
-    }
-    log(`Health:   http://${HOST}:${PORT}/health`);
-    log(`Versions: http://${HOST}:${PORT}/versions`);
-    log(`Metrics:  http://${HOST}:${PORT}/metrics`);
+  const servers = HOSTS.map((host) => {
+    const server = app.listen(PORT, host, () => {
+      log(`Listening on http://${host}:${PORT}`);
+      for (const p of profiles) {
+        log(`  ${p.id}: http://${host}:${PORT}/${p.id}/mcp — ${p.description}`);
+      }
+      log(`Health:   http://${host}:${PORT}/health`);
+    });
+    server.keepAliveTimeout = 120_000;
+    server.headersTimeout = 125_000;
+    return server;
   });
-  server.keepAliveTimeout = 120_000;
-  server.headersTimeout = 125_000;
 
   const shutdown = async (): Promise<void> => {
     log('Shutting down...');
-    server.close();
+    for (const server of servers) server.close();
     await ctx.shutdown();
     process.exit(0);
   };

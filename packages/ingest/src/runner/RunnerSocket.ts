@@ -99,7 +99,13 @@ export class RunnerSocketServer {
       case 'ingest': {
         const run = cmd.retry
           ? await this.service.retry(cmd.limit)
-          : await this.service.ingest(cmd.limit, cmd.direction, cmd.dateFrom, cmd.dateTo, cmd.strategy, cmd.bypassEmbedCache, cmd.categories);
+          : await this.service.ingest(cmd.limit, cmd.direction, cmd.dateFrom, cmd.dateTo, cmd.strategy, cmd.bypassEmbedCache, cmd.categories, cmd.downloadedFirst);
+        return { ok: true, data: run };
+      }
+      case 'registry_update': {
+        const run = await this.service.registryUpdate({
+          dateFrom: cmd.dateFrom, dateTo: cmd.dateTo, direction: cmd.direction, limit: cmd.limit,
+        });
         return { ok: true, data: run };
       }
       case 'stop': {

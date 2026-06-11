@@ -79,7 +79,12 @@ export async function findDuplicates(threshold = 0.95): Promise<DuplicatePair[]>
     source_id: string;
     title: string;
     status: string;
-  }>(`SELECT id, source_id, title, status FROM documents ORDER BY created_at`);
+  }>(
+    // status='listed' = registry-only rows (never downloaded) — excluded so
+    // similarity pairs only cover actually-ingested documents, as before the
+    // per-document registry existed.
+    `SELECT id, source_id, title, status FROM documents WHERE status != 'listed' ORDER BY created_at`,
+  );
 
   const docs = result.rows;
   const pairs: DuplicatePair[] = [];
