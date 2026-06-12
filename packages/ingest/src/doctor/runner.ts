@@ -31,6 +31,10 @@ export async function runDoctor(
   };
 
   for (const check of checks) {
+    if (ctx.shouldStop?.()) {
+      log.warn({ remaining: checks.length - report.checksRun }, 'Doctor stopped by operator');
+      break;
+    }
     log.info({ check: check.name }, 'Running check');
 
     const result = await check.detect();

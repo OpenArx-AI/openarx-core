@@ -155,6 +155,10 @@ function parseArgs(): RunnerCommand {
           i++;
         }
       }
+      if (fix && !check) {
+        console.error('Error: doctor --fix requires --check <name> (running every fix at once, unbounded, is unsafe on the current corpus).');
+        process.exit(1);
+      }
       return { type: 'doctor', fix, check, limit };
     }
     default:
@@ -275,6 +279,14 @@ async function main(): Promise<void> {
         break;
       }
       case 'doctor': {
+        if (cmd.fix) {
+          // fix is a background run now — the response is a PipelineRun
+          const run = resp.data as PipelineRun;
+          console.log(`Doctor fix started: ${run.id}`);
+          console.log(`  Check: ${cmd.check}`);
+          console.log('\nUse "openarx status" to check progress, "openarx stop" to stop.');
+          break;
+        }
         const d = resp.data as DoctorReport;
         console.log('');
         console.log('OpenArx Doctor — Data Integrity Report');

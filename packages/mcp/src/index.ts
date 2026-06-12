@@ -12,7 +12,7 @@ import { registerInternalRoutes } from './internal-routes.js';
 import { registerAdminRoutes } from './admin-routes.js';
 import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, type TokenInfo } from './portal-auth.js';
 import { logRequest, extractResultSummary } from './request-logger.js';
-import { getCostKey } from './cost-key.js';
+import { getCostKey, isDryRunCall } from './cost-key.js';
 import { resolveAgentId, getAgentReputation, getAgentTier } from './gov-identity.js';
 import { UsageTracker, withUsageTracker } from './lib/usage-tracker.js';
 import { incrementCallCounters } from './lib/cost-counters.js';
@@ -588,6 +588,9 @@ async function main(): Promise<void> {
           const userAgent = req.headers['user-agent'] as string ?? '';
           const toolArgs = (handlerArgs[0] ?? {}) as Record<string, unknown>;
           const costKey = getCostKey(name, toolArgs);
+          // dry_run (openarx-contracts-tof2): validation-only calls cost 0 —
+          // skip the pre-check AND every deduction path below.
+          const dryRun = isDryRunCall(name, toolArgs);
 
           // Per-request usage tracker for LLM/embed cost capture
           // (openarx-2a5f). Threaded via AsyncLocalStorage so all
@@ -620,7 +623,7 @@ async function main(): Promise<void> {
             }
 
             // Pre-check: can user afford this tool?
-            if (portalToken?.userId) {
+            if (portalToken?.userId && !dryRun) {
               // For gov tools: fetch agent reputation for discount calculation
               let agentReputation: number | undefined;
               if (profileId === 'gov' && toolArgs.agentId) {
@@ -650,8 +653,10 @@ async function main(): Promise<void> {
             // via AsyncLocalStorage lookup.
             toolResult = await withUsageTracker(usage, () => originalHandler(...handlerArgs));
 
-            // Post-deduct: charge user
-            if (portalToken?.userId && portalToken?.tokenId) {
+            // Post-deduct: charge user (never for dry_run — the legacy
+            // fallback below would otherwise charge when creditsCharged
+            // stayed null)
+            if (portalToken?.userId && portalToken?.tokenId && !dryRun) {
               if (creditsCharged !== null) {
                 // New billing: tool-deduct with effective_cost
                 const deductResult = await toolDeduct(

@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] — 2026-06-12
+
+Publisher-tools hardening release: every change driven by real publishing
+UX feedback from MCP clients (contracts epic 8wq7) plus doctor
+operationalization.
+
+### Added
+- **`dry_run` flag on `submit_document` / `create_new_version`**: validate
+  a submission without committing — no document created, no file written,
+  nothing queued, **0 credits charged**. Returns
+  `{dry_run, validation, estimated_cost, would_save}`; for
+  `create_new_version` the preview reflects resolved metadata inheritance
+  and the actual next version number.
+- `create_new_version` now **inherits `categories`, `keywords` and
+  `language`** from the previous version when omitted; pass a value
+  (including an empty array) to override each independently. Previously
+  keywords were dropped and language reset to `en` on every revision.
+- `get_my_documents` status filter expanded from 4 to 13 values — every
+  real pipeline status (incl. intermediate `parsing`/`chunking`/
+  `embedding`) is filterable; a canonical **Status reference** glossary is
+  embedded in both `get_my_documents` and `get_document_status`
+  descriptions.
+- `categories` fields now document the recommended arXiv format with
+  examples (doc-only — other formats remain accepted).
+- Doctor `--fix` runs as a **background tracked operation** (same run
+  model as ingest: pipeline_runs record, cooperative stop, busy-lock with
+  other writers); an explicit `--check` is now required for fix runs.
+
+### Changed
+- `submit_document` / `create_new_version` reject empty or
+  whitespace-only `content_text` for latex/markdown up front (previously
+  the document enqueued and failed minutes later while the caller saw
+  `queued`).
+- Size ceilings on publish inputs: title ≤5,000; abstract ≤50,000;
+  content_text ≤2,000,000 (~2 MB); keywords ≤50 × ≤100 chars — limits are
+  documented in the tool descriptions.
+- Doctor `license-backfill` no longer counts registry-only entries
+  (status `listed`) as documents missing license info.
+
 ## [0.1.3] — 2026-06-12
 
 Registry-driven coverage release. The ingest pipeline now works from a

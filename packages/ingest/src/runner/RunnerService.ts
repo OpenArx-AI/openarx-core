@@ -573,20 +573,98 @@ export class RunnerService {
     return auditResult;
   }
 
-  async doctor(fix?: boolean, check?: string, limit?: number): Promise<import('../doctor/types.js').DoctorReport> {
-    if (fix && this.isRunning) {
-      throw new Error('Cannot run doctor --fix while ingest is running.');
-    }
+  /**
+   * detect (fix=false): synchronous and read-only — safe to call any time,
+   * returns a DoctorReport directly.
+   *
+   * fix=true: a BACKGROUND run like ingest/registry-update (openarx-76fo
+   * follow-up): same busy-lock (either ingest, registry-update, or a doctor
+   * fix — never two writers), tracked in pipeline_runs
+   * (direction='doctor_fix'), stoppable via the `stop` command. Returns the
+   * PipelineRun immediately; the report lands in metrics.report on finish.
+   * An explicit check name is REQUIRED for fix: running every fix unbounded
+   * was only safe on the early small corpus.
+   */
+  async doctor(fix?: boolean, check?: string, limit?: number): Promise<import('../doctor/types.js').DoctorReport | PipelineRun> {
     const { runDoctor } = await import('../doctor/runner.js');
-    const ctx: import('../doctor/types.js').DoctorContext = {
-      qdrantUrl: process.env.QDRANT_URL ?? 'http://localhost:6335',
-      qdrantApiKey: process.env.QDRANT_API_KEY,
-      fix: !!fix,
-      fixLimit: limit,
-      modelRouter: fix ? this.orchestrator['modelRouter'] : undefined,
-      embedClient: fix ? this.orchestrator['config']?.embedClient : undefined,
-    };
-    return runDoctor(ctx, { checkName: check });
+
+    if (!fix) {
+      const ctx: import('../doctor/types.js').DoctorContext = {
+        qdrantUrl: process.env.QDRANT_URL ?? 'http://localhost:6335',
+        qdrantApiKey: process.env.QDRANT_API_KEY,
+        fix: false,
+        fixLimit: limit,
+      };
+      return runDoctor(ctx, { checkName: check });
+    }
+
+    if (this.isRunning) {
+      throw new Error('Already running. Use "openarx status" to check progress.');
+    }
+    if (!check) {
+      throw new Error('doctor --fix requires an explicit --check <name>: running every fix at once, unbounded, is unsafe on the current corpus.');
+    }
+
+    this.stopRequested = false;
+    this.stopSignal = { requested: false };
+    this.abortController = new AbortController();
+
+    const runId = randomUUID();
+    await query(
+      `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
+       VALUES ($1, 'running', 'doctor_fix', 'arxiv', '{}', $2::jsonb)`,
+      [runId, JSON.stringify({ params: { check, limit: limit ?? null } })],
+    );
+    this.currentRunId = runId;
+
+    log.info({ runId, check, limit }, 'Doctor fix started');
+
+    this.runDoctorFix(runId, check, limit).catch((err) => {
+      log.error({ err, runId }, 'Doctor fix failed unexpectedly');
+    });
+
+    return this.getRunById(runId);
+  }
+
+  private async runDoctorFix(runId: string, check: string, limit?: number): Promise<void> {
+    try {
+      const { runDoctor } = await import('../doctor/runner.js');
+      const ctx: import('../doctor/types.js').DoctorContext = {
+        qdrantUrl: process.env.QDRANT_URL ?? 'http://localhost:6335',
+        qdrantApiKey: process.env.QDRANT_API_KEY,
+        fix: true,
+        fixLimit: limit,
+        modelRouter: this.orchestrator['modelRouter'],
+        embedClient: this.orchestrator['config']?.embedClient,
+        shouldStop: () => this.stopRequested,
+      };
+      const report = await runDoctor(ctx, { checkName: check });
+
+      const fixed = report.results.reduce((s, r) => s + (r.fixResult?.fixed ?? 0), 0);
+      const failed = report.results.reduce((s, r) => s + (r.fixResult?.failed ?? 0), 0);
+      const finalStatus = this.stopRequested ? 'stopped' : 'completed';
+
+      await query(
+        `UPDATE pipeline_runs SET status = $1, finished_at = now(),
+          docs_processed = $2, docs_failed = $3,
+          metrics = COALESCE(metrics, '{}'::jsonb) || $4::jsonb
+         WHERE id = $5`,
+        [finalStatus, fixed, failed, JSON.stringify({ report }), runId],
+      );
+      log.info({ runId, status: finalStatus, check, fixed, failed }, 'Doctor fix finished');
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await query(
+        `UPDATE pipeline_runs SET status = 'failed', finished_at = now(),
+         metrics = COALESCE(metrics, '{}'::jsonb) || $1::jsonb
+         WHERE id = $2`,
+        [JSON.stringify({ error: errMsg }), runId],
+      );
+      log.error({ err, runId }, 'Doctor fix failed');
+    } finally {
+      this.currentRunId = null;
+      this.stopRequested = false;
+    }
   }
 
   async shutdown(): Promise<void> {

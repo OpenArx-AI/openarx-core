@@ -275,9 +275,14 @@ export function createLicenseBackfillCheck(ctx: DoctorContext): CheckModule {
     severity: 'medium',
 
     async detect(): Promise<CheckResult> {
+      // Registry rows are excluded: 'listed' docs have no files and get their
+      // license at download time (OAI fetch inside downloadAndRegister);
+      // 'download_failed' likewise — harvesting licenses for them is wasted
+      // work and was inflating this check by the whole registry (~727K).
       const result = await query<{ cnt: string }>(
         `SELECT count(*)::text as cnt FROM documents
-          WHERE source = 'arxiv' AND licenses = '{}'::jsonb`,
+          WHERE source = 'arxiv' AND licenses = '{}'::jsonb
+            AND status NOT IN ('listed', 'download_failed')`,
       );
       const count = parseInt(result.rows[0]?.cnt ?? '0', 10);
       if (count === 0) {
@@ -306,17 +311,21 @@ export function createLicenseBackfillCheck(ctx: DoctorContext): CheckModule {
       // the from-date deep into the past and force us to walk through years
       // of empty pages. The few outliers can be handled separately if needed.
       // untilDate caps at latest published_at to avoid future records.
+      // Same registry exclusion as detect() — otherwise listed rows stretch
+      // the harvest range across the whole registry (2017+ → everything).
       const dateRangeResult = await query<{ from_date: string | null; until_date: string | null }>(
         `WITH monthly AS (
           SELECT date_trunc('month', published_at)::date as month, count(*) as cnt
             FROM documents
            WHERE source = 'arxiv' AND licenses = '{}'::jsonb
+             AND status NOT IN ('listed', 'download_failed')
            GROUP BY 1
         )
         SELECT
           (SELECT min(month)::text FROM monthly WHERE cnt >= 100) as from_date,
           (SELECT max(published_at)::date::text FROM documents
-            WHERE source = 'arxiv' AND licenses = '{}'::jsonb) as until_date`,
+            WHERE source = 'arxiv' AND licenses = '{}'::jsonb
+              AND status NOT IN ('listed', 'download_failed')) as until_date`,
       );
       const fromDate = dateRangeResult.rows[0]?.from_date ?? null;
       const untilDate = dateRangeResult.rows[0]?.until_date ?? null;
@@ -328,6 +337,10 @@ export function createLicenseBackfillCheck(ctx: DoctorContext): CheckModule {
       }, '[license-backfill] starting OAI-PMH ListRecords backfill');
 
       while (true) {
+        if (ctx.shouldStop?.()) {
+          log.warn({ pages, totalSeen }, '[license-backfill] fix stopped by operator');
+          break;
+        }
         try {
           const { records, nextToken } = await fetchListRecordsPage(token, fromDate, untilDate);
           pages++;

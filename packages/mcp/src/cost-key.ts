@@ -15,9 +15,16 @@ export function getCostKey(tool: string, args: Record<string, unknown>): string 
     case 'search_semantic':
       return `search_semantic:${args.strategy ?? 'fast'}`;
 
-    // Publishing — cost varies by content format
+    // Publishing — cost varies by content format; dry_run is free
+    // (openarx-contracts-tof2): the gateway skips toolCheck/toolDeduct
+    // entirely for dry-run calls (see isDryRunCall), the :dry_run cost_key
+    // exists for request-log observability and the economics_config mirror.
     case 'submit_document':
-      return `submit_document:${args.content_format ?? 'latex'}`;
+      return args.dry_run === true
+        ? 'submit_document:dry_run'
+        : `submit_document:${args.content_format ?? 'latex'}`;
+    case 'create_new_version':
+      return args.dry_run === true ? 'create_new_version:dry_run' : 'create_new_version';
 
     // Search v2 (openarx-g8af) — variants by mode/detail differ in LLM cost
     case 'find_evidence':
@@ -38,4 +45,18 @@ export function getCostKey(tool: string, args: Record<string, unknown>): string 
     default:
       return tool;
   }
+}
+
+/**
+ * Tools that implement validate-without-committing semantics
+ * (openarx-contracts-tof2). ONLY these zero-bill on dry_run=true — a stray
+ * dry_run argument on any other tool must not bypass billing.
+ */
+const DRY_RUN_TOOLS = new Set(['submit_document', 'create_new_version']);
+
+/** True when this call is a dry run of a tool that supports it — the
+ *  gateway then skips BOTH toolCheck (pre) and toolDeduct/legacy-deduct
+ *  (post), making dry_run cost 0 end-to-end regardless of Portal config. */
+export function isDryRunCall(tool: string, args: Record<string, unknown>): boolean {
+  return DRY_RUN_TOOLS.has(tool) && args.dry_run === true;
 }

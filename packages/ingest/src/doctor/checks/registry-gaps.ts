@@ -143,6 +143,10 @@ export function createRegistryGapsCheck(ctx: DoctorContext): CheckModule {
       let fixed = 0;
       let failed = 0;
       for (const row of rows.rows) {
+        if (ctx.shouldStop?.()) {
+          log.warn({ fixed, remaining: rows.rows.length - fixed - failed }, 'registry-gaps fix stopped by operator');
+          break;
+        }
         try {
           // Full document fetched so the download applies as a
           // read-modify-write partial update onto the SAME row.

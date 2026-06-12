@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -1040,16 +1040,20 @@
       },
       {
         "name": "submit_document",
-        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking.",
+        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
             "title": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 5000,
               "description": "Document title"
             },
             "abstract": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 50000,
               "description": "Document abstract"
             },
             "content_format": {
@@ -1063,6 +1067,7 @@
             },
             "content_text": {
               "type": "string",
+              "maxLength": 2000000,
               "description": "Document content (inline text for LaTeX/Markdown)"
             },
             "authors": {
@@ -1103,14 +1108,22 @@
               "items": {
                 "type": "string"
               },
-              "description": "arXiv categories"
+              "description": "List of subject categories. arXiv format recommended:\n`{domain}.{subcategory}` where domain is lowercase (with optional hyphens)\nand subcategory is two uppercase letters.\nExamples: \"cs.CL\" (Computation and Language), \"math.PR\" (Probability),\n\"cond-mat.str-el\" (Strongly Correlated Electrons),\n\"physics.gen-ph\" (General Physics).\nOther formats accepted but may render inconsistently in search facets."
             },
             "keywords": {
               "type": "array",
               "items": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
               },
+              "maxItems": 50,
               "description": "Keywords"
+            },
+            "dry_run": {
+              "type": "boolean",
+              "default": false,
+              "description": "Validate only — no document created, no file written, no queue entry, 0 credits. Response: {dry_run:true, validation:\"ok\", estimated_cost, would_save}."
             }
           },
           "required": [
@@ -1128,7 +1141,7 @@
       },
       {
         "name": "get_my_documents",
-        "description": "List documents you have submitted through OpenArx Portal.",
+        "description": "List documents you have submitted through OpenArx Portal.\n\nStatus reference:\n  downloaded — accepted, queued for indexing\n  parsing — extracting text from latex/markdown/PDF\n  translating — auto-translating to English (non-en originals only)\n  chunking — splitting content into semantic chunks\n  enriching — extracting code/dataset/benchmark links\n  embedding — generating vector embeddings (Gemini + SPECTER2)\n  ready — fully indexed, searchable\n  failed — pipeline error (retryable)\n  download_failed — source fetch failed (retryable; rare for Portal submissions)\n  duplicate — detected as duplicate of an existing document\n  rejected — quality/spam gate rejection (terminal, non-retryable)\n  listed — registry-only entry (not user-submitted, only visible to operators)",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1143,12 +1156,21 @@
               "type": "string",
               "enum": [
                 "all",
-                "ready",
                 "downloaded",
-                "failed"
+                "parsing",
+                "translating",
+                "chunking",
+                "enriching",
+                "embedding",
+                "ready",
+                "failed",
+                "download_failed",
+                "duplicate",
+                "rejected",
+                "listed"
               ],
               "default": "all",
-              "description": "Filter by status"
+              "description": "Filter by status; see Status reference in tool description"
             }
           },
           "additionalProperties": false,
@@ -1160,7 +1182,7 @@
       },
       {
         "name": "get_document_status",
-        "description": "Check the processing status of a submitted document.",
+        "description": "Check the processing status of a submitted document.\n\nStatus reference:\n  downloaded — accepted, queued for indexing\n  parsing — extracting text from latex/markdown/PDF\n  translating — auto-translating to English (non-en originals only)\n  chunking — splitting content into semantic chunks\n  enriching — extracting code/dataset/benchmark links\n  embedding — generating vector embeddings (Gemini + SPECTER2)\n  ready — fully indexed, searchable\n  failed — pipeline error (retryable)\n  download_failed — source fetch failed (retryable; rare for Portal submissions)\n  duplicate — detected as duplicate of an existing document\n  rejected — quality/spam gate rejection (terminal, non-retryable)\n  listed — registry-only entry (not user-submitted, only visible to operators)",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1181,7 +1203,7 @@
       },
       {
         "name": "create_new_version",
-        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest.",
+        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit `categories`, `keywords`, or `language` to inherit each independently from the previous version; pass a value to override. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1191,10 +1213,14 @@
             },
             "title": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 5000,
               "description": "Updated title"
             },
             "abstract": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 50000,
               "description": "Updated abstract"
             },
             "content_format": {
@@ -1208,6 +1234,7 @@
             },
             "content_text": {
               "type": "string",
+              "maxLength": 2000000,
               "description": "Updated document content"
             },
             "authors": {
@@ -1237,6 +1264,32 @@
               "type": "string",
               "default": "cc-by-4.0",
               "description": "License"
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Override. Omit to inherit from previous version. List of subject categories. arXiv format recommended:\n`{domain}.{subcategory}` where domain is lowercase (with optional hyphens)\nand subcategory is two uppercase letters.\nExamples: \"cs.CL\" (Computation and Language), \"math.PR\" (Probability),\n\"cond-mat.str-el\" (Strongly Correlated Electrons),\n\"physics.gen-ph\" (General Physics).\nOther formats accepted but may render inconsistently in search facets."
+            },
+            "keywords": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100
+              },
+              "maxItems": 50,
+              "description": "Override. Omit to inherit from previous version."
+            },
+            "language": {
+              "type": "string",
+              "description": "Override (ISO 639-1). Omit to inherit from previous version."
+            },
+            "dry_run": {
+              "type": "boolean",
+              "default": false,
+              "description": "Validate only — no document created, no file written, no queue entry, 0 credits. Response: {dry_run:true, validation:\"ok\", estimated_cost, would_save}."
             }
           },
           "required": [
