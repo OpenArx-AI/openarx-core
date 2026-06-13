@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -1040,7 +1040,7 @@
       },
       {
         "name": "submit_document",
-        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
+        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Content is provided either inline (content_text) or as a base64-encoded ZIP archive (content_archive_base64) — single archived PDF, markdown + figures, or multifile LaTeX; the two are mutually exclusive. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1069,6 +1069,17 @@
               "type": "string",
               "maxLength": 2000000,
               "description": "Document content (inline text for LaTeX/Markdown)"
+            },
+            "content_archive_base64": {
+              "type": "string",
+              "maxLength": 67000000,
+              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Required if content_text is not provided. Mutually exclusive with content_text."
+            },
+            "main_file": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required."
             },
             "authors": {
               "type": "array",
@@ -1203,7 +1214,7 @@
       },
       {
         "name": "create_new_version",
-        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit `categories`, `keywords`, or `language` to inherit each independently from the previous version; pass a value to override. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
+        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit `categories`, `keywords`, or `language` to inherit each independently from the previous version; pass a value to override. Content is provided either inline (content_text) or as a base64-encoded ZIP archive (content_archive_base64) — single archived PDF, markdown + figures, or multifile LaTeX; the two are mutually exclusive. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1285,6 +1296,17 @@
             "language": {
               "type": "string",
               "description": "Override (ISO 639-1). Omit to inherit from previous version."
+            },
+            "content_archive_base64": {
+              "type": "string",
+              "maxLength": 67000000,
+              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Required if content_text is not provided. Mutually exclusive with content_text."
+            },
+            "main_file": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required."
             },
             "dry_run": {
               "type": "boolean",

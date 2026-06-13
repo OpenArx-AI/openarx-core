@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] — 2026-06-13
+
+Archive upload for publishing, plus internal groundwork for a unified
+publication pipeline.
+
+### Added
+- **ZIP archive upload** on `submit_document` / `create_new_version`: a new
+  `content_archive_base64` parameter (+ optional `main_file`) accepts a
+  base64 ZIP, unlocking three publishing modes over MCP — a single archived
+  PDF, Markdown with figures, and multi-file LaTeX (main.tex + .bib +
+  figures). Mutually exclusive with `content_text`. Validated for ZIP magic
+  bytes, decoded-size and uncompressed-size caps (zip-bomb defense), path
+  traversal, and symlink entries; `dry_run` previews the resolved
+  `main_file` + attachments without committing.
+
+### Changed
+- Request body limit raised to 80 MB on the MCP and internal endpoints so
+  archive uploads up to the documented cap are accepted.
+
+### Fixed
+- Real MCP document submissions failed with `require is not defined` in the
+  ESM build path — corrected to a static import.
+
 ## [0.1.4] — 2026-06-12
 
 Publisher-tools hardening release: every change driven by real publishing

@@ -6,9 +6,22 @@
  */
 
 import { z } from 'zod';
+import { tmpdir as osTmpdir } from 'node:os';
+import { mkdir as fsMkdir, rm as fsRm, cp as fsCp } from 'node:fs/promises';
+import { join as pathJoin } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../../context.js';
 import { query, computeOarxId } from '@openarx/api';
+import {
+  ARCHIVE_LIMITS,
+  ArchiveIntakeError,
+  decodeArchive,
+  extractArchive,
+  resolveMainFile,
+  checkFormatMatch,
+  buildAttachments,
+  assertExtractedFile,
+} from './archive-intake.js';
 
 function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
@@ -53,6 +66,120 @@ export const dryRunField = z.boolean().default(false)
  */
 export function estimatedSubmitCost(format: 'latex' | 'markdown' | 'pdf'): number {
   return format === 'pdf' ? 10 : 5;
+}
+
+// ── Archive intake (openarx-contracts-nie7) ────────────────────────────
+
+const ARCHIVE_NOTE = 'Content is provided either inline (content_text) or as a base64-encoded ZIP archive (content_archive_base64) — single archived PDF, markdown + figures, or multifile LaTeX; the two are mutually exclusive.';
+
+export const archiveField = z.string()
+  .max(ARCHIVE_LIMITS.encodedMax)
+  .optional()
+  .describe('Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Required if content_text is not provided. Mutually exclusive with content_text.');
+
+export const mainFileField = z.string()
+  .min(1).max(255)
+  .optional()
+  .describe('Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required.');
+
+interface PreparedArchive {
+  mainFile: string;
+  attachments: Array<{ filename: string; size: number; type: string }>;
+  tmpDir: string;
+  decodedBytes: number;
+}
+
+/**
+ * Combined content-input validation (nie7 refines on top of flrw):
+ * 1. content_text and content_archive_base64 are mutually exclusive
+ * 2. at least one of them is required (all formats, incl. pdf)
+ * 3. inline latex/markdown keeps the exact flrw non-empty error envelope
+ * @returns error body for jsonResult, or null when valid.
+ */
+export function validateContentInputs(
+  contentFormat: 'latex' | 'markdown' | 'pdf',
+  contentText: string | undefined,
+  archiveBase64: string | undefined,
+): { error: string; message: string; path: string[] } | null {
+  if (contentText != null && archiveBase64 != null) {
+    return { error: 'validation_error', message: 'content_text and content_archive_base64 are mutually exclusive — provide exactly one', path: ['content_archive_base64'] };
+  }
+  if (archiveBase64 != null) return null; // archive path validates during extraction
+  const inlineError = validateInlineContent(contentFormat, contentText);
+  if (inlineError) {
+    return { error: 'validation_error', message: inlineError, path: ['content_text'] };
+  }
+  if (contentFormat === 'pdf' && (contentText == null || contentText.trim().length === 0)) {
+    // pdf used to silently accept an empty body (wrote an empty .pdf) —
+    // the archive mechanism supersedes that: require real content.
+    return { error: 'validation_error', message: 'Either content_text or content_archive_base64 is required', path: ['content_archive_base64'] };
+  }
+  return null;
+}
+
+/** Structured ArchiveIntakeError → tool error envelope; rethrows the rest. */
+function archiveErrorResult(e: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  if (e instanceof ArchiveIntakeError) {
+    return jsonResult({ error: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) });
+  }
+  throw e;
+}
+
+/**
+ * Decode + extract + validate the archive into a temp dir. The CALLER owns
+ * tmpDir cleanup on success (real submit: after copying to storagebox;
+ * dry_run: immediately) — this function cleans up only on failure.
+ */
+async function prepareArchive(
+  base64: string,
+  mainFileArg: string | undefined,
+  contentFormat: 'latex' | 'markdown' | 'pdf',
+): Promise<PreparedArchive> {
+  const buf = decodeArchive(base64);
+  const tmpDir = pathJoin(osTmpdir(), `oarx-archive-${crypto.randomUUID()}`);
+  await fsMkdir(tmpDir, { recursive: true });
+  try {
+    const files = await extractArchive(buf, tmpDir);
+    const mainFile = resolveMainFile(files, mainFileArg);
+    checkFormatMatch(mainFile, contentFormat);
+    await assertExtractedFile(tmpDir, mainFile);
+    return { mainFile, attachments: buildAttachments(files, mainFile), tmpDir, decodedBytes: buf.length };
+  } catch (e) {
+    await fsRm(tmpDir, { recursive: true, force: true }).catch(() => { /* best effort */ });
+    throw e;
+  }
+}
+
+/**
+ * Copy the extracted archive into the document's source dir and compose the
+ * save-shape pieces, incl. the Scenario B content_source payload
+ * (contracts/ingest_document_api.md) persisted in portalMetadata so the
+ * pipeline and Portal can see the multifile layout.
+ */
+async function materializeArchive(
+  prep: PreparedArchive,
+  sourceDir: string,
+  contentFormat: 'latex' | 'markdown' | 'pdf',
+): Promise<{ rawContentPath: string; sources: Record<string, unknown>; portalMetadata: Record<string, unknown> }> {
+  await fsCp(prep.tmpDir, sourceDir, { recursive: true });
+  const rawContentPath = pathJoin(sourceDir, prep.mainFile);
+  const sources = contentFormat === 'pdf'
+    ? { pdf: { path: rawContentPath } }
+    : contentFormat === 'markdown'
+      ? { markdown: { path: rawContentPath } }
+      : { latex: { path: sourceDir, rootTex: prep.mainFile } };
+  return {
+    rawContentPath,
+    sources,
+    portalMetadata: {
+      content_source: {
+        type: 'storagebox',
+        storage_path: sourceDir,
+        main_file: prep.mainFile,
+        attachments: prep.attachments,
+      },
+    },
+  };
 }
 
 /**
@@ -149,10 +276,12 @@ export function validateInlineContent(
 
 const PORTAL_STORAGE = process.env.PORTAL_STORAGE_BASE ?? '/mnt/storagebox/openarx/portal-docs';
 
-/** Per-user path for Portal indexed docs: {base}/{userId}/indexed/{docId}/ */
+/** Per-user path for Portal indexed docs: {base}/{userId}/indexed/{docId}/
+ *  (was `require('node:path')` — a runtime ReferenceError in this ESM
+ *  module that broke every REAL MCP submit; dry_run/validation paths
+ *  returned earlier and masked it. Found by the nie7 live smoke.) */
 function portalDocPath(userId: string, docId: string): string {
-  const { join } = require('node:path') as typeof import('node:path');
-  return join(PORTAL_STORAGE, userId, 'indexed', docId);
+  return pathJoin(PORTAL_STORAGE, userId, 'indexed', docId);
 }
 
 /** Localhost base URL for the internal API (same Express app). Used by
@@ -167,12 +296,14 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
   server.tool(
     'submit_document',
-    `Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
+    `Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. ${ARCHIVE_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
     {
       title: titleField.describe('Document title'),
       abstract: abstractField.describe('Document abstract'),
       content_format: z.enum(['latex', 'markdown', 'pdf']).describe('Content format'),
       content_text: contentTextField.describe('Document content (inline text for LaTeX/Markdown)'),
+      content_archive_base64: archiveField,
+      main_file: mainFileField,
       authors: z.array(z.object({
         given_name: z.string(),
         family_name: z.string(),
@@ -184,87 +315,93 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       keywords: keywordsField.describe('Keywords'),
       dry_run: dryRunField,
     },
-    async ({ title, abstract, content_format, content_text, authors, license, language, categories, keywords, dry_run }, extra) => {
+    async ({ title, abstract, content_format, content_text, content_archive_base64, main_file, authors, license, language, categories, keywords, dry_run }, extra) => {
       // Validation must be IDENTICAL for dry_run and real submits — same
-      // schema (SDK level), same refine here; the dry_run branch comes after.
-      const contentError = validateInlineContent(content_format, content_text);
-      if (contentError) {
-        return jsonResult({ error: 'validation_error', message: contentError, path: ['content_text'] });
+      // schema (SDK level), same refines here; the dry_run branch comes after.
+      const inputError = validateContentInputs(content_format, content_text, content_archive_base64);
+      if (inputError) return jsonResult(inputError);
+
+      // Archive path: decode + extract + validate (steps 1–7) run the same
+      // way for dry_run and real submits. prepareArchive cleans its temp dir
+      // on failure; the finally below cleans it on every other path.
+      let prep: PreparedArchive | null = null;
+      if (content_archive_base64 != null) {
+        try {
+          prep = await prepareArchive(content_archive_base64, main_file, content_format);
+        } catch (e) {
+          return archiveErrorResult(e);
+        }
       }
 
-      if (dry_run) {
-        // No ids in would_save: the real save mints fresh UUIDs/oarx ids —
-        // returning ones here would mislead the caller.
-        return jsonResult({
-          dry_run: true,
-          validation: 'ok',
-          estimated_cost: estimatedSubmitCost(content_format),
-          would_save: {
-            title,
-            abstract,
-            content_format,
-            content_size_bytes: Buffer.byteLength(content_text ?? '', 'utf-8'),
-            authors: authors.map((a) => ({
-              name: `${a.given_name} ${a.family_name}`,
-              givenName: a.given_name,
-              familyName: a.family_name,
-              orcid: a.orcid,
-            })),
-            categories: categories ?? [],
-            keywords: keywords ?? [],
-            language,
-            license,
-            version: 1,
-          },
-        });
-      }
+      try {
+        if (dry_run) {
+          // No ids in would_save: the real save mints fresh UUIDs/oarx ids —
+          // returning ones here would mislead the caller.
+          return jsonResult({
+            dry_run: true,
+            validation: 'ok',
+            estimated_cost: estimatedSubmitCost(content_format),
+            would_save: {
+              title,
+              abstract,
+              content_format,
+              content_size_bytes: prep ? prep.decodedBytes : Buffer.byteLength(content_text ?? '', 'utf-8'),
+              ...(prep ? { main_file: prep.mainFile, attachments: prep.attachments } : {}),
+              authors: authors.map((a) => ({
+                name: `${a.given_name} ${a.family_name}`,
+                givenName: a.given_name,
+                familyName: a.family_name,
+                orcid: a.orcid,
+              })),
+              categories: categories ?? [],
+              keywords: keywords ?? [],
+              language,
+              license,
+              version: 1,
+            },
+          });
+        }
 
-      // Extract userId from portal token for per-user storage
-      const portalToken = (extra as unknown as Record<string, unknown>)._portalToken as { userId?: string } | undefined;
-      const userId = portalToken?.userId ?? '_anonymous';
+        // Extract userId from portal token for per-user storage
+        const portalToken = (extra as unknown as Record<string, unknown>)._portalToken as { userId?: string } | undefined;
+        const userId = portalToken?.userId ?? '_anonymous';
 
-      // Build ingest-document payload
-      const portalDocId = crypto.randomUUID();
-      const payload: Record<string, unknown> = {
-        portal_document_id: portalDocId,
-        title,
-        abstract,
-        content_format,
-        content_source: { type: 'text', text: content_text ?? '' },
-        authors,
-        license,
-        language,
-        arxiv_categories: categories ?? [],
-        keywords: keywords ?? [],
-      };
+        const portalDocId = crypto.randomUUID();
 
-      // Save document via documentStore (same as ingest-document endpoint)
-      const { randomUUID } = await import('node:crypto');
-      const { mkdir, writeFile } = await import('node:fs/promises');
-      const { join } = await import('node:path');
+        // Save document via documentStore (same as ingest-document endpoint)
+        const { randomUUID } = await import('node:crypto');
+        const { mkdir, writeFile } = await import('node:fs/promises');
+        const { join } = await import('node:path');
 
-      const coreDocId = randomUUID();
-      const oarxId = computeOarxId('portal', portalDocId);
-      const docDir = portalDocPath(userId, coreDocId);
-      const sourceDir = join(docDir, 'source');
-      await mkdir(sourceDir, { recursive: true });
+        const coreDocId = randomUUID();
+        const oarxId = computeOarxId('portal', portalDocId);
+        const docDir = portalDocPath(userId, coreDocId);
+        const sourceDir = join(docDir, 'source');
+        await mkdir(sourceDir, { recursive: true });
 
-      const ext = content_format === 'pdf' ? '.pdf' : content_format === 'markdown' ? '.md' : '.tex';
-      const filename = `main${ext}`;
-      const rawContentPath = join(sourceDir, filename);
-      await writeFile(rawContentPath, content_text ?? '', 'utf-8');
+        const sourceFormat: 'pdf' | 'latex' | 'markdown' =
+          content_format === 'pdf' ? 'pdf'
+          : content_format === 'markdown' ? 'markdown'
+          : 'latex';
 
-      const sourceFormat: 'pdf' | 'latex' | 'markdown' =
-        content_format === 'pdf' ? 'pdf'
-        : content_format === 'markdown' ? 'markdown'
-        : 'latex';
-      const sources = sourceFormat === 'pdf'
-        ? { pdf: { path: rawContentPath } }
-        : content_format === 'markdown'
-          ? { markdown: { path: rawContentPath } }
-          : { latex: { path: join(rawContentPath, '..'), rootTex: filename } };
+        let rawContentPath: string;
+        let sources: Record<string, unknown>;
+        let portalMetadata: Record<string, unknown> | undefined;
+        if (prep) {
+          ({ rawContentPath, sources, portalMetadata } = await materializeArchive(prep, sourceDir, content_format));
+        } else {
+          const ext = content_format === 'pdf' ? '.pdf' : content_format === 'markdown' ? '.md' : '.tex';
+          const filename = `main${ext}`;
+          rawContentPath = join(sourceDir, filename);
+          await writeFile(rawContentPath, content_text ?? '', 'utf-8');
+          sources = sourceFormat === 'pdf'
+            ? { pdf: { path: rawContentPath } }
+            : content_format === 'markdown'
+              ? { markdown: { path: rawContentPath } }
+              : { latex: { path: join(rawContentPath, '..'), rootTex: filename } };
+        }
 
-      const doc = {
+        const doc = {
         id: coreDocId,
         version: 1,
         createdAt: new Date(),
@@ -300,6 +437,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         processingCost: 0,
         provenance: [] as Array<{ op: string; at: string; commit: string }>,
         retryCount: 0,
+        ...(portalMetadata ? { portalMetadata } : {}),
       };
 
       await ctx.documentStore.save(doc as Parameters<typeof ctx.documentStore.save>[0]);
@@ -315,6 +453,11 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         status: 'queued',
         message: 'Document submitted for indexing',
       });
+      } finally {
+        // Temp dir cleanup on EVERY path: dry_run, successful submit
+        // (contents already copied to storagebox) and any thrown error.
+        if (prep) await fsRm(prep.tmpDir, { recursive: true, force: true }).catch(() => { /* best effort */ });
+      }
     },
   );
 
@@ -388,7 +531,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
   server.tool(
     'create_new_version',
-    `Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit \`categories\`, \`keywords\`, or \`language\` to inherit each independently from the previous version; pass a value to override. ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
+    `Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit \`categories\`, \`keywords\`, or \`language\` to inherit each independently from the previous version; pass a value to override. ${ARCHIVE_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
     {
       previous_document_id: z.string().describe('Core document ID of the previous version'),
       title: titleField.describe('Updated title'),
@@ -407,16 +550,16 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         .describe('Override. Omit to inherit from previous version.'),
       language: z.string().optional()
         .describe('Override (ISO 639-1). Omit to inherit from previous version.'),
+      content_archive_base64: archiveField,
+      main_file: mainFileField,
       dry_run: dryRunField,
     },
-    async ({ previous_document_id, title, abstract, content_format, content_text, authors, license, categories, keywords, language, dry_run }, extra) => {
+    async ({ previous_document_id, title, abstract, content_format, content_text, content_archive_base64, main_file, authors, license, categories, keywords, language, dry_run }, extra) => {
       // Validation must be IDENTICAL for dry_run and real submits — same
-      // schema (SDK level), same refine here; the dry_run branch comes after
+      // schema (SDK level), same refines here; the dry_run branch comes after
       // prev-doc resolution so would_save reflects real inheritance.
-      const contentError = validateInlineContent(content_format, content_text);
-      if (contentError) {
-        return jsonResult({ error: 'validation_error', message: contentError, path: ['content_text'] });
-      }
+      const inputError = validateContentInputs(content_format, content_text, content_archive_base64);
+      if (inputError) return jsonResult(inputError);
 
       const prevDoc = await ctx.documentStore.getById(previous_document_id);
       if (!prevDoc) return jsonResult({ error: 'not_found', message: 'Previous document not found' });
@@ -429,6 +572,16 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       const newVersion = prevDoc.version + 1;
       const inherited = resolveVersionMetadata(prevDoc, { categories, keywords, language });
 
+      let prep: PreparedArchive | null = null;
+      if (content_archive_base64 != null) {
+        try {
+          prep = await prepareArchive(content_archive_base64, main_file, content_format);
+        } catch (e) {
+          return archiveErrorResult(e);
+        }
+      }
+
+      try {
       if (dry_run) {
         return jsonResult({
           dry_run: true,
@@ -438,7 +591,8 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
             title,
             abstract,
             content_format,
-            content_size_bytes: Buffer.byteLength(content_text ?? '', 'utf-8'),
+            content_size_bytes: prep ? prep.decodedBytes : Buffer.byteLength(content_text ?? '', 'utf-8'),
+            ...(prep ? { main_file: prep.mainFile, attachments: prep.attachments } : {}),
             authors: authors.map((a) => ({
               name: `${a.given_name} ${a.family_name}`,
               givenName: a.given_name,
@@ -454,7 +608,6 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         });
       }
 
-      // Reuse submit_document logic via internal endpoint
       const portalDocId = crypto.randomUUID();
       const { randomUUID } = await import('node:crypto');
       const { mkdir, writeFile } = await import('node:fs/promises');
@@ -466,20 +619,27 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       const sourceDir = join(docDir, 'source');
       await mkdir(sourceDir, { recursive: true });
 
-      const ext = content_format === 'pdf' ? '.pdf' : content_format === 'markdown' ? '.md' : '.tex';
-      const filename = `main${ext}`;
-      const rawContentPath = join(sourceDir, filename);
-      await writeFile(rawContentPath, content_text ?? '', 'utf-8');
-
       const sourceFormat: 'pdf' | 'latex' | 'markdown' =
         content_format === 'pdf' ? 'pdf'
         : content_format === 'markdown' ? 'markdown'
         : 'latex';
-      const sources = sourceFormat === 'pdf'
-        ? { pdf: { path: rawContentPath } }
-        : content_format === 'markdown'
-          ? { markdown: { path: rawContentPath } }
-          : { latex: { path: join(rawContentPath, '..'), rootTex: filename } };
+
+      let rawContentPath: string;
+      let sources: Record<string, unknown>;
+      let portalMetadata: Record<string, unknown> | undefined;
+      if (prep) {
+        ({ rawContentPath, sources, portalMetadata } = await materializeArchive(prep, sourceDir, content_format));
+      } else {
+        const ext = content_format === 'pdf' ? '.pdf' : content_format === 'markdown' ? '.md' : '.tex';
+        const filename = `main${ext}`;
+        rawContentPath = join(sourceDir, filename);
+        await writeFile(rawContentPath, content_text ?? '', 'utf-8');
+        sources = sourceFormat === 'pdf'
+          ? { pdf: { path: rawContentPath } }
+          : content_format === 'markdown'
+            ? { markdown: { path: rawContentPath } }
+            : { latex: { path: join(rawContentPath, '..'), rootTex: filename } };
+      }
 
       const doc = {
         id: coreDocId,
@@ -517,6 +677,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         processingCost: 0,
         provenance: [] as Array<{ op: string; at: string; commit: string }>,
         retryCount: 0,
+        ...(portalMetadata ? { portalMetadata } : {}),
       };
 
       await ctx.documentStore.save(doc as Parameters<typeof ctx.documentStore.save>[0]);
@@ -534,6 +695,11 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         status: 'queued',
         message: `Version ${newVersion} submitted for indexing`,
       });
+      } finally {
+        // Temp dir cleanup on EVERY path: dry_run, successful submit
+        // (contents already copied to storagebox) and any thrown error.
+        if (prep) await fsRm(prep.tmpDir, { recursive: true, force: true }).catch(() => { /* best effort */ });
+      }
     },
   );
 

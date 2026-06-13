@@ -17,6 +17,7 @@ import { resolveAgentId, getAgentReputation, getAgentTier } from './gov-identity
 import { UsageTracker, withUsageTracker } from './lib/usage-tracker.js';
 import { incrementCallCounters } from './lib/cost-counters.js';
 import { startRollupTimer } from './lib/cost-rollup.js';
+import { initLegalVersions } from './lib/legal-versions.js';
 
 /**
  * Bind addresses, comma-separated (openarx-76fo). The service must NOT
@@ -474,7 +475,10 @@ async function main(): Promise<void> {
     next();
   };
 
-  app.post('/:profile/mcp', checkContentType, express.json(), handleJsonParseError, validateJsonRpcEnvelope, async (req: Request, res: Response) => {
+  // Body limit 80mb: content_archive_base64 is capped at 67M chars by zod
+  // (openarx-contracts-nie7) + JSON envelope overhead. Express's default
+  // 100kb made the archive field unusable beyond trivial files (413).
+  app.post('/:profile/mcp', checkContentType, express.json({ limit: '80mb' }), handleJsonParseError, validateJsonRpcEnvelope, async (req: Request, res: Response) => {
     requestCount++;
 
     // SDK's StreamableHTTPServerTransport requires Accept to include BOTH
@@ -730,6 +734,10 @@ async function main(): Promise<void> {
   // Console talks to the runner daemon directly via the unix socket
   // (/run/openarx/runner.sock). The old /api/pipeline/* gateway let any
   // valid Bearer (incl. consumer tokens) start/stop ingest runs.
+  // Load required legal-consent versions for publish-document (uhlh §11);
+  // installs SIGHUP hot-reload so a version bump needs no Core redeploy.
+  initLegalVersions();
+
   registerInternalRoutes(app, ctx);
   registerAdminRoutes(app, ctx);
 

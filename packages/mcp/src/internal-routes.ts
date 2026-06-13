@@ -23,6 +23,7 @@ const execFileAsync = promisify(execFile);
 import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type { AppContext } from './context.js';
+import { handlePublishDocument } from './publish-document.js';
 import type { SearchResult, Document, Author, CodeLink, DatasetLink, BenchmarkResult } from '@openarx/types';
 import { computeOarxId } from '@openarx/api';
 import type { BM25Result, ReportTier } from '@openarx/api';
@@ -144,7 +145,10 @@ function truncate(text: string): string {
 
 export function registerInternalRoutes(app: Express, ctx: AppContext): void {
   const router = express.Router();
-  router.use(express.json());
+  // 80mb: Scenario A inline content can reach 2 MB and Portal payloads may
+  // carry sizable metadata; the default 100kb silently capped them. The
+  // route is X-Internal-Secret-gated, not public.
+  router.use(express.json({ limit: '80mb' }));
   router.use(requireInternalSecret);
 
   // ── POST /search ────────────────────────────────────────
@@ -897,6 +901,11 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
   // manual: bumps version to N+1, creates pending row. Phase 1 only
   // supports aspect 1 (already computed at publish), so manual triggers
   // get an empty pending row — full pipeline re-run is Phase 2+.
+  // ── POST /publish-document — unified publication endpoint (uhlh) ──
+  router.post('/publish-document', (req: Request, res: Response) => {
+    void handlePublishDocument(req, res, ctx);
+  });
+
   router.post('/content-review', async (req: Request, res: Response) => {
     try {
       const body = req.body as Record<string, unknown>;
