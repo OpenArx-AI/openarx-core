@@ -200,6 +200,64 @@ export function extractArchive(
   });
 }
 
+/**
+ * List entries (name + declared uncompressed size) WITHOUT writing anything to
+ * disk. Used by the MCP tool layer (openarx-contracts-w7um) to resolve the
+ * main_file, check the format and build the dry-run preview cheaply — the raw
+ * archive is materialized once, later, by the publish endpoint. Per-entry path
+ * and symlink safety are still enforced; the zip-bomb running-total cap is not
+ * (nothing is inflated here — the real extract in materializeArchive enforces
+ * it). Sizes come from the central-directory header, which is fine for display
+ * and selection but is NOT trusted for the inflation cap.
+ */
+export function listArchiveEntries(buf: Buffer): Promise<ExtractedFile[]> {
+  return new Promise((resolve, reject) => {
+    yauzl.fromBuffer(buf, { lazyEntries: true }, (err, zipfile) => {
+      if (err || !zipfile) {
+        reject(new ArchiveIntakeError('archive_extract_failed', `Cannot read ZIP: ${err?.message ?? 'unknown error'}`));
+        return;
+      }
+      const files: ExtractedFile[] = [];
+      let settled = false;
+      const fail = (e: ArchiveIntakeError): void => {
+        if (settled) return;
+        settled = true;
+        zipfile.close();
+        reject(e);
+      };
+      zipfile.on('error', (e: Error) => {
+        if (/invalid relative path|absolute path/i.test(e.message)) {
+          fail(new ArchiveIntakeError('archive_path_traversal', `Archive entry has an unsafe path: ${e.message}`));
+          return;
+        }
+        fail(new ArchiveIntakeError('archive_extract_failed', `ZIP read error: ${e.message}`));
+      });
+      zipfile.on('entry', (entry: yauzl.Entry) => {
+        const name = entry.fileName;
+        if (isUnsafeEntryPath(name)) {
+          fail(new ArchiveIntakeError('archive_path_traversal', `Archive entry has an unsafe path: ${name}`, { entry: name }));
+          return;
+        }
+        if (isSymlinkEntry(entry)) {
+          fail(new ArchiveIntakeError('archive_symlink_entry', `Archive contains a symlink entry: ${name}`, { entry: name }));
+          return;
+        }
+        if (!name.endsWith('/')) {
+          files.push({ filename: posix.normalize(name.split('\\').join('/')), size: entry.uncompressedSize });
+        }
+        zipfile.readEntry();
+      });
+      zipfile.on('end', () => {
+        if (!settled) {
+          settled = true;
+          resolve(files);
+        }
+      });
+      zipfile.readEntry();
+    });
+  });
+}
+
 const MAIN_FILE_RE = /\.(pdf|tex|md|markdown)$/i;
 
 /**

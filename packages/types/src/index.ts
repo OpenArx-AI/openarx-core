@@ -302,7 +302,11 @@ export interface DocumentAuditEntry {
 export interface DocumentSources {
   pdf?: { path: string; size?: number };
   latex?: { path: string; rootTex?: string; manifest?: boolean; texFiles?: number };
-  markdown?: { path: string };
+  /** path is either a lazy `source/` dir (new model: extract the `eprint`
+   *  sibling there, then read rootMd) or a direct single `.md` file
+   *  (grandfathered docs with no `eprint`). rootMd names the primary `.md`
+   *  inside the archive. */
+  markdown?: { path: string; rootMd?: string };
 }
 
 // ── Chunk model ──

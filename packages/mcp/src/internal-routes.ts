@@ -5,14 +5,16 @@
  * Billing: Portal handles credit deduction before calling these endpoints.
  *
  * POST /api/internal/search              — hybrid search with document metadata
- * POST /api/internal/ingest-document     — queue Portal document for pipeline processing
+ * POST /api/internal/publish-document    — unified publication endpoint (uhlh)
  * GET  /api/internal/documents/:id       — document details
  * GET  /api/internal/documents/:id/pdf   — stream PDF file
+ *
+ * Legacy POST /api/internal/ingest-document removed 2026-06-13 (l37i,
+ * contract §10) — superseded by /publish-document; Portal rewired in o4z2.
  */
 
-import { randomUUID } from 'node:crypto';
-import { createReadStream, statSync } from 'node:fs';
-import { access, constants, mkdir, writeFile, stat, readdir, mkdtemp, rm, realpath } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { access, constants, stat, mkdtemp, rm, realpath } from 'node:fs/promises';
 import { join, dirname, normalize, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -24,11 +26,10 @@ import express from 'express';
 import type { Express, Request, Response, NextFunction } from 'express';
 import type { AppContext } from './context.js';
 import { handlePublishDocument } from './publish-document.js';
-import type { SearchResult, Document, Author, CodeLink, DatasetLink, BenchmarkResult } from '@openarx/types';
-import { computeOarxId } from '@openarx/api';
+import { handleUserDocuments } from './user-documents.js';
+import type { SearchResult, Document } from '@openarx/types';
 import type { BM25Result, ReportTier } from '@openarx/api';
 import {
-  createInitialReview,
   triggerReview,
   getLatestReview,
   getReviewByVersion,
@@ -36,7 +37,7 @@ import {
   patchLatestReviewTier,
   query,
 } from '@openarx/api';
-import { isOpenLicense, runSpamScreen, type SpamScreenResult } from '@openarx/ingest';
+import { isOpenLicense } from '@openarx/ingest';
 import type { SpdxLicense } from '@openarx/ingest';
 
 const INTERNAL_SECRET = process.env.CORE_INTERNAL_SECRET ?? '';
@@ -601,298 +602,6 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     }
   });
 
-  // ── POST /ingest-document ──────────────────────────────
-
-  const PORTAL_STORAGE_BASE = process.env.PORTAL_STORAGE_BASE ?? '/mnt/storagebox/openarx/portal-docs';
-
-  router.post('/ingest-document', async (req: Request, res: Response) => {
-    try {
-      const body = req.body as Record<string, unknown>;
-
-      // ── Validate required fields ──
-      const portalDocId = body.portal_document_id as string | undefined;
-      const title = body.title as string | undefined;
-      const abstract = body.abstract as string | undefined;
-      const contentFormat = body.content_format as string | undefined;
-      const contentSource = body.content_source as Record<string, unknown> | undefined;
-      const license = body.license as string | undefined;
-      const authorsRaw = body.authors as Array<Record<string, unknown>> | undefined;
-
-      if (!portalDocId || !title || !abstract || !contentFormat || !contentSource || !license || !authorsRaw?.length) {
-        res.status(400).json({
-          error: 'validation_error',
-          message: 'Required fields: portal_document_id, title, authors, abstract, content_format, content_source, license',
-        });
-        return;
-      }
-
-      if (!['latex', 'markdown', 'pdf'].includes(contentFormat)) {
-        res.status(400).json({ error: 'validation_error', message: 'content_format must be latex, markdown, or pdf' });
-        return;
-      }
-
-      // ── Check idempotency — if already exists, return existing ID ──
-      const existing = await ctx.documentStore.getBySourceId('portal', portalDocId);
-      if (existing) {
-        if (['parsing', 'chunking', 'enriching', 'embedding'].includes(existing.status)) {
-          res.status(409).json({
-            error: 'already_processing',
-            core_document_id: existing.id,
-            status: existing.status,
-            message: 'Document is currently being processed',
-          });
-          return;
-        }
-        // If document is in downloaded/failed — re-enqueue for processing
-        if ((existing.status === 'downloaded' || existing.status === 'failed') && ctx.portalDocQueue.isReady) {
-          ctx.portalDocQueue.enqueue(existing);
-          res.status(202).json({
-            ok: true,
-            core_document_id: existing.id,
-            status: 'queued',
-            message: 'Document re-queued for processing',
-          });
-          return;
-        }
-        // Already done — return existing
-        res.status(200).json({
-          ok: true,
-          core_document_id: existing.id,
-          status: existing.status,
-          message: existing.status === 'ready' ? 'Document already indexed' : 'Document exists',
-        });
-        return;
-      }
-
-      // ── Validate previous_version_id if provided ──
-      const previousVersionId = body.previous_version_id as string | undefined;
-      if (previousVersionId) {
-        const prevDoc = await ctx.documentStore.getById(previousVersionId);
-        if (!prevDoc) {
-          res.status(404).json({ error: 'not_found', message: `previous_version_id ${previousVersionId} not found` });
-          return;
-        }
-      }
-
-      // ── Aspect 1: spam / emptiness screen (openarx-contracts-4pd Phase 1) ──
-      // Runs BEFORE disk writes + documentStore.save so that a reject
-      // leaves no trace (no storage allocation, no PG row). For the
-      // storage_path ingestion mode we only have the abstract + metadata
-      // to screen; aspect 1 LLM classifier still runs on title+abstract
-      // and the body check is skipped. Spec: contracts/content_review.md §3.
-      const sourceTextForGate = body.content_source as Record<string, unknown> | undefined;
-      const spamScreenBody: string = typeof sourceTextForGate?.text === 'string'
-        ? (sourceTextForGate.text as string).slice(0, 8000)
-        : `${title}\n\n${abstract}`;
-      const spamResult: SpamScreenResult = await runSpamScreen(
-        { title, abstract, body: spamScreenBody },
-        { modelRouter: ctx.modelRouter },
-      );
-      const spamTier: ReportTier = (body.report_tier as ReportTier) === 'basic' ? 'basic' : 'full';
-      if (spamResult.verdict === 'reject') {
-        res.status(422).json({
-          error: 'spam_reject',
-          message: 'Submission rejected by content quality screen',
-          spam_reasons: spamResult.reasons,
-          llm_attempted: spamResult.llmAttempted,
-        });
-        return;
-      }
-
-      // ── Resolve content source ──
-      const sourceText = contentSource.text as string | undefined;
-      const storagePath = contentSource.storage_path as string | undefined;
-      const mainFile = contentSource.main_file as string | undefined;
-
-      if (!sourceText && !storagePath) {
-        res.status(400).json({ error: 'validation_error', message: 'content_source must have text or storage_path' });
-        return;
-      }
-
-      // Determine raw_content_path and source_format
-      const coreDocId = randomUUID();
-      const userId = body.user_id as string | undefined;
-      const docDir = userId
-        ? join(PORTAL_STORAGE_BASE, userId, 'indexed', coreDocId)
-        : join(PORTAL_STORAGE_BASE, '_core', coreDocId); // legacy fallback
-      let rawContentPath = '';
-      let sourceFormat: 'pdf' | 'latex' | 'markdown' =
-        contentFormat === 'pdf' ? 'pdf'
-        : contentFormat === 'markdown' ? 'markdown'
-        : 'latex';
-
-      if (sourceText) {
-        // Scenario A or C: text provided — write to disk
-        const sourceDir = join(docDir, 'source');
-        await mkdir(sourceDir, { recursive: true });
-        const ext = contentFormat === 'pdf' ? '.pdf' : contentFormat === 'markdown' ? '.md' : '.tex';
-        const filename = `main${ext}`;
-        rawContentPath = join(sourceDir, filename);
-        await writeFile(rawContentPath, sourceText, 'utf-8');
-      } else if (storagePath && mainFile) {
-        // Scenario B: files on StorageBox
-        const attachmentsDir = join(storagePath, 'attachments');
-        rawContentPath = join(attachmentsDir, mainFile);
-        try {
-          await access(rawContentPath, constants.R_OK);
-        } catch {
-          res.status(400).json({ error: 'file_not_found', message: `Cannot read ${rawContentPath}` });
-          return;
-        }
-      } else {
-        res.status(400).json({ error: 'validation_error', message: 'storage_path requires main_file when text is not provided' });
-        return;
-      }
-
-      // ── Build authors array ──
-      const authors: Author[] = authorsRaw.map((a) => ({
-        name: [a.given_name, a.family_name].filter(Boolean).join(' ') || (a.name as string) || 'Unknown',
-        givenName: (a.given_name as string) ?? undefined,
-        familyName: (a.family_name as string) ?? undefined,
-        orcid: (a.orcid as string) ?? undefined,
-        email: (a.email as string) ?? undefined,
-        isCorresponding: (a.is_corresponding as boolean) ?? undefined,
-        creditRoles: (a.credit_roles as string[]) ?? undefined,
-      }));
-
-      // ── Build code_links, dataset_links, benchmark_results from author-provided data ──
-      const codeLinksRaw = (body.code_links as Array<{ url: string; description?: string }>) ?? [];
-      const codeLinks: CodeLink[] = codeLinksRaw.map((l) => ({
-        repoUrl: l.url,
-        extractedFrom: 'author' as const,
-      }));
-
-      const datasetLinksRaw = (body.dataset_links as Array<{ name: string; url?: string }>) ?? [];
-      const datasetLinks: DatasetLink[] = datasetLinksRaw.map((l) => ({
-        name: l.name,
-        url: l.url,
-        extractedFrom: 'author' as const,
-      }));
-
-      const benchmarkLinksRaw = (body.benchmark_links as Array<{ task: string; dataset?: string; metric?: string; score?: string }>) ?? [];
-      const benchmarkResults: BenchmarkResult[] = benchmarkLinksRaw.map((b) => ({
-        task: b.task,
-        dataset: b.dataset ?? '',
-        metric: b.metric ?? '',
-        score: Number(b.score) || 0,
-        extractedFrom: 'author' as const,
-      }));
-
-      // ── Build external_ids ──
-      const externalIds: Record<string, string> = { portal: portalDocId };
-      if (body.doi) externalIds.doi = body.doi as string;
-      if (body.arxiv_id) externalIds.arxiv = body.arxiv_id as string;
-
-      // ── Build portal_metadata (rarely-queried fields) ──
-      const portalMetadata: Record<string, unknown> = {};
-      if (body.funding) portalMetadata.funding = body.funding;
-      if (body.coi_statement) portalMetadata.coi_statement = body.coi_statement;
-      if (body.data_availability) portalMetadata.data_availability = body.data_availability;
-      if (body.data_availability_url) portalMetadata.data_availability_url = body.data_availability_url;
-      if (body.related_identifiers) portalMetadata.related_identifiers = body.related_identifiers;
-
-      // ── Create document record ──
-      const version = (body.version as number) ?? 1;
-      const conceptId = (body.concept_id as string) ?? coreDocId;
-      const oarxId = computeOarxId('portal', portalDocId);
-
-      const doc: Document = {
-        id: coreDocId,
-        version,
-        createdAt: new Date(),
-        previousVersion: previousVersionId,
-        oarxId,
-        conceptId,
-        source: 'portal',
-        sourceId: portalDocId,
-        sourceUrl: (body.source_url as string) ?? '',
-        title,
-        authors,
-        abstract,
-        categories: (body.arxiv_categories as string[]) ?? [],
-        publishedAt: new Date(),
-        rawContentPath,
-        structuredContent: null,
-        sources: sourceFormat === 'pdf'
-          ? { pdf: { path: rawContentPath } }
-          : contentFormat === 'markdown'
-            ? { markdown: { path: rawContentPath } }
-            : { latex: { path: join(rawContentPath, '..'), rootTex: rawContentPath.split('/').pop() } },
-        externalIds,
-        license: license,
-        keywords: (body.keywords as string[]) ?? undefined,
-        language: (body.language as string) ?? 'en',
-        resourceType: (body.resource_type as string) ?? 'preprint',
-        embargoUntil: body.embargo_until ? new Date(body.embargo_until as string) : undefined,
-        portalMetadata: Object.keys(portalMetadata).length > 0 ? portalMetadata : undefined,
-        sourceFormat,
-        codeLinks,
-        datasetLinks,
-        benchmarkResults,
-        // Portal docs are our own content — author grants indexing at
-        // publication; we commit to full indexing regardless of license
-        // (product promise, not legal gate). License drives tier only
-        // for external-source docs (arxiv etc). See openarx-luco.
-        indexingTier: 'full',
-        status: 'downloaded',
-        processingLog: [{ step: 'ingest-document', status: 'completed', timestamp: new Date().toISOString() }],
-        processingCost: 0,
-        provenance: [],
-        retryCount: 0,
-      };
-
-      await ctx.documentStore.save(doc);
-
-      // ── Write initial document_reviews row with aspect 1 (spam-screen)
-      //    already populated. Status='pending' lets the pipeline's
-      //    review_novelty step (workers.ts) pick it up after index; that
-      //    worker flips pending → running → complete once aspect 3
-      //    (novelty + grounding) finishes. ──
-      try {
-        await createInitialReview({
-          documentId: coreDocId,
-          triggeredBy: 'auto_on_publish',
-          spamVerdict: spamResult.verdict,
-          spamReasons: spamResult.reasons,
-          llmCost: spamResult.llmCost,
-          reportTier: spamTier,
-          status: 'pending',
-        });
-      } catch (err) {
-        // Review insert failure is non-fatal for publish. Publish still
-        // proceeds to queue; aspect 1 result is lost but not catastrophic.
-        console.error('[ingest-document] review insert failed:', err instanceof Error ? err.message : err);
-      }
-
-      // Enqueue for pipeline processing
-      if (ctx.portalDocQueue.isReady) {
-        const enqueued = ctx.portalDocQueue.enqueue(doc);
-        if (!enqueued) {
-          console.error(`[ingest-document] Queue full — ${coreDocId} saved but not enqueued`);
-          res.status(503).json({
-            error: 'queue_full',
-            core_document_id: coreDocId,
-            message: 'Processing queue is full. Document saved — will be processed when capacity is available.',
-          });
-          return;
-        }
-      }
-
-      console.log(`[ingest-document] Created document ${coreDocId} for portal_document_id=${portalDocId}, version=${version}, format=${contentFormat}`);
-
-      res.status(202).json({
-        ok: true,
-        core_document_id: coreDocId,
-        status: 'queued',
-        queue_position: ctx.portalDocQueue.queuePosition(coreDocId),
-        message: 'Document queued for processing',
-      });
-    } catch (err) {
-      console.error('[ingest-document] Error:', err instanceof Error ? err.message : err);
-      console.error('[ingest-document] Error:', err instanceof Error ? err.message : err);
-      res.status(500).json({ error: 'server_error' });
-    }
-  });
 
   // ── Content Review endpoints (openarx-contracts-4pd) ─────────
 
@@ -904,6 +613,11 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
   // ── POST /publish-document — unified publication endpoint (uhlh) ──
   router.post('/publish-document', (req: Request, res: Response) => {
     void handlePublishDocument(req, res, ctx);
+  });
+
+  // ── GET /user-documents — paginated user doc list for Portal (amc7) ──
+  router.get('/user-documents', (req: Request, res: Response) => {
+    void handleUserDocuments(req, res, ctx);
   });
 
   router.post('/content-review', async (req: Request, res: Response) => {

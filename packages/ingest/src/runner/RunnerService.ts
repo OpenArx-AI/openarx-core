@@ -25,6 +25,7 @@ import { ArxivSource } from '../sources/arxiv-source.js';
 import type { ArxivEntry } from '../sources/arxiv-source.js';
 import { createChildLogger } from '../lib/logger.js';
 import { buildListedRows, buildListedInsertSql, flattenListedRows } from '../lib/listed-registry.js';
+import { resolveDateBounds } from './date-bounds.js';
 import { Channel } from '../pipeline/channel.js';
 import { initProxyPool } from '../lib/proxy-pool.js';
 import { Semaphore } from '../lib/semaphore.js';
@@ -683,6 +684,15 @@ export class RunnerService {
     let dateFrom: Date | null = null;
     let dateTo: Date | null = null;
 
+    // Single-date-anchor semantics: a lone date is an anchor and `direction`
+    // decides which bound it fills (backward → upper, forward → lower); two
+    // dates stay an explicit range. All date-scoped selection below uses these
+    // resolved bounds, not the raw overrides.
+    const { lower: boundFrom, upper: boundTo } = resolveDateBounds(dateFromOverride, dateToOverride, direction);
+    if (dateFromOverride || dateToOverride) {
+      log.info({ dateFromOverride, dateToOverride, direction, boundFrom, boundTo }, 'Resolved date bounds');
+    }
+
     try {
       // Phase A (explicit --downloaded-first flag): drain the downloaded
       // backlog regardless of dates, within the limit. Replaces both the
@@ -730,7 +740,7 @@ export class RunnerService {
               AND ($2::date IS NULL OR published_at <= $2::date + interval '1 day')
             ORDER BY published_at DESC
             LIMIT $3`,
-          [dateFromOverride ?? null, dateToOverride ?? null, remaining],
+          [boundFrom ?? null, boundTo ?? null, remaining],
         );
 
         if (abstractOnly.rows.length > 0) {
@@ -775,7 +785,7 @@ export class RunnerService {
         const counters = { remaining, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
         const result = await this.processRegistryParallel(
           runId,
-          { dateFrom: dateFromOverride, dateTo: dateToOverride, direction, categories: this.currentCategories },
+          { dateFrom: boundFrom, dateTo: boundTo, direction, categories: this.currentCategories },
           counters,
         );
         remaining = counters.remaining;
@@ -1157,10 +1167,13 @@ export class RunnerService {
 
     try {
       const today = new Date().toISOString().slice(0, 10);
+      // Single-date-anchor semantics (same as ingest): a lone date is an anchor
+      // and direction picks the bound it fills; two dates = explicit range.
+      const { lower: bFrom, upper: bTo } = resolveDateBounds(opts.dateFrom, opts.dateTo, opts.direction);
       // Old-format arXiv ids (pre 2007-04) are not parseable by the entry
       // parser — clamp the open lower bound there.
-      const lower = opts.dateFrom ?? '2007-04-01';
-      const upper = (opts.dateTo && opts.dateTo < today) ? opts.dateTo : today;
+      const lower = bFrom ?? '2007-04-01';
+      const upper = (bTo && bTo < today) ? bTo : today;
       const days = enumerateDays(lower, upper);
       if (opts.direction === 'backward') days.reverse();
 

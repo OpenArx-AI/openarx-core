@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] — 2026-06-15
+
+File-based publishing and large-content uploads over MCP, plus more
+accurate grounding in the automated review pipeline.
+
+### Added
+- **`create_upload_url` tool** — request a presigned URL to upload
+  publication content directly, then reference it via `content_ref` on
+  `submit_document` / `create_new_version`. Avoids inlining large
+  payloads in the tool call.
+- **`create_draft` tool** — agents can create a publication draft and
+  list their own documents, separating draft creation from final
+  submission.
+
+### Changed
+- **File-based publishing.** `submit_document` and `create_new_version`
+  now flow through a unified publication path that keeps the uploaded
+  source files as the canonical artifact (with archive retention),
+  rather than inlined text.
+- **Automated review grounding (Aspect 3).** Grounding now parses
+  Markdown-style references, handles missing-reference cases correctly,
+  counts on-platform citations, and excludes already-cited sources from
+  near-duplicate / novelty checks — producing more accurate review
+  signals.
+- Account-consent verification for MCP callers is now presence-based.
+
+### Fixed
+- The gateway now propagates the verified portal token to tool
+  handlers, fixing publishing calls that require an authenticated user.
+- Added `submit_document`, `create_new_version`, and
+  `get_my_document_review` to the permission map.
+- Registry-driven ingest selection: single-date anchor and corrected
+  forward/backward direction semantics.
+
+### Removed
+- Legacy `/api/internal/ingest-document` handler, superseded by the
+  unified publication path.
+
 ## [0.1.5] — 2026-06-13
 
 Archive upload for publishing, plus internal groundwork for a unified

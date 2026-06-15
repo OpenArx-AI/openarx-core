@@ -550,6 +550,10 @@ export async function reviewNoveltyWorker(item: WorkItem, steps: PipelineSteps):
         conceptId: doc.conceptId ?? doc.id,
         chunks: chunks.map((c) => ({ vectors: c.vectors })),
         references: parsedDocument?.references ?? [],
+        // Body text for DOI/arXiv extraction + references-section heuristic.
+        // Chunk content is the reliable source for markdown docs, whose
+        // references never reach parsedDocument.references (0skd).
+        bodyText: chunks.map((c) => c.content).join('\n'),
       },
       {
         vectorStore: steps.vectorStore,

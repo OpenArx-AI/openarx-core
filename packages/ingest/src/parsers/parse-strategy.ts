@@ -17,7 +17,6 @@ import { parseLatexSource } from './latex-parser.js';
 import { ParserStep } from '../pipeline/parser-step.js';
 import { parseWithMathpix } from './mathpix-parser.js';
 import { parseMarkdownFile } from './markdown-parser.js';
-import { createChildLogger } from '../lib/logger.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -35,8 +34,6 @@ async function dirIsNonEmpty(path: string): Promise<boolean> {
     return false;
   }
 }
-
-const log = createChildLogger('parse-strategy');
 
 // Guards
 const GUARD_MAX_PDF_BYTES = parseInt(process.env.GUARD_MAX_PDF_MB ?? '200', 10) * 1024 * 1024;
@@ -186,22 +183,96 @@ export class MarkdownStrategy implements ParseStrategy {
   name = 'markdown';
 
   async parse(document: Document, context: PipelineContext): Promise<ParsedDocument> {
-    const mdPath = document.sources?.markdown?.path;
-    if (!mdPath) {
+    const md = document.sources?.markdown;
+    if (!md?.path) {
       throw new Error('No markdown source path');
     }
 
-    const parsed = await parseMarkdownFile(mdPath);
+    // Mirror-arxiv lazy-extract (openarx-contracts-w7um §17.4), parallel to
+    // LatexStrategy above. New portal markdown docs store the archive at
+    // {dir}/eprint and md.path is a LAZY pointer to {dir}/source/; we extract
+    // eprint→source/, parse the main .md (md.rootMd, else the single root .md),
+    // then delete source/. GRANDFATHERED docs (§17.7) have NO eprint sibling —
+    // md.path is a direct single .md file (e.g. Vlad's survey versions) and is
+    // read as-is. The eprint sibling presence is the discriminator.
+    const eprintPath = join(dirname(md.path), 'eprint');
+    const hasEprint = await fileExists(eprintPath);
 
-    // Guard: text size check (mirror LaTeX limit; markdown is similarly LLM-bounded)
+    if (!hasEprint) {
+      // Grandfathered single-.md: md.path IS the markdown file.
+      const parsed = await parseMarkdownFile(md.path);
+      this.guardSize(parsed);
+      context.logger.info(`Markdown parse complete (grandfathered single-file): ${parsed.sections.length} sections`);
+      return parsed;
+    }
+
+    const sourceDir = md.path;
+    const alreadyPresent = await dirIsNonEmpty(sourceDir);
+    if (!alreadyPresent) {
+      try {
+        await mkdir(sourceDir, { recursive: true });
+        await execFileAsync('tar', ['xzf', eprintPath, '-C', sourceDir]);
+        context.logger.info(`Lazy-extracted ${eprintPath} → ${sourceDir}`);
+      } catch (err) {
+        await rm(sourceDir, { recursive: true, force: true }).catch(() => undefined);
+        throw new Error(
+          `Failed to extract eprint for Markdown parse: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    try {
+      const mainMd = md.rootMd ? join(sourceDir, md.rootMd) : await findRootMarkdown(sourceDir);
+      const parsed = await parseMarkdownFile(mainMd);
+      this.guardSize(parsed);
+      context.logger.info(`Markdown parse complete: ${parsed.sections.length} sections, ${parsed.references.length} refs, ${parsed.formulas.length} formulas`);
+      return parsed;
+    } finally {
+      // Cleanup source/ unconditionally — keep eprint as the canonical archive
+      // (same guard as LatexStrategy: only delete if eprint is still readable).
+      try {
+        await access(eprintPath);
+        await rm(sourceDir, { recursive: true, force: true });
+        context.logger.debug(`Cleaned up ${sourceDir} (eprint retained)`);
+      } catch {
+        context.logger.warn(`Skipping cleanup of ${sourceDir} — eprint missing or inaccessible`);
+      }
+    }
+  }
+
+  /** Text size check (mirror LaTeX limit; markdown is similarly LLM-bounded). */
+  private guardSize(parsed: ParsedDocument): void {
     const totalChars = countTextChars(parsed.sections);
     if (totalChars > GUARD_MAX_TEXT_CHARS) {
       throw new Error(`text_exceeded: Markdown text ${totalChars} chars (limit ${GUARD_MAX_TEXT_CHARS})`);
     }
-
-    context.logger.info(`Markdown parse complete: ${parsed.sections.length} sections, ${parsed.references.length} refs, ${parsed.formulas.length} formulas`);
-    return parsed;
   }
+}
+
+/** True iff the path exists (file or dir). */
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Locate the single root-level .md/.markdown in an extracted markdown archive
+ *  when sources.markdown.rootMd was not recorded (defensive fallback; the
+ *  publish path always sets rootMd). */
+async function findRootMarkdown(sourceDir: string): Promise<string> {
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+  const candidates = entries
+    .filter((e) => e.isFile() && /\.(md|markdown)$/i.test(e.name))
+    .map((e) => e.name);
+  if (candidates.length === 1) return join(sourceDir, candidates[0]);
+  throw new Error(
+    candidates.length === 0
+      ? `No .md file found in extracted markdown archive at ${sourceDir}`
+      : `Multiple .md files in extracted markdown archive and rootMd not set: ${candidates.join(', ')}`,
+  );
 }
 
 // ─── Strategy selector ─────────────────────────────────────

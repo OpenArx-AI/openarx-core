@@ -96,7 +96,7 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
     }
 
     return info;
-  } catch (err) {
+  } catch {
     // Portal unreachable — fail open or closed?
     // Fail closed: deny access if portal is down
     return { valid: false, reason: 'portal_unreachable' };
@@ -333,7 +333,18 @@ export function hasPermission(info: TokenInfo, toolName: string): PermissionResu
   }
 
   // Always-free tools (meta / stats / user-scoped reads)
-  const alwaysAllowed = new Set(['get_system_stats', 'get_document_status', 'get_my_documents']);
+  const alwaysAllowed = new Set([
+    'get_system_stats', 'get_document_status', 'get_my_documents',
+    // pub-profile writes/reads — gated by the profile route
+    // (min_token_type=publisher); the per-tool permission check
+    // intentionally passes through here (openarx-contracts-rta3).
+    'submit_document', 'create_new_version', 'get_my_document_review',
+    // presigned-upload URL request — free; the publish call is the billed
+    // event (openarx-contracts-xuqi).
+    'create_upload_url',
+    // create_draft — free; routes to Portal, billable event is publishing (amc7).
+    'create_draft',
+  ]);
   if (alwaysAllowed.has(toolName)) return { allow: true };
 
   // Gov-profile tools: permission at token level is OK; tier check is deferred.

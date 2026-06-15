@@ -46,24 +46,29 @@ function code(e: unknown): string {
   return e.code;
 }
 
-// ── refines (acceptance 1, 2) ────────────────────────────────────────────
+// ── file-only content inputs (openarx-contracts-w7um §17.2) ──────────────
+// Inline content_text is dropped: validateContentInputs now takes exactly one
+// of (content_archive_base64, content_ref).
 
-test('content_text + archive together → mutually exclusive error', () => {
-  const r = validateContentInputs('markdown', '# x', 'UEsDBA==');
+const REF = '11111111-1111-1111-1111-111111111111';
+
+test('archive alone passes input validation', () => {
+  assert.equal(validateContentInputs('UEsDBA==', undefined), null);
+});
+
+test('content_ref alone passes input validation', () => {
+  assert.equal(validateContentInputs(undefined, REF), null);
+});
+
+test('neither archive nor content_ref → file-upload-required error', () => {
+  const r = validateContentInputs(undefined, undefined);
+  assert.ok(r && r.message.includes('file upload is required'));
+  assert.ok(r && r.message.includes('content_archive_base64') && r.message.includes('content_ref'));
+});
+
+test('content_archive_base64 + content_ref → mutually exclusive error', () => {
+  const r = validateContentInputs('UEsDBA==', REF);
   assert.ok(r && r.message.includes('mutually exclusive'));
-});
-
-test('neither content_text nor archive → at-least-one error (incl. pdf)', () => {
-  const md = validateContentInputs('markdown', undefined, undefined);
-  assert.ok(md && md.message.includes('content_text is required')); // flrw envelope kept
-  const pdf = validateContentInputs('pdf', undefined, undefined);
-  assert.ok(pdf && pdf.message.includes('Either content_text or content_archive_base64'));
-});
-
-test('archive alone passes input validation for every format', () => {
-  for (const f of ['latex', 'markdown', 'pdf'] as const) {
-    assert.equal(validateContentInputs(f, undefined, 'UEsDBA=='), null);
-  }
 });
 
 // ── decode: base64 / magic / size (acceptance 3, 4, 5, 6) ───────────────

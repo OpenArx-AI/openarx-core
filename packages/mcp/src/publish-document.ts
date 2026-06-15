@@ -12,8 +12,7 @@
  * (contract §4 — "branch goes live without Core re-deploy").
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile, rename, rm, cp, access, realpath } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { rm, realpath } from 'node:fs/promises';
 import { join, sep } from 'node:path';
 import type { Request, Response } from 'express';
 import type { AppContext } from './context.js';
@@ -22,6 +21,8 @@ import { query, computeOarxId } from '@openarx/api';
 import { normalizeLicense, runSpamScreen, type SpamScreenResult } from '@openarx/ingest';
 import { createInitialReview } from '@openarx/api';
 import { getRequiredVersions, getLegalVersionsError, type LegalVersions } from './lib/legal-versions.js';
+import { materializeArchive, isDirectory } from './lib/materialize-archive.js';
+import { ArchiveIntakeError } from './profiles/pub/archive-intake.js';
 
 const PORTAL_STORAGE_BASE = process.env.PORTAL_STORAGE_BASE ?? '/mnt/storagebox/openarx/portal-docs';
 const PORTAL_INTERNAL_URL = process.env.PORTAL_INTERNAL_URL ?? 'http://localhost:3200';
@@ -34,6 +35,40 @@ const CONSENT_KEYS: (keyof LegalVersions)[] = [
 // Size ceilings — mirror the MCP zod schemas (bead 6vz2) so both entry
 // points reject identically.
 const LIMITS = { title: 5_000, abstract: 50_000, contentText: 2_000_000, keywordsMax: 50, keywordItemMax: 100 };
+
+/** Portal metadata fields (request-body snake_case keys) persisted into
+ *  documents.portal_metadata JSONB when the caller supplies them
+ *  (openarx-contracts-u66i — o4z2 dropped these). Absent fields are omitted,
+ *  never written as null keys. embargo_until is handled separately (it maps to
+ *  its own column, not the JSONB). */
+export const PORTAL_METADATA_FIELDS = [
+  'funding', 'coi_statement', 'data_availability', 'data_availability_url', 'related_identifiers',
+  // openarx-contracts-w7um §17.5: full Portal metadata set forwarded by the MCP
+  // tools. code_links/dataset_links/doi/arxiv_id/source_url/categories map to
+  // their own columns/externalIds below; these three have no column → JSONB.
+  'hubs', 'benchmark_links', 'arxiv_categories',
+] as const;
+
+/** Pure builder for the persisted portal_metadata, extracted for unit testing:
+ *  starts from a base (content_source etc.) and copies only supplied fields. */
+export function buildPortalMetadata(
+  base: Record<string, unknown>,
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...base };
+  for (const key of PORTAL_METADATA_FIELDS) {
+    if (body[key] !== undefined && body[key] !== null) out[key] = body[key];
+  }
+  return out;
+}
+
+/** Parse body.embargo_until → Date for the documents.embargo_until column
+ *  (openarx-contracts-u66i). Absent or unparseable → undefined (column NULL). */
+export function parseEmbargoUntil(body: Record<string, unknown>): Date | undefined {
+  if (body.embargo_until == null) return undefined;
+  const d = new Date(body.embargo_until as string);
+  return Number.isNaN(d.getTime()) ? undefined : d;
+}
 
 // ── Pure, unit-tested helpers ────────────────────────────────────────────
 
@@ -94,16 +129,19 @@ export function verifyPortalConsent(
   return stale;
 }
 
-/** caller=mcp: account-level versions must be ≥ required (newer is fine). */
+/**
+ * caller=mcp (openarx-contracts-b77h): PRESENCE check only — each consent field
+ * must be populated; version sufficiency is NOT compared. The MCP path has no UI
+ * for a user to act on a stale-version block (dead-end UX), and ToS §13.2
+ * continued-use covers the relaxation. Signup-time acceptance on Portal remains
+ * the blocking gate, and caller=portal keeps full version + recency checks.
+ * Returns the list of NULL/missing keys (empty = ok).
+ */
 export function verifyAccountConsent(
   state: ConsentBlock | undefined,
-  required: LegalVersions,
 ): string[] {
   if (!state) return [...CONSENT_KEYS];
-  return CONSENT_KEYS.filter((k) => {
-    const have = state[k];
-    return typeof have !== 'string' || !versionAtLeast(have, required[k]);
-  });
+  return CONSENT_KEYS.filter((k) => state[k] == null);
 }
 
 /** Aspect 1 fail-open marker (contract §5): LLM timeout / upstream down. */
@@ -213,14 +251,15 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
       jres(res, 503, { ok: false, error: 'consent_check_unavailable', message: `Portal consent-state unreachable: ${err instanceof Error ? err.message : String(err)}` });
       return;
     }
-    const stale = verifyAccountConsent(state, required);
-    if (stale.length > 0) {
+    // b77h: presence-only — block only when a consent field is entirely
+    // missing (never seen). Stale-but-present versions pass on the MCP path.
+    const missing = verifyAccountConsent(state);
+    if (missing.length > 0) {
       jres(res, 400, {
         ok: false, error: 'account_consent_required',
-        message: 'User must re-accept upload consent at portal.openarx.ai/portal/consent',
+        message: 'User must accept upload consent at portal.openarx.ai/portal/consent',
         user_accept_url: 'https://portal.openarx.ai/portal/consent',
-        missing_or_stale: stale,
-        current_required_versions: required,
+        missing_or_stale: missing,
       });
       return;
     }
@@ -246,9 +285,22 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   const abstract = body.abstract as string;
   const contentSource = body.content_source as Record<string, unknown>;
 
+  // ── §17.2: file-only publishing — Scenario A (inline text) is dropped ──
+  // Every publishing surface now mirrors arxiv: content arrives as an uploaded
+  // archive (content_source.type=storagebox). An inline-text body is rejected
+  // so the four surfaces can't split-brain on content shape.
+  if (contentSource.type === 'text' || typeof contentSource.text === 'string') {
+    jres(res, 400, {
+      ok: false, error: 'inline_text_unsupported',
+      message: 'Inline text submissions are no longer accepted. Upload a ZIP (LaTeX/Markdown + assets) or PDF and publish with content_source.type=storagebox.',
+    });
+    return;
+  }
+
   // ── §5 Aspect 1: spam screen (sync, 3s hard cap inside runSpamScreen) ──
-  const inlineText = contentSource.text as string | undefined;
-  const spamBody = typeof inlineText === 'string' ? inlineText.slice(0, 8000) : `${title}\n\n${abstract}`;
+  // File-only: the screen runs on title+abstract (the body lives in the
+  // archive, materialized below, and is screened downstream by the pipeline).
+  const spamBody = `${title}\n\n${abstract}`;
   const spam = await runSpamScreen({ title, abstract, body: spamBody }, { modelRouter: ctx.modelRouter });
   if (spam.verdict === 'reject') {
     jres(res, 400, {
@@ -261,67 +313,68 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   }
   const aspect1ProviderFailure = isAspect1ProviderFailure(spam);
 
-  // ── §6: atomic staged storage ──
+  // ── §6 / §17.1: materialize the uploaded archive (mirror arxiv storage) ──
+  // content_source.storage_path is the RAW uploaded archive FILE — a ZIP, or a
+  // single pdf/tex/md via a content_ref upload. The tool layer no longer
+  // pre-extracts; here we transcode it into the canonical doc dir exactly like
+  // an arxiv eprint (eprint + lazy source/, or paper.pdf). The archive is the
+  // canonical artifact; any extracted tree is transient (materializeArchive
+  // removes it before returning).
   const coreDocId = randomUUID();
-  const stagingUuid = randomUUID();
-  const stagingDir = join(PORTAL_STORAGE_BASE, '.tmp', stagingUuid);
   const canonicalDir = join(PORTAL_STORAGE_BASE, userId, coreDocId);
-  let rawContentPath = '';
-  let mainFile = '';
+
+  // SECURITY: storage_path / main_file are client-supplied. Constrain main_file
+  // (no `..` segments) and require storage_path's REAL path to live inside
+  // PORTAL_STORAGE_BASE — the only place legitimate uploads are staged. Blocks
+  // arbitrary host paths (system files, server config, another user's tree).
+  const storagePath = contentSource.storage_path as string | undefined;
+  const mainFileArg = contentSource.main_file as string | undefined;
+  if (!storagePath) {
+    jres(res, 400, { ok: false, error: 'validation_error', message: 'content_source.type=storagebox requires storage_path' });
+    return;
+  }
+  if (mainFileArg && isUnsafeRelPath(mainFileArg)) {
+    jres(res, 400, { ok: false, error: 'invalid_main_file', message: 'main_file must be a relative path with no .. segments' });
+    return;
+  }
+  const baseReal = await realpath(PORTAL_STORAGE_BASE);
+  let storageReal: string;
+  try {
+    storageReal = await realpath(storagePath);
+  } catch {
+    jres(res, 400, { ok: false, error: 'invalid_storage_path', message: 'storage_path does not exist' });
+    return;
+  }
+  if (storageReal !== baseReal && !storageReal.startsWith(baseReal + sep)) {
+    jres(res, 400, { ok: false, error: 'invalid_storage_path', message: 'storage_path must be inside the portal storage root' });
+    return;
+  }
+  // §17: file-only — storage_path must be the uploaded archive FILE, not a
+  // pre-extracted directory (the dropped Scenario B shape).
+  if (await isDirectory(storageReal)) {
+    jres(res, 400, { ok: false, error: 'invalid_storage_path', message: 'storage_path must be a single uploaded archive file (ZIP/PDF), not a directory' });
+    return;
+  }
 
   try {
-    await mkdir(stagingDir, { recursive: true });
-
-    if (typeof inlineText === 'string') {
-      // Scenario A — inline text
-      const ext = contentFormat === 'pdf' ? '.pdf' : contentFormat === 'markdown' ? '.md' : '.tex';
-      mainFile = `main${ext}`;
-      await writeFile(join(stagingDir, mainFile), inlineText, 'utf-8');
-    } else {
-      // Scenario B — files already on disk at storage_path; copy into staging.
-      // SECURITY: storage_path and main_file are client-supplied. Without an
-      // allowlist, cp(storage_path, …) would copy ANY readable directory on
-      // the host into the document (arbitrary file disclosure), and a
-      // main_file with `..` would escape. Both are constrained below.
-      const storagePath = contentSource.storage_path as string | undefined;
-      mainFile = (contentSource.main_file as string | undefined) ?? '';
-      if (!storagePath || !mainFile) {
-        jres(res, 400, { ok: false, error: 'validation_error', message: 'content_source.type=storagebox requires storage_path and main_file' });
+    // §17.1 + §17.3: materialize; structured archive errors (bad main_file,
+    // format mismatch, unreadable ZIP) surface as 400 with the same envelope
+    // shape the tool layer uses. Anything else bubbles to the outer catch.
+    let materialized;
+    try {
+      materialized = await materializeArchive({ archivePath: storageReal, canonicalDir, contentFormat, mainFile: mainFileArg });
+    } catch (err) {
+      await rm(canonicalDir, { recursive: true, force: true }).catch(() => {});
+      if (err instanceof ArchiveIntakeError) {
+        jres(res, 400, { ok: false, error: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) });
         return;
       }
-      if (isUnsafeRelPath(mainFile)) {
-        jres(res, 400, { ok: false, error: 'invalid_main_file', message: 'main_file must be a relative path with no .. segments' });
-        return;
-      }
-      // Resolve symlinks and require the real path to live inside
-      // PORTAL_STORAGE_BASE — the only place legitimate portal content is
-      // staged. Blocks anything outside it (system files, server config, etc.).
-      const baseReal = await realpath(PORTAL_STORAGE_BASE);
-      let storageReal: string;
-      try {
-        storageReal = await realpath(storagePath);
-      } catch {
-        jres(res, 400, { ok: false, error: 'invalid_storage_path', message: 'storage_path does not exist' });
-        return;
-      }
-      if (storageReal !== baseReal && !storageReal.startsWith(baseReal + sep)) {
-        jres(res, 400, { ok: false, error: 'invalid_storage_path', message: 'storage_path must be inside the portal storage root' });
-        return;
-      }
-      try {
-        await access(join(storageReal, mainFile), constants.R_OK);
-      } catch {
-        jres(res, 400, { ok: false, error: 'file_not_found', message: `Cannot read main_file in storage_path` });
-        return;
-      }
-      await cp(storageReal, stagingDir, { recursive: true });
+      throw err;
     }
-
-    // Atomic publish: rename staging → canonical. Same filesystem (both under
-    // PORTAL_STORAGE_BASE) so this is a real rename(2), not a cross-fs copy.
-    await mkdir(join(PORTAL_STORAGE_BASE, userId), { recursive: true });
-    await rename(stagingDir, canonicalDir);
-    rawContentPath = join(canonicalDir, mainFile);
+    const rawContentPath = materialized.rawContentPath;
+    const mainFile = materialized.mainFile;
+    const sources: Document['sources'] = materialized.sources;
+    const attachments = materialized.attachments;
 
     // ── License SPDX normalization (closes jc74) ──
     // Portal docs are ALWAYS full-indexed (openarx-luco product promise;
@@ -351,16 +404,21 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
     const version = (body.version as number | undefined) ?? 1;
     const conceptId = (body.concept_id as string | undefined) ?? coreDocId;
 
-    const attachments = (contentSource.attachments as Array<unknown> | undefined) ?? [];
-    const portalMetadata: Record<string, unknown> = {
+    // content_source records the canonical archive location + the attachments
+    // materializeArchive enumerated (mirrors arxiv: storage_path is the doc dir
+    // holding eprint/paper.pdf, main_file is rootTex/rootMd/paper.pdf).
+    const baseMetadata: Record<string, unknown> = {
       content_source: { type: 'storagebox', storage_path: canonicalDir, main_file: mainFile, attachments },
     };
-    if (aspect1ProviderFailure) portalMetadata.aspect1_provider_failure = true;
+    if (aspect1ProviderFailure) baseMetadata.aspect1_provider_failure = true;
+    // Persist the Portal metadata fields the caller actually supplied
+    // (openarx-contracts-u66i — o4z2 regression: these were dropped; w7um §17.5
+    // extends the set). Absent fields are OMITTED, never written as null (§3).
+    const portalMetadata = buildPortalMetadata(baseMetadata, body);
 
-    const sources: Document['sources'] =
-      contentFormat === 'pdf' ? { pdf: { path: rawContentPath } }
-      : contentFormat === 'markdown' ? { markdown: { path: rawContentPath } }
-      : { latex: { path: canonicalDir, rootTex: mainFile } };
+    // embargo_until → dedicated column (migration 016). Parse to Date; an
+    // unparseable value is ignored (column stays NULL) rather than erroring.
+    const embargoUntil = parseEmbargoUntil(body);
 
     const doc: Document = {
       id: coreDocId,
@@ -387,6 +445,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
       keywords: (body.keywords as string[] | undefined) ?? undefined,
       language: (body.language as string | undefined) ?? 'en',
       resourceType: (body.resource_type as string | undefined) ?? 'preprint',
+      embargoUntil,
       portalMetadata,
       indexingTier: tier,
       codeLinks,
@@ -460,9 +519,13 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
       review: { aspect1_verdict: spam.verdict, ...(aspect1ProviderFailure ? { aspect1_provider_failure: true } : {}) },
       estimated_processing_seconds: 120,
     });
-  } finally {
-    // §6: staging dir cleaned on every path. After a successful rename it no
-    // longer exists; rm is best-effort for the error/early-return paths.
-    await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+  } catch (err) {
+    // Unexpected failure after the canonical dir was created (e.g. documentStore
+    // save error): remove the half-written document directory so storagebox
+    // doesn't accumulate orphaned eprints, then bubble to the Express handler.
+    // (Validation 400s return before the dir exists; ArchiveIntakeError and the
+    // idempotency-race path clean up themselves; 202/queue_full keep the doc.)
+    await rm(canonicalDir, { recursive: true, force: true }).catch(() => {});
+    throw err;
   }
 }

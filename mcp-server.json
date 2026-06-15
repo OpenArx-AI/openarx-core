@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -1040,7 +1040,7 @@
       },
       {
         "name": "submit_document",
-        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Content is provided either inline (content_text) or as a base64-encoded ZIP archive (content_archive_base64) — single archived PDF, markdown + figures, or multifile LaTeX; the two are mutually exclusive. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
+        "description": "Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Content is file-only: provide a base64-encoded ZIP archive (content_archive_base64) OR a content_ref from an out-of-band upload — exactly one. A ZIP may hold a single PDF, markdown + figures, or multifile LaTeX. Inline text is no longer accepted. For content above ~10 KB, prefer create_upload_url → PUT the file to the returned URL → pass the returned file_id as content_ref (avoids base64 token bloat). content_archive_base64 and content_ref are mutually exclusive — provide exactly one. Limits: title ≤5,000 chars; abstract ≤50,000 chars; archive ≤50 MB; keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1065,21 +1065,21 @@
               ],
               "description": "Content format"
             },
-            "content_text": {
-              "type": "string",
-              "maxLength": 2000000,
-              "description": "Document content (inline text for LaTeX/Markdown)"
-            },
             "content_archive_base64": {
               "type": "string",
               "maxLength": 67000000,
-              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Required if content_text is not provided. Mutually exclusive with content_text."
+              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Mutually exclusive with content_ref. Prefer content_ref (create_upload_url) above ~10 KB."
+            },
+            "content_ref": {
+              "type": "string",
+              "format": "uuid",
+              "description": "file_id from a successful create_upload_url + PUT upload flow. The uploaded ZIP / PDF / LaTeX / Markdown becomes the document content. Mutually exclusive with content_archive_base64."
             },
             "main_file": {
               "type": "string",
               "minLength": 1,
               "maxLength": 255,
-              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required."
+              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required. For a content_ref ZIP this selects the entry; ignored for a content_ref single file."
             },
             "authors": {
               "type": "array",
@@ -1130,6 +1130,107 @@
               },
               "maxItems": 50,
               "description": "Keywords"
+            },
+            "funding": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Funding sources, e.g. [{ funder_name, award_number? }]."
+            },
+            "coi_statement": {
+              "type": "string",
+              "description": "Conflict-of-interest statement."
+            },
+            "data_availability": {
+              "type": "string",
+              "description": "Data-availability statement or status."
+            },
+            "data_availability_url": {
+              "type": "string",
+              "description": "URL to the dataset / data-availability record."
+            },
+            "related_identifiers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Related identifiers, e.g. [{ identifier_type, identifier_value, relation? }]."
+            },
+            "embargo_until": {
+              "type": "string",
+              "description": "ISO-8601 timestamp; the document is embargoed until then."
+            },
+            "hubs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Portal hub / topic slugs to associate."
+            },
+            "code_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url"
+                ],
+                "additionalProperties": false
+              },
+              "description": "Source-code repositories, e.g. [{ url }]."
+            },
+            "dataset_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              "description": "Datasets, e.g. [{ name, url? }]."
+            },
+            "benchmark_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Benchmark-result references."
+            },
+            "doi": {
+              "type": "string",
+              "description": "DOI of the work."
+            },
+            "arxiv_id": {
+              "type": "string",
+              "description": "arXiv identifier, if cross-posted."
+            },
+            "source_url": {
+              "type": "string",
+              "description": "Canonical source URL."
+            },
+            "arxiv_categories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "arXiv subject categories."
             },
             "dry_run": {
               "type": "boolean",
@@ -1214,7 +1315,7 @@
       },
       {
         "name": "create_new_version",
-        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit `categories`, `keywords`, or `language` to inherit each independently from the previous version; pass a value to override. Content is provided either inline (content_text) or as a base64-encoded ZIP archive (content_archive_base64) — single archived PDF, markdown + figures, or multifile LaTeX; the two are mutually exclusive. Limits: title ≤5,000 chars; abstract ≤50,000 chars; content_text ≤2,000,000 chars (~2 MB); keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
+        "description": "Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit `categories`, `keywords`, or `language` to inherit each independently from the previous version; pass a value to override. Content is file-only: provide a base64-encoded ZIP archive (content_archive_base64) OR a content_ref from an out-of-band upload — exactly one. A ZIP may hold a single PDF, markdown + figures, or multifile LaTeX. Inline text is no longer accepted. For content above ~10 KB, prefer create_upload_url → PUT the file to the returned URL → pass the returned file_id as content_ref (avoids base64 token bloat). content_archive_base64 and content_ref are mutually exclusive — provide exactly one. Limits: title ≤5,000 chars; abstract ≤50,000 chars; archive ≤50 MB; keywords ≤50 items × ≤100 chars each. Set dry_run=true to validate without committing: no document is created, nothing is queued, no credits are charged; the response shows what would be saved and the estimated cost.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1242,11 +1343,6 @@
                 "pdf"
               ],
               "description": "Content format"
-            },
-            "content_text": {
-              "type": "string",
-              "maxLength": 2000000,
-              "description": "Updated document content"
             },
             "authors": {
               "type": "array",
@@ -1300,13 +1396,119 @@
             "content_archive_base64": {
               "type": "string",
               "maxLength": 67000000,
-              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Required if content_text is not provided. Mutually exclusive with content_text."
+              "description": "Base64-encoded ZIP archive (PK\\x03\\x04). Must contain main_file plus any attachments. Mutually exclusive with content_ref. Prefer content_ref (create_upload_url) above ~10 KB."
+            },
+            "content_ref": {
+              "type": "string",
+              "format": "uuid",
+              "description": "file_id from a successful create_upload_url + PUT upload flow. The uploaded ZIP / PDF / LaTeX / Markdown becomes the document content. Mutually exclusive with content_archive_base64."
             },
             "main_file": {
               "type": "string",
               "minLength": 1,
               "maxLength": 255,
-              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required."
+              "description": "Filename within the archive to treat as primary content. If exactly one .pdf / .tex / .md file exists at the archive root, auto-inferred when omitted. Otherwise required. For a content_ref ZIP this selects the entry; ignored for a content_ref single file."
+            },
+            "funding": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Funding sources, e.g. [{ funder_name, award_number? }]."
+            },
+            "coi_statement": {
+              "type": "string",
+              "description": "Conflict-of-interest statement."
+            },
+            "data_availability": {
+              "type": "string",
+              "description": "Data-availability statement or status."
+            },
+            "data_availability_url": {
+              "type": "string",
+              "description": "URL to the dataset / data-availability record."
+            },
+            "related_identifiers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Related identifiers, e.g. [{ identifier_type, identifier_value, relation? }]."
+            },
+            "embargo_until": {
+              "type": "string",
+              "description": "ISO-8601 timestamp; the document is embargoed until then."
+            },
+            "hubs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Portal hub / topic slugs to associate."
+            },
+            "code_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url"
+                ],
+                "additionalProperties": false
+              },
+              "description": "Source-code repositories, e.g. [{ url }]."
+            },
+            "dataset_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              "description": "Datasets, e.g. [{ name, url? }]."
+            },
+            "benchmark_links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {}
+              },
+              "description": "Benchmark-result references."
+            },
+            "doi": {
+              "type": "string",
+              "description": "DOI of the work."
+            },
+            "arxiv_id": {
+              "type": "string",
+              "description": "arXiv identifier, if cross-posted."
+            },
+            "source_url": {
+              "type": "string",
+              "description": "Canonical source URL."
+            },
+            "arxiv_categories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "arXiv subject categories."
             },
             "dry_run": {
               "type": "boolean",
@@ -1342,6 +1544,79 @@
           },
           "required": [
             "documentId"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "create_upload_url",
+        "description": "Request a short-lived presigned PUT URL for uploading publishing content. Use when content exceeds practical inline-parameter limits (~10 KB). After uploading the file to the returned URL with an HTTP PUT, pass the file_id as content_ref to submit_document or create_new_version. The URL expires in 10 minutes and accepts a single file up to 50 MB.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "expected_size_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50000000,
+              "description": "Hint for the upload size (≤50 MB is enforced on upload regardless)."
+            },
+            "expected_content_type": {
+              "type": "string",
+              "enum": [
+                "application/zip",
+                "application/pdf",
+                "text/x-tex",
+                "text/markdown"
+              ],
+              "description": "Optional hint for what you intend to upload. A magic-byte check runs on PUT; if set to application/zip or application/pdf the bytes must match that signature."
+            }
+          },
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "create_draft",
+        "description": "Create an editable draft in the OpenArx Portal instead of publishing immediately. Returns a draft_id and an edit_url the user can open to review/edit before publishing. Drafts are file-only: first call create_upload_url, PUT your ZIP/PDF, then pass the returned file_id as content_ref. No content review runs and nothing is indexed — this is Portal workflow state, not corpus knowledge (drafts do not appear in get_my_documents).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 5000,
+              "description": "Draft title"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "latex",
+                "markdown",
+                "pdf"
+              ],
+              "description": "Content format"
+            },
+            "content_ref": {
+              "type": "string",
+              "format": "uuid",
+              "description": "file_id from create_upload_url + PUT. The uploaded ZIP/PDF becomes the draft content (required — drafts are file-only)."
+            },
+            "metadata": {
+              "type": "object",
+              "additionalProperties": {},
+              "description": "Optional metadata block — same field set as submit_document (authors, abstract, license, funding, coi_statement, data_availability, related_identifiers, embargo_until, hubs, code_links, dataset_links, benchmark_links, doi, arxiv_id, source_url, arxiv_categories, …). Forwarded to the draft verbatim."
+            }
+          },
+          "required": [
+            "title",
+            "format"
           ],
           "additionalProperties": false,
           "$schema": "http://json-schema.org/draft-07/schema#"

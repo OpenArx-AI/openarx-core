@@ -1,47 +1,11 @@
 /**
- * openarx-contracts-flrw: content_text required for inline formats in
- * submit_document / create_new_version. Both handlers run the same
- * validateInlineContent predicate at the top (server.tool() takes a raw
- * zod shape, so a schema-level .refine() cannot be attached) — the cases
- * below cover the acceptance matrix for both tools.
+ * Publisher-tool validation matrix. The flrw inline-content cases were removed
+ * in openarx-contracts-w7um §17.2 (publishing is now file-only — there is no
+ * content_text to validate; see archive-intake.test.ts for the file-only
+ * validateContentInputs matrix).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateInlineContent } from './publish-tools.js';
-
-// Acceptance 1 + 5: markdown without content_text → error mentioning requirement
-test('markdown with undefined content_text is rejected', () => {
-  const err = validateInlineContent('markdown', undefined);
-  assert.ok(err && err.includes('content_text is required'));
-});
-
-// Acceptance 2 + 5: whitespace-only content rejected by trim()
-test('latex with whitespace-only content_text is rejected', () => {
-  const err = validateInlineContent('latex', '  \n  ');
-  assert.ok(err && err.includes('content_text is required'));
-});
-
-test('markdown with empty string is rejected', () => {
-  assert.ok(validateInlineContent('markdown', ''));
-});
-
-// Acceptance 3 + 5: real content passes
-test('markdown with real content passes', () => {
-  assert.equal(validateInlineContent('markdown', '# Hello'), null);
-});
-
-test('latex with real content passes', () => {
-  assert.equal(validateInlineContent('latex', '\\documentclass{article}'), null);
-});
-
-// Acceptance 4 + 5: PDF path untouched — no new validation regardless of content_text
-test('pdf with undefined content_text passes (behavior unchanged, openarx-contracts-oa7k owns PDF)', () => {
-  assert.equal(validateInlineContent('pdf', undefined), null);
-});
-
-test('pdf with empty content_text passes (unchanged)', () => {
-  assert.equal(validateInlineContent('pdf', ''), null);
-});
 
 // ── openarx-contracts-7tyj: create_new_version metadata inheritance ──────
 import { resolveVersionMetadata } from './publish-tools.js';
@@ -85,11 +49,11 @@ test('missing prev fields fall back to [] / [] / en', () => {
 });
 
 // ── openarx-contracts-6vz2: size limits via zod .max() ───────────────────
-// The SAME schema objects (titleField/abstractField/contentTextField/
-// keywordsField) are used in both submit_document and create_new_version
-// tool shapes — identity between the tools holds by construction, so each
-// case below covers both tools.
-import { titleField, abstractField, contentTextField, keywordsField, PUBLISH_LIMITS } from './publish-tools.js';
+// The SAME schema objects (titleField/abstractField/keywordsField) are used in
+// both submit_document and create_new_version tool shapes — identity between
+// the tools holds by construction, so each case below covers both tools.
+// (contentTextField was removed with inline content in w7um §17.2.)
+import { titleField, abstractField, keywordsField, PUBLISH_LIMITS } from './publish-tools.js';
 
 test('title over 5000 chars is rejected, 5000 exactly passes', () => {
   assert.equal(titleField.safeParse('A'.repeat(5001)).success, false);
@@ -99,11 +63,6 @@ test('title over 5000 chars is rejected, 5000 exactly passes', () => {
 test('abstract over 50000 chars is rejected', () => {
   assert.equal(abstractField.safeParse('A'.repeat(50001)).success, false);
   assert.equal(abstractField.safeParse('A'.repeat(50000)).success, true);
-});
-
-test('content_text over 2,000,000 chars is rejected', () => {
-  assert.equal(contentTextField.safeParse('A'.repeat(2_000_001)).success, false);
-  assert.equal(contentTextField.safeParse('A'.repeat(2_000_000)).success, true);
 });
 
 test('more than 50 keywords rejected', () => {
@@ -211,4 +170,15 @@ test('dry-run would_save inheritance matches resolveVersionMetadata semantics', 
   assert.deepEqual(overridden.keywords, ['override']);
   assert.deepEqual(overridden.categories, ['cs.CL']);
   assert.equal(overridden.language, 'fr');
+});
+
+// ── openarx-contracts-w3rr: publish-via-endpoint billing rule ────────────
+import { isChargeablePublishStatus } from './publish-tools.js';
+
+test('only 202 (created) and 409 (idempotent replay) are chargeable', () => {
+  assert.equal(isChargeablePublishStatus(202), true);
+  assert.equal(isChargeablePublishStatus(409), true);
+  for (const s of [400, 401, 403, 422, 500, 503]) {
+    assert.equal(isChargeablePublishStatus(s), false, `status ${s} must not be billed`);
+  }
 });

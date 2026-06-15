@@ -9,6 +9,7 @@ import { createContext } from './context.js';
 import { getProfile, getAllProfiles } from './profiles/registry.js';
 import { isTokenTypeSufficient } from './profiles/types.js';
 import { registerInternalRoutes } from './internal-routes.js';
+import { registerUploadRoutes } from './upload-routes.js';
 import { registerAdminRoutes } from './admin-routes.js';
 import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, type TokenInfo } from './portal-auth.js';
 import { logRequest, extractResultSummary } from './request-logger.js';
@@ -281,6 +282,8 @@ async function main(): Promise<void> {
   app.use('/.well-known', createLimiter(RATE_LIMIT_PUBLIC, 'well-known'));
   app.use('/oauth', createLimiter(RATE_LIMIT_OAUTH, 'oauth'));
   app.use('/api/internal', createLimiter(RATE_LIMIT_INTERNAL, 'internal'));
+  // Presigned upload PUT (xuqi) — self-authenticating, per-IP rate limited.
+  app.put('/api/upload/:file_id', createLimiter(RATE_LIMIT_INTERNAL, 'upload'));
 
   // MCP endpoints — per-IP limiter
   const mcpLimiter = createLimiter(RATE_LIMIT_MCP, 'mcp');
@@ -309,6 +312,7 @@ async function main(): Promise<void> {
         || req.path === '/versions'
         || req.path === '/metrics'
         || req.path.startsWith('/api/internal')
+        || req.path.startsWith('/api/upload') // self-authenticating via HMAC URL (xuqi)
         || req.path.startsWith('/admin')
         || req.path.startsWith('/.well-known')
         || req.path.startsWith('/oauth')
@@ -573,6 +577,21 @@ async function main(): Promise<void> {
       if (handlerIdx > 0) {
         const originalHandler = args[handlerIdx] as (...a: unknown[]) => Promise<unknown>;
         args[handlerIdx] = async (...handlerArgs: unknown[]) => {
+          // Propagate the gateway-verified publisher identity onto the SDK
+          // handler `extra`. The MCP SDK only exposes authInfo/requestInfo on
+          // extra — never our req._portalToken — so publish tools that read
+          // (extra)._portalToken.userId were always seeing undefined
+          // (openarx-contracts-0fvo). userId MUST derive from the verified
+          // Bearer here, NEVER from a tool argument (a tool arg could claim
+          // another user's identity). extra is the last handler arg (the SDK
+          // calls (args, extra) with a schema, or (extra) without one).
+          if (portalToken) {
+            const ex = handlerArgs[handlerArgs.length - 1];
+            if (ex && typeof ex === 'object') {
+              (ex as Record<string, unknown>)._portalToken = portalToken;
+            }
+          }
+
           // Token-level permission check (search perms + always-free tools).
           // Tier-gated gov tools return allow=true here — their tier check
           // happens after agentId resolution below.
@@ -657,10 +676,21 @@ async function main(): Promise<void> {
             // via AsyncLocalStorage lookup.
             toolResult = await withUsageTracker(usage, () => originalHandler(...handlerArgs));
 
-            // Post-deduct: charge user (never for dry_run — the legacy
-            // fallback below would otherwise charge when creditsCharged
-            // stayed null)
-            if (portalToken?.userId && portalToken?.tokenId && !dryRun) {
+            // Handler-level skip-billing marker (openarx-contracts-w3rr §7):
+            // publish tools set __skipBilling on non-chargeable endpoint
+            // responses (spam_rejected, consent errors, validation, 503 …) so
+            // the agent isn't charged for a fixable rejection. Read it, then
+            // strip it before the SDK serializes the result.
+            let skipBilling = false;
+            if (toolResult && typeof toolResult === 'object' && (toolResult as Record<string, unknown>).__skipBilling === true) {
+              skipBilling = true;
+              delete (toolResult as Record<string, unknown>).__skipBilling;
+            }
+
+            // Post-deduct: charge user (never for dry_run or a skip-billing
+            // rejection — the legacy fallback below would otherwise charge
+            // when creditsCharged stayed null)
+            if (portalToken?.userId && portalToken?.tokenId && !dryRun && !skipBilling) {
               if (creditsCharged !== null) {
                 // New billing: tool-deduct with effective_cost
                 const deductResult = await toolDeduct(
@@ -739,6 +769,7 @@ async function main(): Promise<void> {
   initLegalVersions();
 
   registerInternalRoutes(app, ctx);
+  registerUploadRoutes(app, ctx);
   registerAdminRoutes(app, ctx);
 
   // ── Portal document processing queue ──────────────────────────
