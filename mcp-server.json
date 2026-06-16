@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -1584,7 +1584,7 @@
       },
       {
         "name": "create_draft",
-        "description": "Create an editable draft in the OpenArx Portal instead of publishing immediately. Returns a draft_id and an edit_url the user can open to review/edit before publishing. Drafts are file-only: first call create_upload_url, PUT your ZIP/PDF, then pass the returned file_id as content_ref. No content review runs and nothing is indexed — this is Portal workflow state, not corpus knowledge (drafts do not appear in get_my_documents).",
+        "description": "Create an editable draft in the OpenArx Portal instead of publishing immediately. Returns a draft_id and an edit_url the user can open to review/edit before publishing. Drafts are file-only: first call create_upload_url, PUT your ZIP/PDF, then pass the returned file_id as content_ref. No content review runs and nothing is indexed — this is Portal workflow state, not corpus knowledge (drafts do not appear in get_my_documents). Optionally bind the draft to an existing document's version chain with previous_document_id, or preview with dry_run. The response always echoes a would_save block so you can confirm the server understood your inputs (which metadata keys were recognized, the resolved file details, and the version binding) before anything is published.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1611,7 +1611,17 @@
             "metadata": {
               "type": "object",
               "additionalProperties": {},
-              "description": "Optional metadata block — same field set as submit_document (authors, abstract, license, funding, coi_statement, data_availability, related_identifiers, embargo_until, hubs, code_links, dataset_links, benchmark_links, doi, arxiv_id, source_url, arxiv_categories, …). Forwarded to the draft verbatim."
+              "description": "Optional metadata block — same field set as submit_document (authors, abstract, license, funding, coi_statement, data_availability, related_identifiers, embargo_until, hubs, code_links, dataset_links, benchmark_links, doi, arxiv_id, source_url, arxiv_categories, …). Unrecognized keys are dropped; would_save.metadata echoes exactly the fields the server recognized — a key missing from that echo was a typo or unsupported."
+            },
+            "previous_document_id": {
+              "type": "string",
+              "format": "uuid",
+              "description": "Optional. Core document ID of the version this draft revises. When set it must exist AND be owned by you; the draft is then bound to that document's concept (version chain). Omit for a standalone draft."
+            },
+            "dry_run": {
+              "type": "boolean",
+              "default": false,
+              "description": "Set true to validate inputs without creating the draft: runs the full validation pipeline (schema, previous_document_id ownership, content_ref magic-bytes), writes nothing to the Portal, does NOT consume the content_ref (a later real call with the same content_ref still succeeds), and returns the would_save echo with draft_id and edit_url null. Always free."
             }
           },
           "required": [

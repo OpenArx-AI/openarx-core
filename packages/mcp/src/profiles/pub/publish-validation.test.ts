@@ -182,3 +182,66 @@ test('only 202 (created) and 409 (idempotent replay) are chargeable', () => {
     assert.equal(isChargeablePublishStatus(s), false, `status ${s} must not be billed`);
   }
 });
+
+// ── openarx-contracts-uomv §19: create_draft extensions ──────────────────
+import { detectDraftFormat, resolveDraftParent, pickDraftMetadata } from './publish-tools.js';
+
+function parseErr(result: { content: Array<{ text: string }> }): { error: string; message: string } {
+  return JSON.parse(result.content[0].text);
+}
+
+// §19.3 — create_draft joins the dry_run allowlist (reuses tof2 isDryRunCall), so
+// the gateway zero-bills it end-to-end (acceptance 4).
+test('isDryRunCall recognizes create_draft dry_run (acceptance 4: zero billing)', () => {
+  assert.equal(isDryRunCall('create_draft', { dry_run: true }), true);
+  assert.equal(isDryRunCall('create_draft', { dry_run: false }), false);
+  assert.equal(isDryRunCall('create_draft', {}), false);
+});
+
+// §19.4 — would_save.content_ref.format_detected via leading-byte signature.
+test('detectDraftFormat classifies zip / gzip-tar / pdf / text / binary by signature', () => {
+  assert.equal(detectDraftFormat(Buffer.from([0x50, 0x4b, 0x03, 0x04])), 'zip');
+  assert.equal(detectDraftFormat(Buffer.from([0x1f, 0x8b, 0x08, 0x00])), 'gzip-tar');
+  assert.equal(detectDraftFormat(Buffer.from('%PDF-1.7')), 'pdf');
+  assert.equal(detectDraftFormat(Buffer.from('\\documentclass{article}')), 'text');
+  assert.equal(detectDraftFormat(Buffer.from([0x00, 0x01, 0x02])), 'binary');
+});
+
+// §19.4 — would_save.metadata echoes ONLY recognized keys; a typo'd key is
+// silently dropped and its absence from the echo is how the agent notices
+// (acceptance 5).
+test('pickDraftMetadata keeps recognized keys (incl. license/authors), drops unrecognized (acceptance 5)', () => {
+  const echoed = pickDraftMetadata({ license: 'cc-by-4.0', authors: [{ name: 'A' }], fundng: 'NSF-123', doi: '10.1/x' });
+  assert.deepEqual(echoed, { license: 'cc-by-4.0', authors: [{ name: 'A' }], doi: '10.1/x' });
+  assert.equal('fundng' in echoed, false);
+});
+
+// §19.2 — previous_document_id ownership gate + concept resolution.
+const ownedDoc = { id: 'doc-1', conceptId: 'concept-1', publisherUserId: 'user-A' };
+const ownedNoConcept = { id: 'doc-2', publisherUserId: 'user-A' };
+function storeReturning(doc: { id: string; conceptId?: string; publisherUserId?: string } | null) {
+  return { getById: async (_id: string) => doc };
+}
+
+test('resolveDraftParent: owned parent → ok + concept_id (acceptance 1)', async () => {
+  const r = await resolveDraftParent(storeReturning(ownedDoc), 'doc-1', 'user-A');
+  assert.equal(r.ok, true);
+  assert.equal(r.ok && r.conceptId, 'concept-1');
+});
+
+test('resolveDraftParent: owned parent without conceptId falls back to its id', async () => {
+  const r = await resolveDraftParent(storeReturning(ownedNoConcept), 'doc-2', 'user-A');
+  assert.equal(r.ok && r.conceptId, 'doc-2');
+});
+
+test('resolveDraftParent: parent owned by another user → not_document_owner (acceptance 2)', async () => {
+  const r = await resolveDraftParent(storeReturning(ownedDoc), 'doc-1', 'user-B');
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && parseErr(r.result).error, 'not_document_owner');
+});
+
+test('resolveDraftParent: non-existent parent → document_not_found (acceptance 3)', async () => {
+  const r = await resolveDraftParent(storeReturning(null), 'missing-id', 'user-A');
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && parseErr(r.result).error, 'document_not_found');
+});

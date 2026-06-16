@@ -27,6 +27,7 @@ import type { Express, Request, Response, NextFunction } from 'express';
 import type { AppContext } from './context.js';
 import { handlePublishDocument } from './publish-document.js';
 import { handleUserDocuments } from './user-documents.js';
+import { resolveConceptLatest } from './concept-latest.js';
 import type { SearchResult, Document } from '@openarx/types';
 import type { BM25Result, ReportTier } from '@openarx/api';
 import {
@@ -620,6 +621,15 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     void handleUserDocuments(req, res, ctx);
   });
 
+  // ── GET /concept-latest — latest version in a concept, owner-scoped. Powers
+  //    Portal's §19 stale-parent check (openarx-portal-atrj / bead openarx-yurz). ──
+  router.get('/concept-latest', async (req: Request, res: Response) => {
+    const conceptId = typeof req.query.concept_id === 'string' ? req.query.concept_id : '';
+    const userId = typeof req.query.user_id === 'string' ? req.query.user_id : '';
+    const { status, body } = await resolveConceptLatest(ctx.pool, conceptId, userId);
+    res.status(status).json(body);
+  });
+
   router.post('/content-review', async (req: Request, res: Response) => {
     try {
       const body = req.body as Record<string, unknown>;
@@ -656,8 +666,8 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
   });
 
   // GET /api/internal/content-review/:documentId[?version=N|all][&user_id=uuid]
-  // ownership check: if user_id provided, compares against
-  //   documents.portal_metadata->>'uploader_id' OR 'user_id'. 403 on mismatch.
+  // ownership check: if user_id provided, compares against documents.publisher_user_id
+  //   (fallback portal_metadata uploader_id/user_id for legacy docs). 403 on mismatch.
   // tier filtering: if report_tier='basic', strips aspect 2-4 + suggestion
   //   + similar_documents fields. Portal is expected to proxy this for
   //   authenticated publishers — Core's internal endpoint trusts the secret
@@ -672,12 +682,14 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
         return;
       }
 
-      // Ownership check: when user_id provided, verify via portal_metadata.
-      // (Core doesn't maintain a dedicated uploaded_by_user_id column yet;
-      // Portal stores uploader identity in portal_metadata on ingest.)
+      // Ownership check: when user_id provided, verify against the canonical
+      // owner column publisher_user_id (migration 030) — the SAME source
+      // create_draft/create_new_version use — falling back to the legacy
+      // portal_metadata uploader_id/user_id only for docs that predate it
+      // (openarx-f20i: unify ownership across read + write surfaces).
       if (userId) {
-        const r = await query<{ meta: Record<string, unknown> | null }>(
-          `SELECT portal_metadata AS meta FROM documents WHERE id = $1::uuid`,
+        const r = await query<{ meta: Record<string, unknown> | null; publisher_user_id: string | null }>(
+          `SELECT portal_metadata AS meta, publisher_user_id FROM documents WHERE id = $1::uuid`,
           [documentId],
         );
         if (r.rows.length === 0) {
@@ -685,7 +697,9 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
           return;
         }
         const meta = r.rows[0]?.meta ?? {};
-        const ownerId = (meta['uploader_id'] as string | undefined) ?? (meta['user_id'] as string | undefined);
+        const ownerId = (r.rows[0]?.publisher_user_id ?? undefined)
+          ?? (meta['uploader_id'] as string | undefined)
+          ?? (meta['user_id'] as string | undefined);
         if (ownerId && ownerId !== userId) {
           res.status(403).json({ error: 'not_owner' });
           return;

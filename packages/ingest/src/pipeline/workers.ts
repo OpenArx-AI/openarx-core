@@ -15,6 +15,7 @@ import type {
   DocumentStore,
   ModelRouter,
   ParsedDocument,
+  ParsedSection,
   PipelineContext,
   VectorStore,
 } from '@openarx/types';
@@ -29,7 +30,7 @@ import {
 } from '@openarx/api';
 import { runNoveltyWorker } from './review/novelty-worker.js';
 import { access, mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { parseWithStrategy } from '../parsers/parse-strategy.js';
 import { ParserStep } from './parser-step.js';
 import { ChunkerStep, buildAbstractChunkContext } from './chunker-step.js';
@@ -124,6 +125,43 @@ export type WorkerFn = (item: WorkItem, steps: PipelineSteps) => Promise<void>;
 async function fileExists(path: string): Promise<boolean> {
   if (!path) return false;
   try { await access(path); return true; } catch { return false; }
+}
+
+/**
+ * Paths whose existence means the parse source is available. For w7um file-only
+ * docs (openarx-contracts-w7um §17) the canonical artifact is {dir}/eprint and
+ * sources.{markdown,latex}.path is a LAZY {dir}/source pointer that parse-strategy
+ * extracts at parse time — so the eprint sibling counts as "available" even
+ * before source/ exists. PDF (real paper.pdf) and grandfathered single-file
+ * markdown (direct .md) are covered by the primary path. Exported for testing.
+ */
+export function sourceCheckPaths(
+  sources: Document['sources'] | undefined,
+  rawContentPath?: string,
+): string[] {
+  const archivePath = sources?.markdown?.path ?? sources?.latex?.path;
+  const primary = archivePath ?? sources?.pdf?.path ?? rawContentPath ?? '';
+  const paths: string[] = [];
+  if (primary) paths.push(primary);
+  // Archive (lazy-source) formats: the eprint sibling is the real artifact.
+  if (archivePath) paths.push(join(dirname(archivePath), 'eprint'));
+  return paths;
+}
+
+/**
+ * Flatten a parsed document's sections (recursively, names + content) into one
+ * text blob. The chunker drops the References/bibliography section for embedding
+ * hygiene, so Aspect-3 cited-identifier extraction (0skd/szpw) must read the
+ * full parsed section text — not just chunk bodies — to see citations that live
+ * in a References section (openarx-9sps). Exported for testing.
+ */
+export function sectionsToText(sections: ParsedSection[]): string {
+  const out: string[] = [];
+  for (const s of sections) {
+    out.push(s.name, s.content);
+    if (s.subsections && s.subsections.length > 0) out.push(sectionsToText(s.subsections));
+  }
+  return out.join('\n');
 }
 
 const DATA_DIR = process.env.RUNNER_DATA_DIR ?? '/mnt/storagebox/arxiv';
@@ -225,11 +263,17 @@ export async function parseWorker(item: WorkItem, steps: PipelineSteps): Promise
     throw new DuplicateError(doc.sourceId);
   }
 
-  // Pre-parse check: ensure source files exist on disk
-  const hasSourceRecord = doc.sources?.pdf?.path || doc.sources?.latex?.path || doc.sources?.markdown?.path;
-  const sourcePath = doc.sources?.markdown?.path ?? doc.sources?.latex?.path ?? doc.sources?.pdf?.path ?? doc.rawContentPath ?? '';
+  // Pre-parse check: ensure source files exist on disk. w7um file-only docs keep
+  // the canonical artifact at {dir}/eprint with a lazy {dir}/source pointer, so an
+  // eprint sibling means the source IS available even before source/ is extracted.
+  const checkPaths = sourceCheckPaths(doc.sources, doc.rawContentPath);
+  const hasSourceRecord = checkPaths.length > 0;
+  let sourceAvailable = false;
+  for (const p of checkPaths) {
+    if (await fileExists(p)) { sourceAvailable = true; break; }
+  }
 
-  if (!hasSourceRecord || !(await fileExists(sourcePath))) {
+  if (!hasSourceRecord || !sourceAvailable) {
     context.logger.warn(`Source files missing for ${doc.sourceId}, attempting re-download...`);
     const ok = await reDownloadSource(doc, context.logger);
     if (!ok) {
@@ -550,10 +594,16 @@ export async function reviewNoveltyWorker(item: WorkItem, steps: PipelineSteps):
         conceptId: doc.conceptId ?? doc.id,
         chunks: chunks.map((c) => ({ vectors: c.vectors })),
         references: parsedDocument?.references ?? [],
-        // Body text for DOI/arXiv extraction + references-section heuristic.
-        // Chunk content is the reliable source for markdown docs, whose
-        // references never reach parsedDocument.references (0skd).
-        bodyText: chunks.map((c) => c.content).join('\n'),
+        // Body text for DOI/arXiv/oarx extraction + references-section heuristic.
+        // Must include the FULL parsed section text: the chunker drops the
+        // References section for embedding hygiene, so cited ids in a prose
+        // bibliography never reach extraction via chunk bodies alone
+        // (openarx-9sps). Chunk content kept as a fallback when parsedDocument
+        // is absent (e.g. review re-run without re-parse).
+        bodyText: [
+          parsedDocument ? sectionsToText(parsedDocument.sections) : '',
+          chunks.map((c) => c.content).join('\n'),
+        ].filter(Boolean).join('\n'),
       },
       {
         vectorStore: steps.vectorStore,

@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] — 2026-06-16
+
+Publishing fixes and review-grounding accuracy, plus draft version-chaining.
+
+### Added
+- **`create_draft` extensions**: `previous_document_id` to bind a draft to an
+  existing document's version chain (validated for ownership), `dry_run` to
+  validate inputs and preview without creating the draft or consuming the
+  upload, and a `would_save` echo block on every response so an agent can
+  confirm what the server recognized (metadata keys, file details, version
+  binding) before publishing.
+
+### Fixed
+- **Markdown and LaTeX publishing**: file-only submissions of Markdown/LaTeX
+  documents were accepted and then silently failed in processing; they now
+  index normally. (PDF was unaffected.)
+- **Privacy / ownership**: `get_my_documents` now returns only your own
+  submissions (it previously listed all portal documents), and the
+  content-review read path checks the canonical owner — consistent with the
+  publishing tools.
+- **Automated review grounding (Aspect 3)**: citation extraction now reads the
+  full parsed document text, so citations in a References/bibliography section
+  (including on-platform citations by id) are correctly credited.
+
+### Internal
+- Added an internal `concept-latest` endpoint the Portal uses to detect stale
+  parents when publishing a new version.
+
 ## [0.1.6] — 2026-06-15
 
 File-based publishing and large-content uploads over MCP, plus more

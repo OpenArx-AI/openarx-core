@@ -46,6 +46,7 @@ interface DocumentRow {
   resource_type: string | null;
   embargo_until: Date | null;
   portal_metadata: unknown;
+  publisher_user_id: string | null;
   // Translation
   original_title: string | null;
   original_abstract: string | null;
@@ -97,6 +98,7 @@ function rowToDocument(row: DocumentRow): Document {
     resourceType: row.resource_type ?? undefined,
     embargoUntil: row.embargo_until ?? undefined,
     portalMetadata: (row.portal_metadata as Record<string, unknown>) ?? undefined,
+    publisherUserId: row.publisher_user_id ?? undefined,
     // Translation
     originalTitle: row.original_title ?? undefined,
     originalAbstract: row.original_abstract ?? undefined,

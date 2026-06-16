@@ -52,7 +52,7 @@ export function getCostKey(tool: string, args: Record<string, unknown>): string 
  * (openarx-contracts-tof2). ONLY these zero-bill on dry_run=true — a stray
  * dry_run argument on any other tool must not bypass billing.
  */
-const DRY_RUN_TOOLS = new Set(['submit_document', 'create_new_version']);
+const DRY_RUN_TOOLS = new Set(['submit_document', 'create_new_version', 'create_draft']);
 
 /** True when this call is a dry run of a tool that supports it — the
  *  gateway then skips BOTH toolCheck (pre) and toolDeduct/legacy-deduct

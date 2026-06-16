@@ -253,6 +253,9 @@ export interface Document {
   resourceType?: string;
   embargoUntil?: Date;
   portalMetadata?: Record<string, unknown>;
+  // Portal user that submitted this document (publisher_user_id, migration 030).
+  // Used for tool-level ownership checks (e.g. create_draft previous_document_id).
+  publisherUserId?: string;
 
   // Linkage
   codeLinks: CodeLink[];

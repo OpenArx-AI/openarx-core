@@ -6,7 +6,7 @@
  */
 
 import { z } from 'zod';
-import { mkdir as fsMkdir, rm as fsRm, readFile as fsReadFile, writeFile as fsWriteFile, copyFile as fsCopyFile } from 'node:fs/promises';
+import { mkdir as fsMkdir, rm as fsRm, readFile as fsReadFile, writeFile as fsWriteFile, copyFile as fsCopyFile, stat as fsStat, open as fsOpen } from 'node:fs/promises';
 import { join as pathJoin } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from '../../context.js';
@@ -124,6 +124,20 @@ function pickPublishMetadata(args: Record<string, unknown>): Record<string, unkn
   const out: Record<string, unknown> = {};
   for (const k of PUBLISH_METADATA_KEYS) {
     if (args[k] !== undefined && args[k] !== null) out[k] = args[k];
+  }
+  return out;
+}
+
+/** create_draft carries everything in one freeform `metadata` block, whereas
+ *  submit_document splits authors/abstract/license into top-level params. The
+ *  recognized set for the would_save echo (openarx-contracts-uomv §19.4) is
+ *  therefore the publish metadata keys PLUS those three. Unknown keys are
+ *  dropped — their absence from the echo is how the agent spots a typo. */
+const DRAFT_METADATA_KEYS = [...PUBLISH_METADATA_KEYS, 'authors', 'abstract', 'license'] as const;
+export function pickDraftMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of DRAFT_METADATA_KEYS) {
+    if (metadata[k] !== undefined && metadata[k] !== null) out[k] = metadata[k];
   }
   return out;
 }
@@ -356,6 +370,50 @@ async function consumeContentRef(contentRef: string, userId: string): Promise<vo
   await fsRm(uploadFilePath(userId, contentRef), { force: true }).catch(() => { /* best effort */ });
 }
 
+/** Read the leading bytes of a staged upload for magic-byte detection
+ *  (openarx-contracts-uomv §19.4 — would_save.content_ref.format_detected and the
+ *  dry_run content_ref header check). Returns an empty buffer if unreadable. */
+async function readUploadHead(path: string, n = 16): Promise<Buffer> {
+  const fh = await fsOpen(path, 'r');
+  try {
+    const buf = Buffer.alloc(n);
+    const { bytesRead } = await fh.read(buf, 0, n, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+/** Classify a staged upload by its signature for the would_save echo: ZIP
+ *  (PK\x03\x04), gzip-tar (1f 8b), or PDF (%PDF-); falls back to detectKind's
+ *  text/binary for anything else. Echo-only — never rejects (uomv §19.4). */
+export function detectDraftFormat(head: Buffer): string {
+  if (head.length >= 4 && head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04) return 'zip';
+  if (head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b) return 'gzip-tar';
+  if (head.length >= 5 && head.toString('latin1', 0, 5) === '%PDF-') return 'pdf';
+  return detectKind(head);
+}
+
+/** Resolve + validate a create_draft `previous_document_id` (openarx-contracts-uomv
+ *  §19.2). Shares concept_id resolution with create_new_version (getById →
+ *  conceptId ?? id) and adds the tool-level ownership gate the version chain
+ *  needs: the parent must exist (else document_not_found) and be owned by the
+ *  caller (else not_document_owner). Returns the resolved concept_id. */
+export async function resolveDraftParent(
+  documentStore: { getById(id: string): Promise<{ id: string; conceptId?: string; publisherUserId?: string } | null> },
+  previousDocumentId: string,
+  userId: string,
+): Promise<{ ok: true; conceptId: string } | { ok: false; result: PublishToolResult }> {
+  const parent = await documentStore.getById(previousDocumentId);
+  if (!parent) {
+    return { ok: false, result: skipBilledError('document_not_found', 'previous_document_id does not match any document') };
+  }
+  if (parent.publisherUserId !== userId) {
+    return { ok: false, result: skipBilledError('not_document_owner', 'previous_document_id is not owned by you') };
+  }
+  return { ok: true, conceptId: parent.conceptId ?? parent.id };
+}
+
 /** POST a draft to Portal's agent-create-draft endpoint (openarx-contracts-amc7).
  *  Core forwards content verbatim — no review, no storage. Returns the raw
  *  status + parsed body; status 0 means Portal was unreachable. */
@@ -585,17 +643,28 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       limit: z.number().int().min(1).max(50).default(20).describe('Max results'),
       status: z.enum(STATUS_FILTER_VALUES).default('all').describe('Filter by status; see Status reference in tool description'),
     },
-    async ({ limit, status }) => {
-      // NOTE: not yet user-scoped — lists all source='portal' documents
-      // (per-user filtering via the auth context is a separate concern).
-      const useStatusFilter = status !== 'all';
+    async ({ limit, status }, extra) => {
+      // Scope to the caller's own submissions via publisher_user_id (migration
+      // 030) — the SAME owner column create_draft/create_new_version check
+      // (openarx-f20i: this previously listed ALL source='portal' docs, leaking
+      // every user's submissions and disagreeing with the write-side gate).
+      const portalToken = (extra as unknown as Record<string, unknown>)._portalToken as { userId?: string } | undefined;
+      const userId = portalToken?.userId;
+      if (!userId) return jsonResult({ error: 'user_required', message: 'Publisher token required (userId missing)' });
+
+      const params: unknown[] = [userId, limit];
+      let statusClause = '';
+      if (status !== 'all') {
+        params.push(status);
+        statusClause = `AND d.status = $${params.length}`;
+      }
       const result = await query<{ id: string; oarx_id: string; title: string; status: string; created_at: Date; chunks_count: string }>(
         `SELECT d.id, d.oarx_id, d.title, d.status, d.created_at,
                 (SELECT count(*)::text FROM chunks WHERE document_id = d.id) as chunks_count
          FROM documents d
-         WHERE d.source = 'portal' ${useStatusFilter ? 'AND d.status = $2' : ''}
-         ORDER BY d.created_at DESC LIMIT $1`,
-        useStatusFilter ? [limit, status] : [limit],
+         WHERE d.source = 'portal' AND d.publisher_user_id = $1::uuid ${statusClause}
+         ORDER BY d.created_at DESC LIMIT $2`,
+        params,
       );
 
       return jsonResult({
@@ -860,15 +929,19 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
   server.tool(
     'create_draft',
-    'Create an editable draft in the OpenArx Portal instead of publishing immediately. Returns a draft_id and an edit_url the user can open to review/edit before publishing. Drafts are file-only: first call create_upload_url, PUT your ZIP/PDF, then pass the returned file_id as content_ref. No content review runs and nothing is indexed — this is Portal workflow state, not corpus knowledge (drafts do not appear in get_my_documents).',
+    'Create an editable draft in the OpenArx Portal instead of publishing immediately. Returns a draft_id and an edit_url the user can open to review/edit before publishing. Drafts are file-only: first call create_upload_url, PUT your ZIP/PDF, then pass the returned file_id as content_ref. No content review runs and nothing is indexed — this is Portal workflow state, not corpus knowledge (drafts do not appear in get_my_documents). Optionally bind the draft to an existing document\'s version chain with previous_document_id, or preview with dry_run. The response always echoes a would_save block so you can confirm the server understood your inputs (which metadata keys were recognized, the resolved file details, and the version binding) before anything is published.',
     {
       title: titleField.describe('Draft title'),
       format: z.enum(['latex', 'markdown', 'pdf']).describe('Content format'),
       content_ref: contentRefField.describe('file_id from create_upload_url + PUT. The uploaded ZIP/PDF becomes the draft content (required — drafts are file-only).'),
       metadata: z.record(z.unknown()).optional()
-        .describe('Optional metadata block — same field set as submit_document (authors, abstract, license, funding, coi_statement, data_availability, related_identifiers, embargo_until, hubs, code_links, dataset_links, benchmark_links, doi, arxiv_id, source_url, arxiv_categories, …). Forwarded to the draft verbatim.'),
+        .describe('Optional metadata block — same field set as submit_document (authors, abstract, license, funding, coi_statement, data_availability, related_identifiers, embargo_until, hubs, code_links, dataset_links, benchmark_links, doi, arxiv_id, source_url, arxiv_categories, …). Unrecognized keys are dropped; would_save.metadata echoes exactly the fields the server recognized — a key missing from that echo was a typo or unsupported.'),
+      previous_document_id: z.string().uuid().optional()
+        .describe('Optional. Core document ID of the version this draft revises. When set it must exist AND be owned by you; the draft is then bound to that document\'s concept (version chain). Omit for a standalone draft.'),
+      dry_run: z.boolean().default(false)
+        .describe('Set true to validate inputs without creating the draft: runs the full validation pipeline (schema, previous_document_id ownership, content_ref magic-bytes), writes nothing to the Portal, does NOT consume the content_ref (a later real call with the same content_ref still succeeds), and returns the would_save echo with draft_id and edit_url null. Always free.'),
     },
-    async ({ title, format, content_ref, metadata }, extra) => {
+    async ({ title, format, content_ref, metadata, previous_document_id, dry_run }, extra) => {
       const portalToken = (extra as unknown as Record<string, unknown>)._portalToken as { userId?: string } | undefined;
       const userId = portalToken?.userId;
       if (!userId) return skipBilledError('user_required', 'Publisher token required (userId missing)');
@@ -876,15 +949,53 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       if (!content_ref) {
         return skipBilledError('validation_error', 'content_ref is required — drafts are file-only (create_upload_url → PUT → pass the file_id)');
       }
+
+      // Resolve (read-only — never consumes) the staged upload. Shared by the
+      // dry_run and real paths so validation is identical either way (uomv §19.3).
       const resolved = await resolveContentRef(content_ref, userId);
       if (!resolved.ok) return resolved.result;
+
+      // previous_document_id: ownership gate + concept resolution, evaluated
+      // BEFORE the dry_run branch so would_save reflects the real version binding
+      // and dry_run rejects a bad parent exactly like a real call (uomv §19.2/§19.3).
+      let boundConceptId: string | null = null;
+      if (previous_document_id != null) {
+        const parent = await resolveDraftParent(ctx.documentStore, previous_document_id, userId);
+        if (!parent.ok) return parent.result;
+        boundConceptId = parent.conceptId;
+      }
+
+      // content_ref header check + file details for the would_save echo (uomv §19.4).
+      const head = await readUploadHead(resolved.uploadPath).catch(() => Buffer.alloc(0));
+      const sizeBytes = await fsStat(resolved.uploadPath).then((s) => s.size).catch(() => 0);
+      const originalFilename = format === 'pdf' ? 'upload.pdf' : 'upload.zip';
+
+      // would_save: echo exactly what the server resolved — recognized metadata
+      // only, deterministic filename, detected format, and the validated version
+      // binding. Identical shape on dry_run and real calls (uomv §19.4).
+      const wouldSave = {
+        title,
+        format,
+        metadata: pickDraftMetadata(metadata ?? {}),
+        content_ref: {
+          filename: originalFilename,
+          size_bytes: sizeBytes,
+          format_detected: detectDraftFormat(head),
+        },
+        previous_document_id: previous_document_id ?? null,
+      };
+
+      if (dry_run) {
+        // Validate-only: nothing staged, no Portal call, content_ref left
+        // reusable (NOT consumed — xuqi upload lifecycle preserved). Free.
+        return skipBilling(jsonResult({ draft_id: null, edit_url: null, would_save: wouldSave }));
+      }
 
       // Stage the uploaded bytes VERBATIM (binary-safe copy — never a UTF-8 read,
       // which corrupted ZIP/PDF uploads before w7um D5) into a deterministic
       // draft dir on shared storage. draft_id is minted Core-side so the target
       // path is known before Portal responds; Portal reads from storage_path.
       const draftId = crypto.randomUUID();
-      const originalFilename = format === 'pdf' ? 'upload.pdf' : 'upload.zip';
       const draftDir = pathJoin(PORTAL_STORAGE, 'drafts', userId, draftId);
       const storagePath = pathJoin(draftDir, originalFilename);
       try {
@@ -903,6 +1014,11 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         storage_path: storagePath,
         original_filename: originalFilename,
         metadata: metadata ?? {},
+        // Version-chain binding (uomv §19.2): pass BOTH so Portal atrj can persist
+        // the lineage; omitted entirely for standalone drafts.
+        ...(previous_document_id != null
+          ? { previous_document_id, concept_id: boundConceptId }
+          : {}),
       });
       if (status < 200 || status >= 300) {
         // Portal rejected — drop the staged copy so the content_ref stays
@@ -921,7 +1037,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
       const editUrl = (b.edit_url as string | undefined) ?? `${PORTAL_PUBLIC_URL}/portal/drafts/${returnedDraftId}`;
       // Free tool — never deduct credits (the billable event is publishing, not drafting).
-      return skipBilling(jsonResult({ draft_id: returnedDraftId, edit_url: editUrl }));
+      return skipBilling(jsonResult({ draft_id: returnedDraftId, edit_url: editUrl, would_save: wouldSave }));
     },
   );
 }
