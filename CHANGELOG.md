@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] — 2026-06-18
+
+Ingest pipeline reliability and cost fix. No API or tool changes.
+
+### Fixed
+- **Chunker JSON escape repair**: the chunking step now repairs, content-safely,
+  base-model responses that emit a single backslash before a non-escape character
+  (common in LaTeX/math such as `\hat`, `\Delta`, `\{`). Previously these made
+  `JSON.parse` fail and forced an expensive fallback retry on a larger model. The
+  repair doubles only the backslashes that form an invalid JSON escape, leaving
+  valid escapes (`\"`, `\\`, `\n`, `\uXXXX`) and already-correct `\\command`
+  sequences untouched — so LaTeX content is preserved exactly. This sharply reduces
+  fallback retries on LaTeX-heavy batches.
+
 ## [0.1.7] — 2026-06-16
 
 Publishing fixes and review-grounding accuracy, plus draft version-chaining.
