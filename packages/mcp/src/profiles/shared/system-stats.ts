@@ -29,10 +29,15 @@ interface UserStats {
 }
 
 const GOV_STATS_ZERO: GovStats = {
-  total_agents: 0, total_initiatives: 0, active_initiatives: 0, total_votes_cast: 0,
+  total_agents: 0,
+  total_initiatives: 0,
+  active_initiatives: 0,
+  total_votes_cast: 0,
 };
 const USER_STATS_ZERO: UserStats = {
-  total_registered: 0, total_api_tokens: 0, total_mcp_requests_30d: 0,
+  total_registered: 0,
+  total_api_tokens: 0,
+  total_mcp_requests_30d: 0,
 };
 
 async function fetchGovStats(): Promise<GovStats> {
@@ -45,7 +50,7 @@ async function fetchGovStats(): Promise<GovStats> {
       console.warn(`[system-stats] gov-stats HTTP ${resp.status}, using zeros`);
       return GOV_STATS_ZERO;
     }
-    const data = await resp.json() as Partial<GovStats>;
+    const data = (await resp.json()) as Partial<GovStats>;
     return {
       total_agents: Number(data.total_agents ?? 0),
       total_initiatives: Number(data.total_initiatives ?? 0),
@@ -53,7 +58,9 @@ async function fetchGovStats(): Promise<GovStats> {
       total_votes_cast: Number(data.total_votes_cast ?? 0),
     };
   } catch (err) {
-    console.warn(`[system-stats] gov-stats fetch failed: ${err instanceof Error ? err.message : err}`);
+    console.warn(
+      `[system-stats] gov-stats fetch failed: ${err instanceof Error ? err.message : err}`,
+    );
     return GOV_STATS_ZERO;
   }
 }
@@ -68,14 +75,16 @@ async function fetchUserStats(): Promise<UserStats> {
       console.warn(`[system-stats] user-stats HTTP ${resp.status}, using zeros`);
       return USER_STATS_ZERO;
     }
-    const data = await resp.json() as Partial<UserStats>;
+    const data = (await resp.json()) as Partial<UserStats>;
     return {
       total_registered: Number(data.total_registered ?? 0),
       total_api_tokens: Number(data.total_api_tokens ?? 0),
       total_mcp_requests_30d: Number(data.total_mcp_requests_30d ?? 0),
     };
   } catch (err) {
-    console.warn(`[system-stats] user-stats fetch failed: ${err instanceof Error ? err.message : err}`);
+    console.warn(
+      `[system-stats] user-stats fetch failed: ${err instanceof Error ? err.message : err}`,
+    );
     return USER_STATS_ZERO;
   }
 }
@@ -88,7 +97,16 @@ const CACHE_TTL_MS = 60_000;
 async function fetchStats(ctx: AppContext): Promise<unknown> {
   if (cachedStats && Date.now() < cacheExpiresAt) return cachedStats;
 
-  const [docStats, chunkStats, coverageStats, pipelineStats, avgCost, qdrantPoints, govStats, userStats] = await Promise.all([
+  const [
+    docStats,
+    chunkStats,
+    coverageStats,
+    pipelineStats,
+    avgCost,
+    qdrantPoints,
+    govStats,
+    userStats,
+  ] = await Promise.all([
     // documents_indexed, documents_ready, by indexing tier.
     // Soft-deleted docs must NOT count (contracts/document_soft_delete.md §2)
     // — public counters reflect reachable-to-search documents only.
@@ -103,8 +121,11 @@ async function fetchStats(ctx: AppContext): Promise<unknown> {
     ),
     // chunks breakdown by lifecycle status (openarx-q2eh)
     ctx.pool.query<{
-      total: string; indexed: string; indexed_partial: string;
-      embedded: string; pending_embed: string;
+      total: string;
+      indexed: string;
+      indexed_partial: string;
+      embedded: string;
+      pending_embed: string;
     }>(
       `SELECT
          count(*)::text as total,
@@ -114,9 +135,10 @@ async function fetchStats(ctx: AppContext): Promise<unknown> {
          count(*) FILTER (WHERE status = 'pending_embed')::text as pending_embed
          FROM chunks`,
     ),
-    // coverage date range
+    // coverage date range — derived from the per-document registry (coverage_map removed)
     ctx.pool.query<{ min_date: string | null; max_date: string | null }>(
-      `SELECT min(date)::text as min_date, max(date)::text as max_date FROM coverage_map WHERE source = 'arxiv'`,
+      `SELECT min(published_at)::date::text as min_date, max(published_at)::date::text as max_date
+         FROM documents WHERE source = 'arxiv' AND published_at IS NOT NULL`,
     ),
     // pipeline runs
     ctx.pool.query<{ total: string; last_status: string | null; last_date: Date | null }>(
@@ -138,9 +160,12 @@ async function fetchStats(ctx: AppContext): Promise<unknown> {
       try {
         const headers: Record<string, string> = {};
         if (QDRANT_API_KEY) headers['api-key'] = QDRANT_API_KEY;
-        const resp = await fetch(`${QDRANT_URL}/collections/chunks`, { headers, signal: AbortSignal.timeout(5000) });
+        const resp = await fetch(`${QDRANT_URL}/collections/chunks`, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
         if (!resp.ok) return 0;
-        const data = await resp.json() as { result?: { points_count?: number } };
+        const data = (await resp.json()) as { result?: { points_count?: number } };
         return data.result?.points_count ?? 0;
       } catch {
         return 0;
@@ -167,9 +192,10 @@ async function fetchStats(ctx: AppContext): Promise<unknown> {
       chunks_embedded: parseInt(chunkStats.rows[0]?.embedded ?? '0', 10),
       chunks_pending_embed: parseInt(chunkStats.rows[0]?.pending_embed ?? '0', 10),
       qdrant_points: qdrantPoints,
-      coverage_date_range: coverage?.min_date && coverage?.max_date
-        ? `${coverage.min_date} — ${coverage.max_date}`
-        : null,
+      coverage_date_range:
+        coverage?.min_date && coverage?.max_date
+          ? `${coverage.min_date} — ${coverage.max_date}`
+          : null,
       categories: ['cs.AI', 'cs.CL', 'cs.LG'],
     },
     pipeline: {

@@ -28,6 +28,7 @@ import type { AppContext } from './context.js';
 import { handlePublishDocument } from './publish-document.js';
 import { handleUserDocuments } from './user-documents.js';
 import { resolveConceptLatest } from './concept-latest.js';
+import { methodology as methodistMethodology } from './profiles/methodist-v2/assets/content.js';
 import type { SearchResult, Document } from '@openarx/types';
 import type { BM25Result, ReportTier } from '@openarx/api';
 import {
@@ -37,6 +38,8 @@ import {
   getAllReviewVersions,
   patchLatestReviewTier,
   query,
+  neoGraphCounts,
+  Layer2VectorStore,
 } from '@openarx/api';
 import { isOpenLicense } from '@openarx/ingest';
 import type { SpdxLicense } from '@openarx/ingest';
@@ -621,6 +624,9 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     void handleUserDocuments(req, res, ctx);
   });
 
+  // (/layer2/user-records REMOVED with the PG-graph teardown — openarx-1woy: it queried the
+  //  dropped PG layer2 record tables. Portal portfolio moves to a Neo4j-backed reader.)
+
   // ── GET /concept-latest — latest version in a concept, owner-scoped. Powers
   //    Portal's §19 stale-parent check (openarx-portal-atrj / bead openarx-yurz). ──
   router.get('/concept-latest', async (req: Request, res: Response) => {
@@ -628,6 +634,41 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     const userId = typeof req.query.user_id === 'string' ? req.query.user_id : '';
     const { status, body } = await resolveConceptLatest(ctx.pool, conceptId, userId);
     res.status(status).json(body);
+  });
+
+  // ── GET /methodist-graph-counts — live cheap graph counts for the Console methodist stats
+  //    page (openarx-694n): Neo4j node counts by label + relationship counts by type (native,
+  //    ~O(1)) + the Qdrant layer2_claims point count. Heavy claim breakdowns go via the rollup. ──
+  router.get('/methodist-graph-counts', async (_req: Request, res: Response) => {
+    try {
+      const [graph, qdrantCount] = await Promise.all([
+        neoGraphCounts(),
+        new Layer2VectorStore().countPoints().catch(() => 0),
+      ]);
+      res.json({ nodes: graph.nodes, edges: graph.edges, qdrant: { layer2_claims: qdrantCount } });
+    } catch (e) {
+      res.status(500).json({ error: 'methodist_graph_counts_failed', message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  // ── GET /methodist-version-passport — the deployed methodology's version + structural summary
+  //    (Console 694n, A1/A7): methodology_version, procedure names, the _process run-mechanics
+  //    (cycle/stage structure, e.g. final_stage_by_cycle), and output-schema names. The PEDAGOGICAL
+  //    profile (TRIZ tools/patches/learning-ladder) lives in the methodology CORPUS (prompts._corpus,
+  //    unstructured) — the methodist owns that detailed version passport. ──
+  router.get('/methodist-version-passport', (_req: Request, res: Response) => {
+    const m = methodistMethodology as unknown as {
+      methodology_version?: string;
+      procedures?: Array<{ name?: string }>;
+      schemas?: Record<string, unknown>;
+      _process?: unknown;
+    };
+    res.json({
+      methodology_version: m.methodology_version ?? null,
+      procedures: (m.procedures ?? []).map((p) => p.name).filter((n): n is string => typeof n === 'string'),
+      process: m._process ?? null,
+      schemas: Object.keys(m.schemas ?? {}),
+    });
   });
 
   router.post('/content-review', async (req: Request, res: Response) => {

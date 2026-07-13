@@ -37,6 +37,14 @@ export interface IngestCommand {
    *  downloaded backlog only. Replaces the old implicit Step 0 + the
    *  pending_only direction. */
   downloadedFirst?: boolean;
+  /** Re-index abstract_only documents that agents have REQUESTED (full-content
+   *  demand SUM(get_document_count) > 1) to FULL. A separate stage AFTER the
+   *  downloaded_first backlog, BEFORE new-doc indexing: each such doc is claimed
+   *  one-at-a-time atomically (marked downloaded + forced indexing_tier='full') and
+   *  fed into the parallel pipeline. Set alone (no dates) = process this backlog
+   *  only. Default false. (indexing_tier is an economic PRIORITY signal, not a
+   *  restriction — re-indexing deferred abstract_only docs to full is normal.) */
+  reindexRequestedFirst?: boolean;
   strategy?: IngestStrategy;
   /** When true, runner workers pass {bypassCache: true} to every
    *  embed-service call. Useful for backfills where each chunk text
@@ -71,10 +79,6 @@ export interface StatusCommand {
   type: 'status';
 }
 
-export interface CoverageCommand {
-  type: 'coverage';
-}
-
 export interface HistoryCommand {
   type: 'history';
   limit: number;
@@ -98,7 +102,6 @@ export type RunnerCommand =
   | RegistryUpdateCommand
   | StopCommand
   | StatusCommand
-  | CoverageCommand
   | HistoryCommand
   | AuditCommand
   | DoctorCommand;
@@ -153,18 +156,5 @@ export interface AuditResult {
     dbCount: number;
     missing: number;
     downloaded: number;
-  }>;
-}
-
-export interface CoverageResult {
-  source: string;
-  forwardCursor: string | null;
-  backfillCursor: string | null;
-  totalPapers: number;
-  runs: Array<{
-    direction: string;
-    dateFrom: string | null;
-    dateTo: string | null;
-    docsProcessed: number;
   }>;
 }

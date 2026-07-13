@@ -462,6 +462,14 @@ export interface ModelResponse {
   provider?: string;
   inputTokens: number;
   outputTokens: number;
+  /**
+   * Context-cache hit: the subset of `inputTokens` served from cache (Gemini
+   * `usageMetadata.cachedContentTokenCount`). Implicit caching (auto on Gemini 2.5+/3.x
+   * for a repeated leading prefix ≥ the model's min-token threshold) bills these at a ~90%
+   * discount, so `cost` below already reflects the discount. 0 / absent when nothing hit the
+   * cache. The cache-ROI signal (2h): cachedTokens / inputTokens = the prefix hit-rate.
+   */
+  cachedTokens?: number;
   cost: number;
   finishReason?: string; // 'STOP' | 'MAX_TOKENS' | 'SAFETY' | etc.
 }
@@ -641,3 +649,7 @@ export interface SourceRegistryStore {
   /** Reload cache from DB. Use after source_registry edits. */
   refresh(): Promise<void>;
 }
+
+// ── Layer 2 — Claims & Relations Pillar ──
+export * from './layer2.js';
+export * from './layer2-hash.js';

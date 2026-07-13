@@ -33,7 +33,7 @@ export { computeQualityMetrics } from './lib/quality-metrics.js';
 
 // Content review — aspect 1 (spam screen) for Portal publish gate
 // (contracts/content_review.md / openarx-contracts-4pd)
-export { runSpamScreen, parseLlmResponse as parseSpamScreenLlmResponse } from './pipeline/review/spam-screen.js';
+export { runSpamScreen, runDeterministicScreen, parseLlmResponse as parseSpamScreenLlmResponse } from './pipeline/review/spam-screen.js';
 export type {
   SpamVerdict as SpamScreenVerdict,
   SpamReason as SpamScreenReason,

@@ -32,6 +32,13 @@ const COST_PER_MILLION: Record<string, { input: number; output: number }> = {
   'gemini-2.5-flash-preview-05-20': { input: 0.15, output: 0.60 },
 };
 
+// 2h context-cache (gs21): input tokens that hit the cache (usageMetadata.cachedContentTokenCount)
+// are billed at a ~90% discount (Gemini docs: "context caching helps reduce input costs by
+// offering a 90% discount"; implicit caching carries no storage fee). So a cached token costs
+// 0.10× the model's input rate. Applied per-call to keep cost tracking honest when the shared
+// methodology prefix is served from cache. Subject to billing reconciliation.
+const CACHED_INPUT_RATE_MULTIPLIER = 0.1;
+
 export interface VertexLlmConfig {
   apiKey?: string;
   serviceAccountKeyFile?: string;
@@ -49,6 +56,9 @@ interface VertexResponse {
     promptTokenCount: number;
     candidatesTokenCount: number;
     totalTokenCount: number;
+    // 2h: the subset of promptTokenCount served from the context cache (implicit or explicit).
+    // Present only when a cache hit occurred; absent → 0.
+    cachedContentTokenCount?: number;
   };
   // Present (instead of candidates) when the prompt is blocked by a safety /
   // recitation filter — Vertex returns promptFeedback with a blockReason and
@@ -201,14 +211,24 @@ export class VertexLlm {
       ?? (!result.candidates?.length ? `BLOCKED:${result.promptFeedback?.blockReason ?? 'no_candidates'}` : undefined);
     const inputTokens = result.usageMetadata?.promptTokenCount ?? 0;
     const outputTokens = result.usageMetadata?.candidatesTokenCount ?? 0;
+    // 2h: cachedTokens is a SUBSET of promptTokenCount (the input tokens served from cache).
+    // Clamp to inputTokens defensively so the uncached remainder can never go negative.
+    const cachedTokens = Math.min(result.usageMetadata?.cachedContentTokenCount ?? 0, inputTokens);
     const rates = COST_PER_MILLION[model] ?? { input: 0.075, output: 0.30 };
-    const cost = (inputTokens * rates.input + outputTokens * rates.output) / 1_000_000;
+    // Split input billing: uncached tokens at the full rate, cached at the discounted rate.
+    // With cachedTokens=0 (no hit) this is identical to the previous full-price formula.
+    const uncachedInput = inputTokens - cachedTokens;
+    const cost =
+      (uncachedInput * rates.input +
+        cachedTokens * rates.input * CACHED_INPUT_RATE_MULTIPLIER +
+        outputTokens * rates.output) /
+      1_000_000;
 
     if (finishReason === 'MAX_TOKENS') {
       console.warn(`[vertex:${this.authMode}] Output truncated (MAX_TOKENS): ${inputTokens} in → ${outputTokens} out, model=${model}`);
     }
 
-    return { text, model, provider: 'vertex', inputTokens, outputTokens, cost, finishReason };
+    return { text, model, provider: 'vertex', inputTokens, outputTokens, cachedTokens, cost, finishReason };
   }
 
   private async callApi(

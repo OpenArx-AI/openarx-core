@@ -32,6 +32,8 @@
     "test:parse-strategy-extract": "node --test --import tsx src/parsers/__tests__/parse-strategy-extract.test.ts",
     "test:listed-registry": "node --test --import tsx src/lib/__tests__/listed-registry.test.ts",
     "test:download-rmw": "node --test --import tsx src/lib/__tests__/download-rmw.test.ts",
+    "test:run-lock": "node --experimental-test-module-mocks --test --import tsx src/runner/run-lock.test.ts",
+    "test:benchmark": "node --test --import tsx src/pipeline/enricher/__tests__/benchmark-extractor.test.ts",
     "runner": "node dist/scripts/runner.js",
     "cli": "node dist/scripts/cli.js"
   },

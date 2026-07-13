@@ -1,0 +1,33 @@
+{
+  "name": "@openarx/methodist",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Methodist pipeline lower layer: primitive runtime (Phase 2A) + ~30 primitives (Phase 2B) + schema-blind interpreter. Graduated from the isolated lab into the workspace (Phase 2 integration) so the MCP door surface can call the door-engine as typed project code.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testkit": {
+      "types": "./dist/testkit/index.d.ts",
+      "import": "./dist/testkit/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.spec.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "canonicalize": "^2.0.0"
+  }
+}

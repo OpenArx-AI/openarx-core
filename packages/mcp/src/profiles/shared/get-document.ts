@@ -2,7 +2,15 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { ChunkContext } from '@openarx/types';
 import type { AppContext } from '../../context.js';
-import { jsonResult, formatDoc, truncateChunk, computeIndexingLimitation, computeCanServeFile } from './helpers.js';
+import {
+  jsonResult,
+  formatDoc,
+  truncateChunk,
+  computeIndexingLimitation,
+  computeCanServeFile,
+  computeSourceAccessibility,
+  effectiveIndexingTier,
+} from './helpers.js';
 import { loadCachedSearchPool } from './search-helpers.js';
 
 const CONTENT_TYPE_ENUM = z.enum([
@@ -21,7 +29,7 @@ interface ChunkRow {
 export function registerGetDocument(server: McpServer, ctx: AppContext): void {
   server.tool(
     'get_document',
-    "Retrieve full paper details by ID. Default returns metadata only (title, authors, abstract, license, codeLinks counts) — use includeChunks=true to fetch chunk content. For specific sections or content types, use chunkContentTypes/section filters or call get_chunks instead. For long papers, prefer filtered chunk retrieval over full chunks dump.",
+    "Retrieve full paper details by ID. Default returns metadata only (title, authors, abstract, license, codeLinks counts) — use includeChunks=true to fetch chunk content. For specific sections or content types, use chunkContentTypes/section filters or call get_chunks instead. For long papers, prefer filtered chunk retrieval over full chunks dump. AVAILABILITY is two INDEPENDENT axes: indexingTier (none|abstract_only|full) = whether the full text is indexed and readable via get_chunks (chunkCount shows how many); sourceAccessibility (served_by_us|external_link_only|unavailable) = how to obtain the raw source file, with sourceUrl returned whenever known. To read content: if indexingTier='full' use get_chunks; else if sourceAccessibility!='unavailable' fetch sourceUrl yourself; only 'unavailable' means no full text. canServeFile is DEPRECATED — it gates raw-PDF delivery ONLY and is NOT a content-availability signal; use indexingTier + sourceAccessibility.",
     {
       id: z.string().optional().describe('Document UUID'),
       arxivId: z.string().optional().describe('arXiv ID (e.g. 1706.03762)'),
@@ -67,7 +75,15 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
       // Implicit: chunkContentTypes set → user wants chunks
       const wantChunks = includeChunks || (chunkContentTypes && chunkContentTypes.length > 0);
 
-      const docFormatted = formatDocByDetail(doc, detail);
+      // Total indexed chunk count — drives the document's chunkCount/indexingTier
+      // fields and is surfaced at the response root (totalChunks). Computed once.
+      const totalChunksRes = await ctx.pool.query<{ count: string }>(
+        `SELECT count(*)::text FROM chunks WHERE document_id = $1 AND is_latest = true`,
+        [doc.id],
+      );
+      const totalChunks = parseInt(totalChunksRes.rows[0]?.count ?? '0', 10);
+
+      const docFormatted = formatDocByDetail(doc, detail, totalChunks);
 
       const response: Record<string, unknown> = {
         document: docFormatted,
@@ -143,12 +159,8 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
         response.chunkOrder = importanceOrder ? 'importance' : 'position';
         if (importanceFallbackReason) response.chunkOrderNote = importanceFallbackReason;
 
-        // Total chunk count (independent of filter)
-        const totalRes = await ctx.pool.query<{ count: string }>(
-          `SELECT count(*)::text FROM chunks WHERE document_id = $1 AND is_latest = true`,
-          [doc.id],
-        );
-        response.totalChunks = parseInt(totalRes.rows[0]?.count ?? '0', 10);
+        // Total chunk count (independent of filter) — reuse the early count.
+        response.totalChunks = totalChunks;
         response.matchedChunks = rows.length;
 
         // Soft-filter telemetry: when a contentType filter is active, surface
@@ -162,11 +174,7 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
       } else {
         // Metadata-only path — surface helpful counts so agents don't
         // need a follow-up call to know whether body content exists
-        const cntRes = await ctx.pool.query<{ count: string }>(
-          `SELECT count(*)::text FROM chunks WHERE document_id = $1 AND is_latest = true`,
-          [doc.id],
-        );
-        response.totalChunks = parseInt(cntRes.rows[0]?.count ?? '0', 10);
+        response.totalChunks = totalChunks;
         response.hasCode = doc.codeLinks.length > 0;
         response.hasDatasets = doc.datasetLinks.length > 0;
         response.hasBenchmarks = doc.benchmarkResults.length > 0;
@@ -184,6 +192,7 @@ export function registerGetDocument(server: McpServer, ctx: AppContext): void {
 function formatDocByDetail(
   doc: import('@openarx/types').Document,
   detail: 'minimal' | 'standard' | 'full',
+  chunkCount?: number,
 ): Record<string, unknown> {
   if (detail === 'minimal') {
     return {
@@ -197,7 +206,7 @@ function formatDocByDetail(
   if (detail === 'full') {
     // Identical to legacy formatDoc — preserves existing v1 shape for
     // callers needing complete metadata.
-    return formatDoc(doc);
+    return formatDoc(doc, chunkCount);
   }
 
   // standard — trim multi-source map, full author records, externalIds
@@ -212,7 +221,16 @@ function formatDocByDetail(
     sourceUrl: doc.sourceUrl,
     sourceId: doc.sourceId,
     license: doc.license ?? null,
-    indexingTier: doc.indexingTier ?? 'full',
+    // Two orthogonal availability axes (openarx-5xve): indexingTier = is the
+    // full text indexed & retrievable via get_chunks; sourceAccessibility = how
+    // the raw source can be obtained. They are independent — a doc can be
+    // indexingTier='full' + sourceAccessibility='external_link_only'.
+    indexingTier:
+      chunkCount !== undefined ? effectiveIndexingTier(doc, chunkCount) : (doc.indexingTier ?? 'full'),
+    sourceAccessibility: computeSourceAccessibility(doc),
+    ...(chunkCount !== undefined ? { chunkCount } : {}),
+    // DEPRECATED: raw-PDF delivery gate ONLY; NOT a content-availability signal.
+    // Equals sourceAccessibility==='served_by_us'. Use sourceAccessibility.
     canServeFile: computeCanServeFile(doc),
     indexingLimitedBy: limitation?.limitedBy ?? null,
     indexingLimitedNote: limitation?.note ?? null,

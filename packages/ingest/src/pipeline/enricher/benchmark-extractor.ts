@@ -49,6 +49,63 @@ const METRIC_KEYWORDS = [
 
 const RESULTS_SECTION_RE = /\b(experiment|result|evaluation|benchmark|ablation)\b/i;
 
+// Stub / placeholder dataset labels that must NOT be emitted as a real dataset
+// name. Two literals seen in the wild (openarx-9kv0): GROBID table-caption
+// fallback ("Table 2 :") and the LLM's "Not specified" placeholder.
+const DATASET_STUB_RE = /^(?:table\s*\d*\s*[:.]?|not\s*specified|n\.?\/?a\.?|unknown|none|[-–—]+)$/i;
+
+export function isStubDataset(s: string | null | undefined): boolean {
+  const t = s?.trim();
+  if (!t) return true;
+  return DATASET_STUB_RE.test(t);
+}
+
+// Word-boundary (non-alphanumeric delimited) matcher for metric-column headers.
+// Replaces the old `header.includes(metric)` substring test, which false-matched
+// short tokens like 'em' (exact-match) INSIDE ordinary words — "M-em-ory",
+// "T-em-poral", "PerM-em", "Emb-odied" — turning task/benchmark-name columns into
+// bogus metric columns with a glued header as the "metric" (openarx-9kv0).
+const METRIC_RE = new RegExp(
+  '(?<![a-z0-9])(?:' +
+    METRIC_KEYWORDS.slice()
+      .sort((a, b) => b.length - a.length) // longest alternative first
+      .map((k) =>
+        k
+          .toLowerCase()
+          .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') // escape regex metachars
+          .replace(/\s+/g, '\\s+'),
+      )
+      .join('|') +
+    ')(?![a-z0-9])',
+  'i',
+);
+
+/** True when a header names a recognized metric as a whole token (not a substring). */
+export function headerHasMetric(header: string): boolean {
+  return METRIC_RE.test(header);
+}
+
+/** Parse a single benchmark score cell ("95.2%", "**95.2**", "2,202", "0.41 ± 0.1"). */
+export function parseScoreCell(cell: string | undefined): number {
+  if (!cell) return NaN;
+  const cleaned = cell.replace(/[*%±,]/g, '').trim().split(/\s+/)[0];
+  return parseFloat(cleaned);
+}
+
+/** A metric column must hold numbers in the majority of its data rows. Guards the
+ *  malformed-table case where a glued/misaligned header sits over a text column. */
+export function columnIsNumeric(rows: string[][], index: number): boolean {
+  let numeric = 0;
+  let total = 0;
+  for (const row of rows) {
+    const cell = row[index];
+    if (cell === undefined || cell.trim() === '') continue;
+    total++;
+    if (!Number.isNaN(parseScoreCell(cell))) numeric++;
+  }
+  return total > 0 && numeric / total >= 0.5;
+}
+
 export class BenchmarkExtractor {
   async extract(
     parsed: ParsedDocument,
@@ -96,37 +153,38 @@ export class BenchmarkExtractor {
     for (const table of tables) {
       if (table.headers.length < 2 || table.rows.length === 0) continue;
 
-      // Find metric columns by matching header names against known metrics
+      // Find metric columns: header names a recognized metric AS A TOKEN (not a
+      // substring) AND the column actually holds numbers in most rows.
       const metricCols: Array<{ index: number; metric: string }> = [];
       const datasetCol = this.findDatasetColumn(table.headers);
       const taskCol = this.findColumn(table.headers, ['task']);
 
       for (let i = 0; i < table.headers.length; i++) {
-        const header = table.headers[i].toLowerCase().trim();
-        for (const metric of METRIC_KEYWORDS) {
-          if (header.includes(metric.toLowerCase())) {
-            metricCols.push({ index: i, metric: table.headers[i].trim() });
-            break;
-          }
+        if (i === datasetCol || i === taskCol) continue;
+        const header = table.headers[i].trim();
+        if (headerHasMetric(header) && columnIsNumeric(table.rows, i)) {
+          metricCols.push({ index: i, metric: header });
         }
       }
 
       if (metricCols.length === 0) continue;
 
+      // Dataset: prefer an explicit dataset column; else fall back to the caption
+      // with any "Table N :" prefix stripped. Reject stub labels outright.
+      const captionDataset = (table.caption ?? '')
+        .replace(/^\s*table\s*\d*\s*[:.]?\s*/i, '')
+        .trim();
+
       for (const row of table.rows) {
-        const dataset = datasetCol >= 0 ? row[datasetCol]?.trim() : (table.caption ?? '');
+        const colDataset = datasetCol >= 0 ? row[datasetCol]?.trim() : '';
+        const dataset = colDataset && !isStubDataset(colDataset) ? colDataset : captionDataset;
         const task = taskCol >= 0 ? row[taskCol]?.trim() : '';
 
-        if (!dataset) continue;
+        if (isStubDataset(dataset)) continue;
 
         for (const { index, metric } of metricCols) {
-          const scoreStr = row[index]?.trim();
-          if (!scoreStr) continue;
-
-          // Extract numeric value (handle "95.2%", "95.2 ± 0.1", bold "**95.2**")
-          const cleaned = scoreStr.replace(/[*%±]/g, '').trim().split(/\s/)[0];
-          const score = parseFloat(cleaned);
-          if (isNaN(score)) continue;
+          const score = parseScoreCell(row[index]);
+          if (Number.isNaN(score)) continue;
 
           results.push({
             task: task || '',
@@ -226,7 +284,13 @@ Return ONLY the JSON array, no other text.`;
       if (!Array.isArray(parsed)) return [];
 
       return parsed
-        .filter((r) => r.dataset && r.metric && typeof r.score === 'number')
+        .filter(
+          (r) =>
+            r.dataset &&
+            r.metric &&
+            typeof r.score === 'number' &&
+            !isStubDataset(r.dataset),
+        )
         .map((r) => ({
           task: r.task ?? '',
           dataset: r.dataset!,

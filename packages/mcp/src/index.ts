@@ -5,19 +5,48 @@ import express, { Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createContext } from './context.js';
+import { createContext, type AppContext } from './context.js';
 import { getProfile, getAllProfiles } from './profiles/registry.js';
 import { isTokenTypeSufficient } from './profiles/types.js';
+import { roleFor, V4_ROLES, type V4Role } from './profiles/v4/index.js';
+import { logMethodistToolCall } from '@openarx/api';
+import { requiredScope, SCOPE_READ, SCOPE_METHODIST } from './profiles/scopes.js';
 import { registerInternalRoutes } from './internal-routes.js';
 import { registerUploadRoutes } from './upload-routes.js';
 import { registerAdminRoutes } from './admin-routes.js';
-import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, type TokenInfo } from './portal-auth.js';
+import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, applyPublishRefund, credentialFromToken, type PublishRefundOp, type TokenInfo } from './portal-auth.js';
 import { logRequest, extractResultSummary } from './request-logger.js';
 import { getCostKey, isDryRunCall } from './cost-key.js';
 import { resolveAgentId, getAgentReputation, getAgentTier } from './gov-identity.js';
 import { UsageTracker, withUsageTracker } from './lib/usage-tracker.js';
 import { incrementCallCounters } from './lib/cost-counters.js';
 import { startRollupTimer } from './lib/cost-rollup.js';
+import { incrementDemand, demandDocId } from './lib/demand-counters.js';
+import { startDemandRollupTimer } from './lib/demand-rollup.js';
+import { startMethodistRollupTimer } from './lib/methodist-rollup.js';
+
+// openarx-1mu1 (apfh follow-up): the anti-gaming tool-log records a researcher's WORK-tool calls
+// so the checkpoint crosscheck reconciles claimed_usage. The methodist MECHANISM doors are NOT
+// work-tools the agent chose (the single `methodist` model door = the checkpoint/diagnose/ask
+// mechanism; report_need/escalate/get_current_dose/get_my_development = protocol plumbing) — excluded,
+// else the agent would have to claim them. BUT the methodist_* READ-doors (get/find/search/
+// explore_topic, §12.5 scientific-reads) ARE chosen research tools (reading the layer-2 graph, like
+// search/get_document) → they MUST be logged, else a genuine methodist_search/find is false-flagged
+// as fabrication (claimed_not_logged) — the catch-22 that blocked the mandated c8 layer-2 probe.
+// So exclude ONLY the mechanism doors; log everything else (Layer-1 tools AND the methodist_* reads).
+const METHODIST_MECHANISM_DOORS = new Set([
+  'methodist',
+  'methodist_get_current_dose',
+  'methodist_report_need',
+  'methodist_escalate',
+  'methodist_get_my_development',
+]);
+
+// Layer2 PG-graph consumers removed with the PG→Neo4j teardown (openarx-1woy): the embed
+// worker (PG layer2_claims → Qdrant) + the §7.6 dedup consumer operated on the dropped
+// layer2_* tables. The methodist path now writes claim vectors DIRECTLY to Qdrant (2c), and
+// Neo4j is the canonical graph. The Qdrant Layer2VectorStore + buildClaimProjection stay
+// (reused by 2c). Full worker/consumer FILE removal is a staged follow-up (openarx-1woy).
 import { initLegalVersions } from './lib/legal-versions.js';
 
 /**
@@ -109,14 +138,23 @@ async function main(): Promise<void> {
     res.json({ status: 'ok', profiles: getAllProfiles().map((p) => p.id), redis });
   });
 
+  // The live surface is the v4 role model (mcp_profiles_v4): two roles, gated by
+  // token_type, no scopes. The v3 profiles remain as superseded compatibility
+  // endpoints (not advertised — no v3 tokens exist post-cutover).
+  const V4_ROLE_DESCRIPTIONS: Record<string, string> = {
+    researcher:
+      "The researcher role — the scientist's pass: document search + read, document publishing, the scientific graph read (get/find/search/explore_topic), and the methodist door group. Access is by role (token_type=researcher); scopes are abolished. Direct Layer-2 graph writes are NOT an agent surface — publication is a checkpoint consequence.",
+    governance:
+      'The governance role — membership, voting and governance, plus corpus read. Access is by role (token_type=governance). Distinct civic pass; no methodist doors.',
+  };
   app.get('/versions', (_req: Request, res: Response) => {
-    const profiles = getAllProfiles().map((p) => ({
-      id: p.id,
-      name: p.name,
-      description: p.description,
-      version: p.version,
-      url: `/${p.id}/mcp`,
-      min_token_type: p.minTokenType,
+    const profiles = Object.values(V4_ROLES).map((r) => ({
+      id: r.token_type,
+      name: r.name,
+      description: V4_ROLE_DESCRIPTIONS[r.token_type] ?? r.name,
+      version: r.version,
+      url: `/${r.token_type}/mcp`,
+      token_type: r.token_type,
     }));
     res.json({ profiles });
   });
@@ -269,10 +307,22 @@ async function main(): Promise<void> {
       ? new RedisStoreClass({ prefix: `rl:${name}:`, sendCommand: (...args: string[]) => redis.call(args[0], ...args.slice(1)) as never })
       : undefined,
     keyGenerator,
-    message: { error: 'rate_limited', message: `Too many requests (limit: ${max}/min)` },
+    // N-7 (§7.7): a 429 is a RETRYABLE throttle, never an auth failure. Shape it so
+    // a client cannot confuse it with token expiry — a distinct `rate_limited` code,
+    // an explicit `retryable` flag, and a Retry-After hint. (Batch/audit enumeration
+    // is a supported pattern: the global list/enumerate reads page 200 at a time, so
+    // a full-graph audit is a handful of calls, comfortably within the per-user window.)
+    message: { error: 'rate_limited', retryable: true, message: `Rate limit exceeded (${max}/min) — transient throttle, retry shortly; do NOT re-authenticate.` },
     handler: (_req, res) => {
       log(`Rate limit hit: ${name}`);
-      res.status(429).json({ error: 'rate_limited', message: `Too many requests (limit: ${max}/min)` });
+      res.setHeader('Retry-After', '60');
+      res.status(429).json({
+        error: 'rate_limited',
+        reason: 'rate_limited',
+        retryable: true,
+        retry_after_seconds: 60,
+        message: `Rate limit exceeded (${max}/min). This is a transient throttle, NOT an authentication error — wait and retry; do not re-authenticate. Audit enumeration is supported: use the paginated list_relations / enumerate_bundles / query_* reads (up to 200 per page).`,
+      });
     },
   });
 
@@ -345,6 +395,18 @@ async function main(): Promise<void> {
       if (portalAuth) {
         const info = await verifyToken(token);
         if (!info.valid) {
+          // N-7 (§7.7): an upstream throttle/outage on token-verify is RETRYABLE,
+          // NOT an auth failure — never 401 (which tells clients to re-authenticate).
+          if (info.rateLimited) {
+            res.setHeader('Retry-After', '5');
+            res.status(429).json({ error: 'rate_limited', retryable: true, retry_after_seconds: 5, message: 'Token verification is rate-limited upstream — retry shortly; do NOT re-authenticate.' });
+            return;
+          }
+          if (info.upstreamUnavailable) {
+            res.setHeader('Retry-After', '5');
+            res.status(503).json({ error: 'verifier_unavailable', retryable: true, retry_after_seconds: 5, message: 'Token verification is temporarily unavailable — retry shortly; do NOT re-authenticate.' });
+            return;
+          }
           res.setHeader('WWW-Authenticate', `${wwwAuth}, error="invalid_token"`);
           res.status(401).json({ error: 'Unauthorized', reason: info.reason ?? 'invalid_token' });
           return;
@@ -527,27 +589,79 @@ async function main(): Promise<void> {
     }
 
     const profileId = String(req.params.profile);
-    const profile = getProfile(profileId);
-
-    if (!profile) {
-      res.status(404).json({
-        jsonrpc: '2.0',
-        error: { code: -32001, message: `Unknown profile: ${profileId}. GET /versions for available profiles.` },
-        id: null,
-      });
-      return;
-    }
-
-    // Check token type meets profile minimum
     const portalToken = (req as unknown as Record<string, unknown>)._portalToken as TokenInfo | undefined;
-    if (portalToken && !isTokenTypeSufficient(portalToken.tokenType, profile.minTokenType)) {
-      res.status(403).json({
-        jsonrpc: '2.0',
-        error: { code: -32003, message: `Token type '${portalToken.tokenType ?? 'unknown'}' insufficient for profile '${profileId}' (requires '${profile.minTokenType}')` },
-        id: null,
-      });
-      return;
+
+    // ── v4 role-gate (mcp_profiles_v4 §1/§2/§8) ────────────────────────────────
+    // A token_type of researcher|governance IS the role — no scopes, no per-tool
+    // permissions. TOLERANT dual-mode for the Phase 3 cutover: a token still carrying an
+    // old type (consumer/publisher/gov_participant) or `scopes` (pre-Portal-v4) falls
+    // through to the EXACT v3 path below, so Core deploys FIRST with zero breakage.
+    const v4Role: V4Role | undefined = roleFor(portalToken?.tokenType ?? '');
+    const isV4 = v4Role !== undefined;
+
+    let effId: string;
+    let effVersion: string;
+    let effRegister: (server: McpServer, ctx: AppContext) => void;
+
+    if (isV4) {
+      // Facade-mirror compat (openarx-534w): a v4 token is served ITS OWN role's toolset
+      // regardless of which facade URL it arrived on. This un-breaks external OAuth
+      // connectors set up before the Phase 3 cutover against a now-deprecated facade
+      // (/v1, /pub, /dev, /gov, /layer2): after the cutover their token became
+      // token_type=researcher|governance, and the old strict gate 403'd every such request
+      // (Claude surfaced it as "authorized but integration rejected credentials"). No
+      // privilege change — the token only ever receives ITS OWN role's tools; a researcher
+      // can never reach governance tools via /gov, nor vice-versa. Superseded facades are
+      // kept alive as mirrors and retired later once deprecation-hit traffic falls to zero.
+      if (profileId !== v4Role.token_type) {
+        // Only genuinely-known endpoints are mirrored: a registered v3 facade
+        // (v1/pub/dev/gov/layer2) or the other v4 role. An unknown path is still a 404,
+        // exactly as the v3 branch treats it — the mirror must not turn typos into 200s.
+        if (getProfile(profileId) === undefined && roleFor(profileId) === undefined) {
+          res.status(404).json({
+            jsonrpc: '2.0',
+            error: { code: -32001, message: `Unknown profile: ${profileId}. GET /versions for available profiles.` },
+            id: null,
+          });
+          return;
+        }
+        // Deprecated-facade hit by a v4 token: serve the role, but flag it (RFC 8594
+        // Deprecation + successor Link) and log it, so we can measure who still uses the
+        // old URL before removing it (mcp_profiles_v4 §8 amendment, openarx-534w).
+        res.setHeader('Deprecation', 'true');
+        res.setHeader('Link', `</${v4Role.token_type}/mcp>; rel="successor-version"`);
+        log(`[deprecated-facade] v4 token role='${v4Role.token_type}' arrived on '/${profileId}/mcp' — served via role-mirror; connector should repoint to /${v4Role.token_type}/mcp`);
+      }
+      effId = v4Role.token_type;
+      effVersion = v4Role.version;
+      effRegister = (s, c) => v4Role.registerTools(s, c);
+    } else {
+      const profile = getProfile(profileId);
+      if (!profile) {
+        res.status(404).json({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: `Unknown profile: ${profileId}. GET /versions for available profiles.` },
+          id: null,
+        });
+        return;
+      }
+      // Check token type meets profile minimum (v3 only).
+      if (portalToken && !isTokenTypeSufficient(portalToken.tokenType, profile.minTokenType)) {
+        res.status(403).json({
+          jsonrpc: '2.0',
+          error: { code: -32003, message: `Token type '${portalToken.tokenType ?? 'unknown'}' insufficient for profile '${profileId}' (requires '${profile.minTokenType}')` },
+          id: null,
+        });
+        return;
+      }
+      effId = profile.id;
+      effVersion = profile.version;
+      effRegister = (s, c) => profile.registerTools(s, c);
     }
+
+    // gov economy logic (agentId resolution + tier) fires for the v3 `gov` endpoint
+    // AND the v4 `governance` role — the economy axis is untouched by v4 (§8).
+    const isGovSurface = profileId === 'gov' || profileId === 'governance';
 
     // Hybrid: we're architecturally stateless (a fresh transport per request,
     // no in-memory session state we care about), but spec-strict 2025-03-26+
@@ -565,13 +679,43 @@ async function main(): Promise<void> {
     internalTransport.validateSession = () => undefined;
 
     const server = new McpServer({
-      name: `openarx-${profile.id}`,
-      version: profile.version,
+      name: `openarx-${effId}`,
+      version: effVersion,
     });
 
     // Wrap tool registration with metrics + portal credit deduction
     const originalTool = server.tool.bind(server);
     server.tool = function (name: string, ...rest: unknown[]) {
+      // v3 scope-filter (mcp_profiles_v3.md §3/§4). SKIPPED for v4 — the role is the
+      // gate (§2), everything in the role is visible, no per-tool sub-gate.
+      if (!isV4) {
+        // (1) Methodist tools are scope-gated on EVERY endpoint they're registered on
+        //     (the unified-facade model, §4 + §3.3): they require the `methodist` scope,
+        //     fail-CLOSED. So a working agent whose token GAINS methodist (via the
+        //     publisher-class scope mapping) sees them on its EXISTING endpoint after a
+        //     single reconnect — no new server/config. Absent scope → not in tools/list
+        //     AND uncallable. A token without methodist (every current token) is
+        //     unaffected — the methodist tools are simply invisible.
+        if (requiredScope(name) === SCOPE_METHODIST) {
+          const scopes = portalToken?.scopes;
+          if (!Array.isArray(scopes) || !scopes.includes(SCOPE_METHODIST)) {
+            return undefined as unknown as ReturnType<typeof originalTool>;
+          }
+        }
+        // (2) On the researcher profile ADDITIONALLY scope-gate write:documents /
+        //     write:layer2 (read is the floor; writes fail-CLOSED). Facade profiles
+        //     (v1/pub/layer2) keep their existing minTokenType + hasPermission gating
+        //     for non-methodist tools — no existing client's non-methodist list changes.
+        if (effId === 'researcher') {
+          const req = requiredScope(name);
+          if (req !== SCOPE_READ && req !== SCOPE_METHODIST) {
+            const scopes = portalToken?.scopes;
+            if (!Array.isArray(scopes) || !scopes.includes(req)) {
+              return undefined as unknown as ReturnType<typeof originalTool>;
+            }
+          }
+        }
+      }
       const args = [name, ...rest];
       const handlerIdx = args.findIndex((a, i) => i > 0 && typeof a === 'function');
       if (handlerIdx > 0) {
@@ -592,10 +736,35 @@ async function main(): Promise<void> {
             }
           }
 
+          // F2.3/Phase 3 live tool-log (bead openarx-4y79): record a researcher's WORK-tool
+          // calls (not the methodist interface itself) so the checkpoint crosscheck
+          // reconciles claimed_usage against real usage (§8 inv-4). Fire-and-forget —
+          // a journal failure must never break the tool call.
+          //   • apfh/openarx-1mu1: exclude ONLY the methodist MECHANISM doors (METHODIST_MECHANISM_DOORS:
+          //     the bare `methodist` checkpoint/model door + the deterministic channels) — the door-call
+          //     is the mechanism, not a tool the agent chose. The methodist_* READ-doors (get/find/
+          //     search/explore_topic) ARE chosen research tools and DO get logged (else a genuine read
+          //     is false-flagged as fabrication — the c8-probe catch-22). Prior code excluded the whole
+          //     `methodist_*` prefix, which wrongly swallowed the read-doors.
+          //   • 2f: key the log by the SAME credential the run node carries
+          //     (credentialFromToken → the (userId,tokenId) composite), NOT the raw userId —
+          //     else listRunToolLog (which looks up by run.credential_id) finds nothing.
+          if (
+            isV4 &&
+            effId === 'researcher' &&
+            portalToken?.userId &&
+            !METHODIST_MECHANISM_DOORS.has(name)
+          ) {
+            void logMethodistToolCall(credentialFromToken(portalToken), name).catch((e) =>
+              console.error('[methodist tool-log]', e instanceof Error ? e.message : e),
+            );
+          }
+
           // Token-level permission check (search perms + always-free tools).
           // Tier-gated gov tools return allow=true here — their tier check
-          // happens after agentId resolution below.
-          if (portalToken) {
+          // happens after agentId resolution below. SKIPPED for v4 — permissions{}
+          // is dropped (§8); the role gates access, tier/credit economy is kept.
+          if (!isV4 && portalToken) {
             const perm = hasPermission(portalToken, name);
             if (!perm.allow) {
               return { content: [{ type: 'text', text: JSON.stringify(perm.errorBody) }] };
@@ -622,8 +791,8 @@ async function main(): Promise<void> {
           const usage = new UsageTracker();
 
           try {
-            // For gov profile: resolve agentId server-side (never trust client-supplied)
-            if (profileId === 'gov') {
+            // For the governance surface: resolve agentId server-side (never trust client-supplied)
+            if (isGovSurface) {
               delete toolArgs.agentId;
               if (portalToken?.userId) {
                 const agentId = await resolveAgentId(portalToken.userId);
@@ -649,7 +818,7 @@ async function main(): Promise<void> {
             if (portalToken?.userId && !dryRun) {
               // For gov tools: fetch agent reputation for discount calculation
               let agentReputation: number | undefined;
-              if (profileId === 'gov' && toolArgs.agentId) {
+              if (isGovSurface && toolArgs.agentId) {
                 const rep = await getAgentReputation(toolArgs.agentId as string);
                 if (rep !== null) agentReputation = rep;
               }
@@ -666,6 +835,13 @@ async function main(): Promise<void> {
                   }) }] };
                 }
                 creditsCharged = check.effectiveCost;
+                // §23.5 W1: expose the pre-known effective cost to publish
+                // tools (same extra-mechanism as _portalToken) so the internal
+                // endpoint can compute exact credits_refunded in the envelope.
+                const exCost = handlerArgs[handlerArgs.length - 1];
+                if (exCost && typeof exCost === 'object') {
+                  (exCost as Record<string, unknown>)._effectiveCost = check.effectiveCost;
+                }
               }
               // check === null → Portal unavailable, fallback to legacy below
             }
@@ -686,6 +862,18 @@ async function main(): Promise<void> {
               skipBilling = true;
               delete (toolResult as Record<string, unknown>).__skipBilling;
             }
+            // §23.5 W2: Tier-2/3 publish outcomes tag a refund op the gateway
+            // must send to Portal AFTER the full-cost deduct. Read + strip
+            // (never serialize the marker to the client).
+            // Honest logging: when the handler marked the call non-billable,
+            // no deduct happens — the JSONL/rollup must show 0, not the
+            // pre-check effectiveCost (found via QA ledger reconciliation).
+            if (skipBilling) creditsCharged = 0;
+            let refundOp: PublishRefundOp | null = null;
+            if (toolResult && typeof toolResult === 'object' && (toolResult as Record<string, unknown>).__refundNotify) {
+              refundOp = (toolResult as Record<string, unknown>).__refundNotify as PublishRefundOp;
+              delete (toolResult as Record<string, unknown>).__refundNotify;
+            }
 
             // Post-deduct: charge user (never for dry_run or a skip-billing
             // rejection — the legacy fallback below would otherwise charge
@@ -697,6 +885,13 @@ async function main(): Promise<void> {
                   portalToken.userId, portalToken.tokenId, costKey, creditsCharged, ip, userAgent,
                 );
                 if (deductResult) creditsCharged = deductResult.creditsCharged;
+                // §23.5 W2: full cost deducted above; now notify Portal of the
+                // Tier-2/3 ledger refund (idempotent on request_ref). Fire-and-
+                // verify — applyPublishRefund retries + ALERTs on exhaustion.
+                if (refundOp) {
+                  const requestRef = randomUUID();
+                  void applyPublishRefund(portalToken.userId, portalToken.tokenId, refundOp, requestRef);
+                }
               } else {
                 // Fallback: legacy deduct-credit (transition period)
                 const legacyResult = await deductCredit(
@@ -748,6 +943,15 @@ async function main(): Promise<void> {
               creditsCharged,
               usage: usageSnapshot,
             });
+
+            // Per-document demand counter (openarx-1nvk) — only the two content-
+            // read tools. Fire-and-forget Redis HINCRBY; rolled up to PG by
+            // lib/demand-rollup.ts. Internal signal for re-index candidate
+            // selection; never surfaced to agents.
+            if (name === 'get_document' || name === 'get_chunks') {
+              const demandDoc = demandDocId(toolArgs, topResults);
+              if (demandDoc) void incrementDemand(name, demandDoc);
+            }
           }
         };
       }
@@ -755,7 +959,7 @@ async function main(): Promise<void> {
       return (originalTool as any)(...args);
     } as typeof server.tool;
 
-    profile.registerTools(server, ctx);
+    effRegister(server, ctx);
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   });
@@ -808,7 +1012,6 @@ async function main(): Promise<void> {
 // ── Cluster mode ────────────────────────────────────────────────
 
 import cluster from 'node:cluster';
-import { availableParallelism } from 'node:os';
 
 const MCP_WORKERS = parseInt(process.env.MCP_WORKERS ?? '1', 10);
 
@@ -823,6 +1026,9 @@ if (MCP_WORKERS > 1 && cluster.isPrimary) {
   // Workers don't run it to avoid duplicate UPSERTs to Postgres.
   // See lib/cost-rollup.ts and docs/mcp_cost_tracking.md.
   startRollupTimer();
+  startDemandRollupTimer();
+  startMethodistRollupTimer(); // 694n — hourly Neo4j claim breakdowns → PG rollup
+  // Layer2 PG-graph consumers disabled — PG graph torn down (openarx-1woy).
 } else {
   main().catch((err: unknown) => {
     log('Fatal error:', err);
@@ -830,5 +1036,10 @@ if (MCP_WORKERS > 1 && cluster.isPrimary) {
   });
   // Single-process mode (MCP_WORKERS=1): no primary/worker split, the
   // sole process serves HTTP AND runs the rollup timer.
-  if (MCP_WORKERS <= 1) startRollupTimer();
+  if (MCP_WORKERS <= 1) {
+    startRollupTimer();
+    startDemandRollupTimer();
+    startMethodistRollupTimer(); // 694n
+    // Layer2 PG-graph consumers disabled (openarx-1woy).
+  }
 }

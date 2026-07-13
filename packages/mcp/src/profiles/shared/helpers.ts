@@ -66,6 +66,42 @@ export function computeCanServeFile(doc: Document): boolean {
 }
 
 /**
+ * Source-text accessibility — the SECOND axis, ORTHOGONAL to indexingTier
+ * (whether the full text is indexed and retrievable via get_chunks). It answers
+ * "how can the raw source be obtained", which agents previously conflated with
+ * content availability via canServeFile (openarx-5xve):
+ *   - 'served_by_us'       — we may deliver the raw PDF/source (open/permissive license)
+ *   - 'external_link_only' — license blocks US redistributing the file, but the
+ *                            source URL is public, so the agent can self-fetch it
+ *   - 'unavailable'        — no deliverable file and no source URL
+ * The license gates OUR redistribution of the file, NOT linking to it. Only
+ * 'unavailable' means the source is genuinely unreachable; full text may still
+ * be read via get_chunks when indexingTier='full'.
+ */
+export type SourceAccessibility = 'unavailable' | 'served_by_us' | 'external_link_only';
+
+export function computeSourceAccessibility(doc: Document): SourceAccessibility {
+  if (computeCanServeFile(doc)) return 'served_by_us';
+  if (doc.sourceUrl) return 'external_link_only';
+  return 'unavailable';
+}
+
+/**
+ * Effective indexing tier, including 'none' for documents with no indexed body.
+ * Conservative: a tier-stamped doc keeps its tier; a null-tier doc that has
+ * chunks is treated as 'full' (legacy default); only a doc with no tier AND no
+ * chunks reports 'none'. chunkCount must be the total is_latest chunk count.
+ */
+export function effectiveIndexingTier(
+  doc: Document,
+  chunkCount: number,
+): 'none' | 'abstract_only' | 'full' {
+  if (doc.indexingTier === 'abstract_only') return 'abstract_only';
+  if (doc.indexingTier === 'full') return 'full';
+  return chunkCount > 0 ? 'full' : 'none';
+}
+
+/**
  * Surface to clients WHY a document is at abstract_only tier. Lets agents
  * distinguish 'still being processed' from 'legally cannot be indexed beyond
  * abstract' — different actions are appropriate (wait vs use external source).
@@ -108,7 +144,7 @@ export function computeIndexingLimitation(doc: Document): IndexingLimitation | n
   };
 }
 
-export function formatDoc(doc: Document): Record<string, unknown> {
+export function formatDoc(doc: Document, chunkCount?: number): Record<string, unknown> {
   const limitation = computeIndexingLimitation(doc);
   return {
     id: doc.id,
@@ -124,7 +160,16 @@ export function formatDoc(doc: Document): Record<string, unknown> {
     datasetLinks: doc.datasetLinks,
     license: doc.license ?? null,
     licenses: doc.licenses ?? {},
-    indexingTier: doc.indexingTier ?? 'full',
+    // Two orthogonal availability axes (openarx-5xve):
+    //   indexingTier        — is the full text indexed & retrievable via get_chunks
+    //   sourceAccessibility — how the raw source file can be obtained
+    indexingTier:
+      chunkCount !== undefined ? effectiveIndexingTier(doc, chunkCount) : (doc.indexingTier ?? 'full'),
+    sourceAccessibility: computeSourceAccessibility(doc),
+    ...(chunkCount !== undefined ? { chunkCount } : {}),
+    // DEPRECATED: gates raw-PDF delivery via our service ONLY; NOT a content
+    // availability signal. Equivalent to sourceAccessibility==='served_by_us'.
+    // Use sourceAccessibility instead. Removal tracked in openarx-5xve phase 2.
     canServeFile: computeCanServeFile(doc),
     indexingLimitedBy: limitation?.limitedBy ?? null,
     indexingLimitedNote: limitation?.note ?? null,

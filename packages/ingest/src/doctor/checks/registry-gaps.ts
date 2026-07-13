@@ -9,8 +9,8 @@
  *   - status='listed'           — known on arXiv, files never downloaded
  *   - status='download_failed'  — retries exhausted (>= MAX_DOWNLOAD_RETRIES)
  *
- * Complements (does not replace) the coverage_map-based 'coverage-gaps'
- * check: coverage_map is still written in parallel (Phase 3 decides drop).
+ * This is the sole coverage tracker — the legacy coverage_map aggregate
+ * table and its checks were removed (registry-driven model, openarx-j173).
  *
  * Fix: downloads listed docs directly — the listing metadata stored on the
  * row is enough to rebuild the download request, no listing re-fetch needed.
@@ -90,20 +90,22 @@ export function createRegistryGapsCheck(ctx: DoctorContext): CheckModule {
       if (listedTotal === 0 && failedTotal === 0) {
         return {
           status: 'ok',
-          message: 'Registry has no pending documents: every listed paper is downloaded, no exhausted failures',
+          message:
+            'Registry has no pending documents: every listed paper is downloaded, no exhausted failures',
           affectedCount: 0,
         };
       }
 
-      const dayStrs = listedByDay.rows
-        .slice(0, 10)
-        .map((r) => `${r.day}: ${r.cnt}`);
+      const dayStrs = listedByDay.rows.slice(0, 10).map((r) => `${r.day}: ${r.cnt}`);
 
       return {
         status: 'warn',
-        message: `${listedTotal} listed-not-downloaded across ${listedByDay.rows.length} days` +
+        message:
+          `${listedTotal} listed-not-downloaded across ${listedByDay.rows.length} days` +
           (failedTotal > 0 ? `, ${failedTotal} download_failed with retries exhausted` : '') +
-          (dayStrs.length > 0 ? ` (${dayStrs.join('; ')}${listedByDay.rows.length > 10 ? '; …' : ''})` : ''),
+          (dayStrs.length > 0
+            ? ` (${dayStrs.join('; ')}${listedByDay.rows.length > 10 ? '; …' : ''})`
+            : ''),
         affectedCount: listedTotal + failedTotal,
         details: {
           listedTotal,
@@ -144,7 +146,10 @@ export function createRegistryGapsCheck(ctx: DoctorContext): CheckModule {
       let failed = 0;
       for (const row of rows.rows) {
         if (ctx.shouldStop?.()) {
-          log.warn({ fixed, remaining: rows.rows.length - fixed - failed }, 'registry-gaps fix stopped by operator');
+          log.warn(
+            { fixed, remaining: rows.rows.length - fixed - failed },
+            'registry-gaps fix stopped by operator',
+          );
           break;
         }
         try {
@@ -154,11 +159,17 @@ export function createRegistryGapsCheck(ctx: DoctorContext): CheckModule {
           if (!doc || doc.status !== 'listed' || doc.deletedAt) continue;
           await arxivSource.downloadAndRegister(rowToEntry(row), documentStore, doc);
           fixed++;
-          log.info({ arxivId: row.source_id, fixed, total: rows.rows.length }, 'registry-gaps: downloaded listed doc');
+          log.info(
+            { arxivId: row.source_id, fixed, total: rows.rows.length },
+            'registry-gaps: downloaded listed doc',
+          );
         } catch (err) {
           // Stays 'listed' — picked up by the next fix run or ingest.
           failed++;
-          log.warn({ arxivId: row.source_id, err: err instanceof Error ? err.message : err }, 'registry-gaps: download failed, row stays listed');
+          log.warn(
+            { arxivId: row.source_id, err: err instanceof Error ? err.message : err },
+            'registry-gaps: download failed, row stays listed',
+          );
         }
         await sleep(RATE_LIMIT_MS);
       }
@@ -166,7 +177,8 @@ export function createRegistryGapsCheck(ctx: DoctorContext): CheckModule {
       return {
         fixed,
         failed,
-        message: `Downloaded ${fixed}/${rows.rows.length} listed docs (now status='downloaded', processed by next ingest run)` +
+        message:
+          `Downloaded ${fixed}/${rows.rows.length} listed docs (now status='downloaded', processed by next ingest run)` +
           (failed > 0 ? `; ${failed} failed, left as 'listed'` : ''),
       };
     },

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-07-13
+
+Layer 2 — a semantic knowledge graph with built-in quality control. OpenArx moves
+from a search-and-publish surface to a graph of claims and relations that agents
+read, traverse, and contribute to.
+
+### Added
+
+- **Layer 2 semantic knowledge graph.** Claims and typed scientific relations
+  (`support`, `extend`, `qualify`, `refute`, `background`, `shared_evidence`,
+  `same_as`) are first-class nodes and edges. Every record has a content-addressed,
+  reproducible id, giving stable identity, deduplication, and provenance across
+  stores and over time.
+- **Methodology engine (`@openarx/methodist`).** An AI that guides contributing
+  agents through the scientific method — staged checkpoints, dosed guidance, and
+  pedagogy — holding back unsupported or low-quality claims before they reach the
+  graph.
+- **`researcher` MCP profile.** A single role unifying search, read, publish, and
+  the methodology channel, superseding the earlier split profiles (kept as
+  compatibility facades).
+
+### Changed
+
+- Ingest pipeline now feeds both vector search and graph indexing.
+
 ## [0.1.8] — 2026-06-18
 
 Ingest pipeline reliability and cost fix. No API or tool changes.

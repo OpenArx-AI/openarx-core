@@ -18,7 +18,7 @@ import type { Request, Response } from 'express';
 import type { AppContext } from './context.js';
 import type { Author, CodeLink, DatasetLink, BenchmarkResult, Document } from '@openarx/types';
 import { query, computeOarxId } from '@openarx/api';
-import { normalizeLicense, runSpamScreen, type SpamScreenResult } from '@openarx/ingest';
+import { normalizeLicense, runSpamScreen, runDeterministicScreen, type SpamScreenResult } from '@openarx/ingest';
 import { createInitialReview } from '@openarx/api';
 import { getRequiredVersions, getLegalVersionsError, type LegalVersions } from './lib/legal-versions.js';
 import { materializeArchive, isDirectory } from './lib/materialize-archive.js';
@@ -188,11 +188,40 @@ function jres(res: Response, status: number, body: Record<string, unknown>): voi
   res.status(status).json(body);
 }
 
+// ── §23 three-tier refund envelopes (contract 2a3ae4e; wire mechanics f0b0043) ──
+// Core only TAGS the envelope; Portal applies every ledger op (§23.5).
+// publish_penalty is a flat contract value (vendor-LLM cost is type-independent);
+// the cost fallback mirrors economics.config.json 50/50/100 for the rare case the
+// caller didn't supply charged_credits (Portal path sends it; MCP path derives it
+// from the gateway's toolCheck effectiveCost).
+const PUBLISH_PENALTY = parseInt(process.env.PUBLISH_PENALTY ?? '5', 10);
+const FALLBACK_COST: Record<string, number> = { latex: 50, markdown: 50, pdf: 100 };
+
+/** Tier 1 — pre-charge reject (no charge attempted; no refund fields, §23.3). */
+function tier1(res: Response, status: number, error: string, extra: Record<string, unknown> = {}): void {
+  jres(res, status, { ok: false, tier: 1, error, reason_codes: (extra.reason_codes as string[]) ?? [error], ...extra });
+}
+
+/** Tier 2 — post-charge LLM reject (422): refund cost − penalty, penalty kept. */
+function tier2(res: Response, error: string, reasonCodes: string[], chargedCredits: number, message?: string): void {
+  jres(res, 422, {
+    ok: false, tier: 2, error, reason_codes: reasonCodes,
+    credits_refunded: Math.max(chargedCredits - PUBLISH_PENALTY, 0),
+    penalty: PUBLISH_PENALTY,
+    ...(message ? { message } : {}),
+  });
+}
+
+/** Tier 3 — post-charge technical failure (5xx): full refund, no penalty. */
+function tier3(res: Response, status: number, error: string, chargedCredits: number, extra: Record<string, unknown> = {}): void {
+  jres(res, status, { ok: false, tier: 3, error, credits_refunded: chargedCredits, ...extra });
+}
+
 export async function handlePublishDocument(req: Request, res: Response, ctx: AppContext): Promise<void> {
   // §2: X-Caller required, validated before anything else.
   const caller = parseCaller(req.headers['x-caller']);
   if (!caller) {
-    jres(res, 400, { ok: false, error: 'validation_error', message: "X-Caller header required: 'portal' or 'mcp'" });
+    tier1(res, 400, 'validation_error', { message: "X-Caller header required: 'portal' or 'mcp'" });
     return;
   }
 
@@ -200,7 +229,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
 
   const bodyError = validatePublishBody(body);
   if (bodyError) {
-    jres(res, 400, { ok: false, error: 'validation_error', message: bodyError });
+    tier1(res, 400, 'validation_error', { message: bodyError });
     return;
   }
 
@@ -210,7 +239,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   // path construction.
   const userId = body.user_id;
   if (!isValidUserId(userId)) {
-    jres(res, 400, { ok: false, error: 'user_required', message: 'A resolvable user_id (UUID) is required to publish' });
+    tier1(res, 400, 'user_required', { message: 'A resolvable user_id (UUID) is required to publish' });
     return;
   }
 
@@ -218,7 +247,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   // malformed file → fail-closed (cannot verify consent → cannot publish).
   const required = getRequiredVersions();
   if (!required) {
-    jres(res, 503, { ok: false, error: 'consent_check_unavailable', message: `legal-versions unavailable: ${getLegalVersionsError() ?? 'unknown'}` });
+    tier1(res, 503, 'consent_check_unavailable', { message: `legal-versions unavailable: ${getLegalVersionsError() ?? 'unknown'}` });
     return;
   }
 
@@ -226,8 +255,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   if (caller === 'portal') {
     const stale = verifyPortalConsent(body.consent as ConsentBlock | undefined, required, Date.now());
     if (stale.length > 0) {
-      jres(res, 400, {
-        ok: false, error: 'consent_required',
+      tier1(res, 400, 'consent_required', {
         missing_or_stale: stale,
         current_required_versions: required,
       });
@@ -243,20 +271,19 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
         { headers: { 'X-Internal-Secret': INTERNAL_SECRET }, signal: AbortSignal.timeout(5_000) },
       );
       if (!resp.ok) {
-        jres(res, 503, { ok: false, error: 'consent_check_unavailable', message: `Portal consent-state returned ${resp.status}` });
+        tier1(res, 503, 'consent_check_unavailable', { message: `Portal consent-state returned ${resp.status}` });
         return;
       }
       state = await resp.json() as ConsentBlock;
     } catch (err) {
-      jres(res, 503, { ok: false, error: 'consent_check_unavailable', message: `Portal consent-state unreachable: ${err instanceof Error ? err.message : String(err)}` });
+      tier1(res, 503, 'consent_check_unavailable', { message: `Portal consent-state unreachable: ${err instanceof Error ? err.message : String(err)}` });
       return;
     }
     // b77h: presence-only — block only when a consent field is entirely
     // missing (never seen). Stale-but-present versions pass on the MCP path.
     const missing = verifyAccountConsent(state);
     if (missing.length > 0) {
-      jres(res, 400, {
-        ok: false, error: 'account_consent_required',
+      tier1(res, 400, 'account_consent_required', {
         message: 'User must accept upload consent at portal.openarx.ai/portal/consent',
         user_accept_url: 'https://portal.openarx.ai/portal/consent',
         missing_or_stale: missing,
@@ -290,8 +317,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   // archive (content_source.type=storagebox). An inline-text body is rejected
   // so the four surfaces can't split-brain on content shape.
   if (contentSource.type === 'text' || typeof contentSource.text === 'string') {
-    jres(res, 400, {
-      ok: false, error: 'inline_text_unsupported',
+    tier1(res, 400, 'inline_text_unsupported', {
       message: 'Inline text submissions are no longer accepted. Upload a ZIP (LaTeX/Markdown + assets) or PDF and publish with content_source.type=storagebox.',
     });
     return;
@@ -301,14 +327,39 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   // File-only: the screen runs on title+abstract (the body lives in the
   // archive, materialized below, and is screened downstream by the pipeline).
   const spamBody = `${title}\n\n${abstract}`;
+
+  // §23 amount provenance (wire mechanics f0b0043): Portal path supplies
+  // charged_credits in the request body; MCP path derives it from the
+  // gateway's toolCheck effectiveCost (also passed as charged_credits by the
+  // tool layer). Fallback mirrors economics.config.json 50/50/100.
+  const chargedCredits =
+    typeof body.charged_credits === 'number' && Number.isFinite(body.charged_credits)
+      ? body.charged_credits
+      : (FALLBACK_COST[contentFormat] ?? 50);
+
+  // ── §23 Tier 1: deterministic content checks run BEFORE any charge ──
+  // (BELOW_MIN_LENGTH / ABSTRACT_TOO_SHORT / EMPTY_BODY / REPETITIVE_CONTENT —
+  // no LLM cost, "fix and retry" at zero cost.)
+  const deterministic = runDeterministicScreen({ title, abstract, body: spamBody });
+  if (deterministic) {
+    tier1(res, 400, deterministic[0]!.code, {
+      reason_codes: deterministic.map((r) => r.code),
+      core_document_id: null,
+      message: 'Submission failed deterministic content checks — fix the flagged issues and retry (no credits were charged).',
+    });
+    return;
+  }
+
+  // ── §23 Tier 2: LLM classifier (post-charge; penalty kept on reject) ──
   const spam = await runSpamScreen({ title, abstract, body: spamBody }, { modelRouter: ctx.modelRouter });
   if (spam.verdict === 'reject') {
-    jres(res, 400, {
-      ok: false, error: 'spam_rejected',
-      reason: spam.reasons.map((r) => r.code).join(', '),
-      core_document_id: null,
-      credits_refunded: true, // see contract §7 + w3rr gateway-marker dependency
-    });
+    tier2(
+      res,
+      'spam_rejected',
+      spam.reasons.map((r) => r.code),
+      chargedCredits,
+      'Content was flagged by the automated screening. If you believe this is a mistake, contact hello@openarx.ai to appeal (§21.4).',
+    );
     return;
   }
   const aspect1ProviderFailure = isAspect1ProviderFailure(spam);
@@ -366,7 +417,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
     } catch (err) {
       await rm(canonicalDir, { recursive: true, force: true }).catch(() => {});
       if (err instanceof ArchiveIntakeError) {
-        jres(res, 400, { ok: false, error: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) });
+        tier1(res, 400, err.code, { message: err.message, ...(err.details ? { details: err.details } : {}) });
         return;
       }
       throw err;
@@ -502,7 +553,7 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
     if (ctx.portalDocQueue.isReady) {
       const enqueued = ctx.portalDocQueue.enqueue(doc);
       if (!enqueued) {
-        jres(res, 503, { ok: false, error: 'queue_full', core_document_id: coreDocId, message: 'Saved but queue is full; will be processed when capacity frees.' });
+        tier3(res, 503, 'queue_full', chargedCredits, { core_document_id: coreDocId, message: 'Saved but queue is full; will be processed when capacity frees.' });
         return;
       }
     }
@@ -522,10 +573,19 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
   } catch (err) {
     // Unexpected failure after the canonical dir was created (e.g. documentStore
     // save error): remove the half-written document directory so storagebox
-    // doesn't accumulate orphaned eprints, then bubble to the Express handler.
+    // doesn't accumulate orphaned eprints. §23 Tier 3: answer with a bodied 5xx
+    // envelope (full refund) instead of bubbling to Express — a bodyless 5xx
+    // would leave the client unable to distinguish refunded vs unknown (§23.3).
     // (Validation 400s return before the dir exists; ArchiveIntakeError and the
     // idempotency-race path clean up themselves; 202/queue_full keep the doc.)
     await rm(canonicalDir, { recursive: true, force: true }).catch(() => {});
-    throw err;
+    // Full detail stays server-side; the response carries only a correlation
+    // id (raw err.message could leak paths/SQL to external MCP clients).
+    const correlationId = randomUUID();
+    console.error(`[publish-document] tier-3 internal failure (cid=${correlationId}):`, err);
+    tier3(res, 500, 'internal_error', chargedCredits, {
+      message: 'Internal error while publishing — the charge is refunded in full. Contact support with the correlation id.',
+      correlation_id: correlationId,
+    });
   }
 }

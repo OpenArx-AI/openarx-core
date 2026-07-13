@@ -1,6 +1,6 @@
 {
   "name": "@openarx/mcp",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -16,6 +16,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@openarx/api": "workspace:*",
     "@openarx/ingest": "workspace:*",
+    "@openarx/methodist": "workspace:*",
     "@openarx/types": "workspace:*",
     "@types/archiver": "^7.0.0",
     "archiver": "^7.0.1",

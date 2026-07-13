@@ -1,10 +1,9 @@
 /**
  * Check module registry — add new checks here.
  *
- * Removed with the registry-driven coverage transition (openarx-j173,
- * approved by Vlad 2026-06-11): coverage-gaps and coverage-breakdown-drift
- * read coverage_map aggregates — superseded by registry-gaps, which reports
- * concrete documents from the per-document registry.
+ * Coverage is registry-driven (openarx-j173): registry-gaps reports concrete
+ * documents from the per-document registry (documents.status). The old
+ * coverage_map-based checks were removed with that transition.
  */
 
 import type { CheckModule, DoctorContext } from '../types.js';

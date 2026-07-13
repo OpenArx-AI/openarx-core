@@ -120,6 +120,29 @@ const DEFAULT_MODEL = 'gemini-3-flash-preview';
 /** Public entry point. Always resolves — never throws (callers rely on
  *  verdict/reasons, not exceptions). On catastrophic failure returns a
  *  degraded borderline result so publish proceeds. */
+/**
+ * §23 Tier-1 pre-charge deterministic screen (contract 2a3ae4e §23.1).
+ * Runs ONLY the no-LLM checks that are now rejected BEFORE any charge:
+ * EMPTY_BODY / BELOW_MIN_LENGTH (hard threshold) / REPETITIVE_CONTENT from
+ * the hard-reject set, plus ABSTRACT_TOO_SHORT (promoted from soft signal to
+ * a Tier-1 reject by §23 — deterministic, no compute cost, "fix and retry").
+ * Returns reject reasons or null. runSpamScreen keeps its full behaviour for
+ * every other consumer (pipeline review path) — this is an additive facade.
+ */
+export function runDeterministicScreen(
+  input: SpamScreenInput,
+  deps: Partial<SpamScreenDeps> = {},
+): SpamReason[] | null {
+  const cfg = { ...DEFAULT_DEPS, ...deps };
+  const hard = checkHardReject(input, cfg);
+  if (hard) return hard;
+  const abstract = input.abstract.trim();
+  if (abstract.length > 0 && abstract.length < cfg.minAbstractChars) {
+    return [{ code: 'ABSTRACT_TOO_SHORT', detail: `${abstract.length} chars` }];
+  }
+  return null;
+}
+
 export async function runSpamScreen(
   input: SpamScreenInput,
   deps: SpamScreenDeps,

@@ -6,13 +6,12 @@
  *   openarx ingest --limit 200
  *   openarx ingest --limit 200 --direction forward
  *   openarx status
- *   openarx coverage
  *   openarx stop
  *   openarx history --limit 10
  */
 
 import { sendCommand } from '../runner/RunnerSocket.js';
-import type { RunnerCommand, StatusResult, CoverageResult, PipelineRun, AuditResult } from '../runner/types.js';
+import type { RunnerCommand, StatusResult, PipelineRun, AuditResult } from '../runner/types.js';
 import type { DoctorReport } from '../doctor/types.js';
 
 const SOCKET_PATH = process.env.RUNNER_SOCKET ?? '/run/openarx/runner.sock';
@@ -29,6 +28,7 @@ function parseArgs(): RunnerCommand {
       let dateFrom: string | undefined;
       let dateTo: string | undefined;
       let downloadedFirst = false;
+      let reindexRequestedFirst = false;
       let strategy: 'license_aware' | 'force_full' | undefined;
       let bypassEmbedCache = false;
       let categories: string[] | undefined;
@@ -39,7 +39,9 @@ function parseArgs(): RunnerCommand {
         } else if (args[i] === '--direction' && args[i + 1]) {
           const v = args[i + 1];
           if (v !== 'forward' && v !== 'backward') {
-            console.error("Error: --direction must be 'forward' (ascending dates, default) or 'backward'.");
+            console.error(
+              "Error: --direction must be 'forward' (ascending dates, default) or 'backward'.",
+            );
             process.exit(1);
           }
           direction = v;
@@ -54,8 +56,13 @@ function parseArgs(): RunnerCommand {
           i++;
         } else if (args[i] === '--downloaded-first') {
           downloadedFirst = true;
+        } else if (args[i] === '--reindex-requested-first') {
+          reindexRequestedFirst = true;
         } else if (args[i] === '--categories' && args[i + 1]) {
-          categories = args[i + 1].split(',').map((c) => c.trim()).filter(Boolean);
+          categories = args[i + 1]
+            .split(',')
+            .map((c) => c.trim())
+            .filter(Boolean);
           i++;
         } else if (args[i] === '--strategy' && args[i + 1]) {
           const v = args[i + 1];
@@ -73,11 +80,25 @@ function parseArgs(): RunnerCommand {
         console.error('Error: --retry and --direction are mutually exclusive.');
         process.exit(1);
       }
-      if (!retry && !dateFrom && !dateTo && !downloadedFirst) {
-        console.error('Error: at least one of --dateFrom/--dateTo is required (or --downloaded-first to process the downloaded backlog only).');
+      if (!retry && !dateFrom && !dateTo && !downloadedFirst && !reindexRequestedFirst) {
+        console.error(
+          'Error: at least one of --dateFrom/--dateTo is required (or --downloaded-first / --reindex-requested-first to process a backlog only).',
+        );
         process.exit(1);
       }
-      return { type: 'ingest', limit, direction, retry, dateFrom, dateTo, downloadedFirst, strategy, bypassEmbedCache, categories };
+      return {
+        type: 'ingest',
+        limit,
+        direction,
+        retry,
+        dateFrom,
+        dateTo,
+        downloadedFirst,
+        reindexRequestedFirst,
+        strategy,
+        bypassEmbedCache,
+        categories,
+      };
     }
     case 'registry-update': {
       let limit = 100;
@@ -112,8 +133,6 @@ function parseArgs(): RunnerCommand {
     }
     case 'status':
       return { type: 'status' };
-    case 'coverage':
-      return { type: 'coverage' };
     case 'stop':
       return { type: 'stop' };
     case 'history': {
@@ -156,22 +175,33 @@ function parseArgs(): RunnerCommand {
         }
       }
       if (fix && !check) {
-        console.error('Error: doctor --fix requires --check <name> (running every fix at once, unbounded, is unsafe on the current corpus).');
+        console.error(
+          'Error: doctor --fix requires --check <name> (running every fix at once, unbounded, is unsafe on the current corpus).',
+        );
         process.exit(1);
       }
       return { type: 'doctor', fix, check, limit };
     }
     default:
-      console.error('Usage: openarx <ingest|registry-update|status|coverage|stop|history|audit|doctor>');
-      console.error('  ingest          --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]');
-      console.error('                  [--categories cs.AI,cs.LG] [--downloaded-first] [--retry] [--strategy ...] [--bypass-cache]');
-      console.error('                  (registry-driven: works from documents with status listed/downloaded, no arXiv listing fetch)');
-      console.error('  registry-update --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]');
-      console.error('                  (fetches arXiv day listings into the registry; days are atomic)');
+      console.error('Usage: openarx <ingest|registry-update|status|stop|history|audit|doctor>');
+      console.error(
+        '  ingest          --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]',
+      );
+      console.error(
+        '                  [--categories cs.AI,cs.LG] [--downloaded-first] [--reindex-requested-first] [--retry] [--strategy ...] [--bypass-cache]',
+      );
+      console.error(
+        '                  (registry-driven: works from documents with status listed/downloaded, no arXiv listing fetch)',
+      );
+      console.error(
+        '  registry-update --dateFrom YYYY-MM-DD [--dateTo YYYY-MM-DD] [--direction forward|backward] [--limit N=100]',
+      );
+      console.error(
+        '                  (fetches arXiv day listings into the registry; days are atomic)',
+      );
       console.error('  audit   [--days N] [--date YYYYMMDD]');
       console.error('  doctor  [--fix] [--check <name>] [--limit N]');
       console.error('  status');
-      console.error('  coverage');
       console.error('  stop');
       console.error('  history --limit N');
       process.exit(1);
@@ -237,20 +267,6 @@ async function main(): Promise<void> {
         }
         break;
       }
-      case 'coverage': {
-        const cov = resp.data as CoverageResult;
-        console.log(`Coverage (${cov.source}):`);
-        console.log(`  Forward cursor: ${formatDate(cov.forwardCursor)}`);
-        console.log(`  Backfill cursor: ${formatDate(cov.backfillCursor)}`);
-        console.log(`  Total papers: ${cov.totalPapers}`);
-        if (cov.runs.length > 0) {
-          console.log('  Runs:');
-          for (const r of cov.runs) {
-            console.log(`    ${r.direction}: ${formatDate(r.dateFrom)} → ${formatDate(r.dateTo)} (${r.docsProcessed} papers)`);
-          }
-        }
-        break;
-      }
       case 'stop': {
         const status = resp.data as StatusResult;
         if (status.state === 'idle') {
@@ -271,9 +287,13 @@ async function main(): Promise<void> {
         for (const r of runs) {
           const dur = formatDuration(r.startedAt, r.finishedAt);
           const cost = r.totalCost !== null ? `$${r.totalCost.toFixed(2)}` : '-';
-          console.log(`  ${r.status.toUpperCase().padEnd(10)} ${r.direction.padEnd(9)} ${formatDate(r.startedAt)}  ${dur.padEnd(8)} ${r.docsProcessed}ok/${r.docsFailed}fail/${r.docsSkipped}skip  ${cost}`);
+          console.log(
+            `  ${r.status.toUpperCase().padEnd(10)} ${r.direction.padEnd(9)} ${formatDate(r.startedAt)}  ${dur.padEnd(8)} ${r.docsProcessed}ok/${r.docsFailed}fail/${r.docsSkipped}skip  ${cost}`,
+          );
           if (r.dateFrom || r.dateTo) {
-            console.log(`             coverage: ${formatDate(r.dateFrom)} → ${formatDate(r.dateTo)}`);
+            console.log(
+              `             coverage: ${formatDate(r.dateFrom)} → ${formatDate(r.dateTo)}`,
+            );
           }
         }
         break;
@@ -299,11 +319,15 @@ async function main(): Promise<void> {
           const sev = r.result.status !== 'ok' ? `  [${r.severity}]` : '';
           console.log(`  ${icon} ${r.name.padEnd(28)} ${r.result.message}${sev}`);
           if (r.fixResult) {
-            console.log(`     → Fixed: ${r.fixResult.fixed}, Failed: ${r.fixResult.failed} — ${r.fixResult.message}`);
+            console.log(
+              `     → Fixed: ${r.fixResult.fixed}, Failed: ${r.fixResult.failed} — ${r.fixResult.message}`,
+            );
           }
         }
         console.log('');
-        console.log(`Summary: ${d.checksRun} checks, ${d.ok} ok, ${d.warnings} warnings, ${d.errors} errors`);
+        console.log(
+          `Summary: ${d.checksRun} checks, ${d.ok} ok, ${d.warnings} warnings, ${d.errors} errors`,
+        );
         break;
       }
       case 'audit': {
@@ -314,7 +338,9 @@ async function main(): Promise<void> {
         console.log(`  Days with gaps: ${a.daysWithGaps}`);
         for (const d of a.details) {
           if (d.missing > 0) {
-            console.log(`    ${d.day}: arXiv=${d.arxivCount}, DB=${d.dbCount}, missing=${d.missing} → downloaded ${d.downloaded}`);
+            console.log(
+              `    ${d.day}: arXiv=${d.arxivCount}, DB=${d.dbCount}, missing=${d.missing} → downloaded ${d.downloaded}`,
+            );
           }
         }
         console.log(`  Total missing: ${a.totalMissing}`);

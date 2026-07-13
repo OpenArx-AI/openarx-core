@@ -132,10 +132,10 @@ test('unconventional categories still pass schema (doc-only, no regex)', () => {
 import { estimatedSubmitCost, dryRunField } from './publish-tools.js';
 import { getCostKey, isDryRunCall } from '../../cost-key.js';
 
-test('estimated cost mirrors economics config: latex/markdown 5, pdf 10', () => {
-  assert.equal(estimatedSubmitCost('latex'), 5);
-  assert.equal(estimatedSubmitCost('markdown'), 5);
-  assert.equal(estimatedSubmitCost('pdf'), 10);
+test('estimated cost mirrors §23 economics: latex/markdown 50, pdf 100', () => {
+  assert.equal(estimatedSubmitCost('latex'), 50);
+  assert.equal(estimatedSubmitCost('markdown'), 50);
+  assert.equal(estimatedSubmitCost('pdf'), 100);
 });
 
 test('dry_run field defaults to false (acceptance 4: omitting = real submit)', () => {
@@ -175,11 +175,15 @@ test('dry-run would_save inheritance matches resolveVersionMetadata semantics', 
 // ── openarx-contracts-w3rr: publish-via-endpoint billing rule ────────────
 import { isChargeablePublishStatus } from './publish-tools.js';
 
-test('only 202 (created) and 409 (idempotent replay) are chargeable', () => {
-  assert.equal(isChargeablePublishStatus(202), true);
-  assert.equal(isChargeablePublishStatus(409), true);
-  for (const s of [400, 401, 403, 422, 500, 503]) {
-    assert.equal(isChargeablePublishStatus(s), false, `status ${s} must not be billed`);
+test('§23 chargeable statuses: 202/409 (kept) + 422 tier-2 + 5xx tier-3 (charged, then Portal-refunded)', () => {
+  // Contract 2a3ae4e: Tier-2 (422) and Tier-3 (5xx) are charged full upfront,
+  // the refund is a separate Portal ledger op — so the gateway MUST deduct.
+  for (const s of [202, 409, 422, 500, 503]) {
+    assert.equal(isChargeablePublishStatus(s), true, `status ${s} must be billed (§23)`);
+  }
+  // Tier-1 pre-charge rejects stay un-billed.
+  for (const s of [400, 401, 403]) {
+    assert.equal(isChargeablePublishStatus(s), false, `status ${s} must not be billed (tier 1)`);
   }
 });
 

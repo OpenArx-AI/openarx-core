@@ -60,12 +60,13 @@ export const dryRunField = z.boolean().default(false)
 
 /**
  * Published submit cost per content format (openarx-contracts-tof2).
- * Mirrors contracts/economics_config.md (submit_document:latex/markdown=5,
- * submit_document:pdf=10) — used ONLY for the dry-run estimate; real
- * billing happens Portal-side via cost_key lookup.
+ * Mirrors contracts/economics_config.md §23 economics (contract 2a3ae4e):
+ * submit_document:latex/markdown=50, submit_document:pdf=100. Used ONLY for
+ * the dry-run estimate; real billing happens Portal-side via cost_key lookup.
+ * (QA openarx-tester-glu: the pre-§23 5/10 values under-budgeted agents 10×.)
  */
 export function estimatedSubmitCost(format: 'latex' | 'markdown' | 'pdf'): number {
-  return format === 'pdf' ? 10 : 5;
+  return format === 'pdf' ? 100 : 50;
 }
 
 // ── Archive intake (openarx-contracts-nie7; file-only since w7um §17.2) ──
@@ -173,10 +174,15 @@ export function validateContentInputs(
   return null; // content_ref is validated against portal_pending_uploads; archive validates during staging
 }
 
-/** Structured ArchiveIntakeError → tool error envelope; rethrows the rest. */
+/** Structured ArchiveIntakeError → §23 tier-1 tool envelope; rethrows the rest. */
 function archiveErrorResult(e: unknown): { content: Array<{ type: 'text'; text: string }> } {
   if (e instanceof ArchiveIntakeError) {
-    return jsonResult({ error: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) });
+    const r = jsonResult({
+      ok: false, tier: 1, error: e.code, reason_codes: [e.code],
+      message: e.message, ...(e.details ? { details: e.details } : {}),
+    });
+    (r as Record<string, unknown>).isError = true;
+    return r;
   }
   throw e;
 }
@@ -271,7 +277,11 @@ export const SKIP_BILLING_MARKER = '__skipBilling';
  * can fix and retry — not billed.
  */
 export function isChargeablePublishStatus(status: number): boolean {
-  return status === 202 || status === 409;
+  // §23 (contract 2a3ae4e): 202/409 = success/replay (charged, kept);
+  // 422 = Tier-2 LLM reject (charged, then Portal refunds cost − penalty);
+  // 5xx = Tier-3 technical (charged, then Portal refunds in full).
+  // Only 400-class Tier-1 rejects stay un-billed (__skipBilling).
+  return status === 202 || status === 409 || status === 422 || status >= 500;
 }
 
 /**
@@ -316,6 +326,22 @@ async function callPublishEndpoint(payload: Record<string, unknown>): Promise<{ 
 function toolResultFromPublish(r: { status: number; body: unknown }): PublishToolResult {
   const result = jsonResult(r.body) as PublishToolResult;
   if (!isChargeablePublishStatus(r.status)) result[SKIP_BILLING_MARKER] = true;
+  // MCP isError on every reject body (4xx/5xx) — QA openarx-tester-huz;
+  // mirrors the layer2 profile convention (333bd5f).
+  if (r.status >= 400 && r.status !== 409) (result as Record<string, unknown>).isError = true;
+  // §23.5 W2: on a Tier-2/3 envelope the gateway must, AFTER deducting the
+  // full cost, notify Portal of the ledger refund op. Tag the tool result;
+  // the gateway wrapper reads + strips it (same mechanism as __skipBilling).
+  const b = r.body as Record<string, unknown> | null;
+  if (b && (b.tier === 2 || b.tier === 3) && typeof b.credits_refunded === 'number') {
+    (result as Record<string, unknown>).__refundNotify = {
+      tier: b.tier,
+      amount: b.credits_refunded,
+      penalty: typeof b.penalty === 'number' ? b.penalty : 0,
+      reason: typeof b.error === 'string' ? b.error : 'unknown',
+      core_document_id: (b.core_document_id as string | null) ?? null,
+    };
+  }
   return result;
 }
 
@@ -326,9 +352,13 @@ function skipBilling<T extends { content: Array<{ type: 'text'; text: string }> 
   return result;
 }
 
-/** A billing-exempt tool error envelope. */
+/** A billing-exempt tool error envelope — §23 Tier-1 shape (QA
+ *  openarx-tester-9fw: uniform {ok:false, tier:1, ...} across ALL pre-charge
+ *  rejects, tool-layer included) + MCP isError (QA openarx-tester-huz). */
 function skipBilledError(error: string, message: string): PublishToolResult {
-  return skipBilling(jsonResult({ error, message }));
+  const r = skipBilling(jsonResult({ ok: false, tier: 1, error, reason_codes: [error], message }));
+  (r as Record<string, unknown>).isError = true;
+  return r;
 }
 
 interface PendingUploadRow {
@@ -545,7 +575,12 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       // Validation must be IDENTICAL for dry_run and real submits — same
       // schema (SDK level), same refine here; the dry_run branch comes after.
       const inputError = validateContentInputs(content_archive_base64, content_ref);
-      if (inputError) return skipBilling(jsonResult(inputError));
+      if (inputError) {
+        // §23 tier-1 shape + isError (QA openarx-tester-9fw residual, A3 path)
+        const r = skipBilling(jsonResult({ ok: false, tier: 1, reason_codes: [inputError.error], ...inputError }));
+        (r as Record<string, unknown>).isError = true;
+        return r;
+      }
 
       // File-only staging (w7um §17.2): a base64 ZIP is written raw under
       // PORTAL_STORAGE; a content_ref upload is passed through. The endpoint
@@ -608,6 +643,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
         // the full Portal metadata set is forwarded verbatim (§17.5).
         const published = await callPublishEndpoint({
           user_id: portalToken?.userId,
+          charged_credits: (extra as unknown as Record<string, unknown>)._effectiveCost as number | undefined,
           title,
           abstract,
           authors: endpointAuthors(authors),
@@ -743,7 +779,12 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       // schema (SDK level), same refine here; the dry_run branch comes after
       // prev-doc resolution so would_save reflects real inheritance.
       const inputError = validateContentInputs(content_archive_base64, content_ref);
-      if (inputError) return skipBilling(jsonResult(inputError));
+      if (inputError) {
+        // §23 tier-1 shape + isError (QA openarx-tester-9fw residual, A3 path)
+        const r = skipBilling(jsonResult({ ok: false, tier: 1, reason_codes: [inputError.error], ...inputError }));
+        (r as Record<string, unknown>).isError = true;
+        return r;
+      }
 
       const prevDoc = await ctx.documentStore.getById(previous_document_id);
       if (!prevDoc) return jsonResult({ error: 'not_found', message: 'Previous document not found' });
@@ -807,6 +848,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       // content_source (w7um §17.1) + verbatim metadata (§17.5).
       const published = await callPublishEndpoint({
         user_id: portalToken?.userId,
+        charged_credits: (extra as unknown as Record<string, unknown>)._effectiveCost as number | undefined,
         title,
         abstract,
         authors: endpointAuthors(authors),

@@ -90,7 +90,11 @@ export class RunnerSocketServer {
 
     this.dispatch(cmd).then(
       (resp) => this.sendResponse(conn, resp),
-      (err) => this.sendResponse(conn, { ok: false, error: err instanceof Error ? err.message : String(err) }),
+      (err) =>
+        this.sendResponse(conn, {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        }),
     );
   }
 
@@ -99,12 +103,25 @@ export class RunnerSocketServer {
       case 'ingest': {
         const run = cmd.retry
           ? await this.service.retry(cmd.limit)
-          : await this.service.ingest(cmd.limit, cmd.direction, cmd.dateFrom, cmd.dateTo, cmd.strategy, cmd.bypassEmbedCache, cmd.categories, cmd.downloadedFirst);
+          : await this.service.ingest(
+              cmd.limit,
+              cmd.direction,
+              cmd.dateFrom,
+              cmd.dateTo,
+              cmd.strategy,
+              cmd.bypassEmbedCache,
+              cmd.categories,
+              cmd.downloadedFirst,
+              cmd.reindexRequestedFirst,
+            );
         return { ok: true, data: run };
       }
       case 'registry_update': {
         const run = await this.service.registryUpdate({
-          dateFrom: cmd.dateFrom, dateTo: cmd.dateTo, direction: cmd.direction, limit: cmd.limit,
+          dateFrom: cmd.dateFrom,
+          dateTo: cmd.dateTo,
+          direction: cmd.direction,
+          limit: cmd.limit,
         });
         return { ok: true, data: run };
       }
@@ -115,10 +132,6 @@ export class RunnerSocketServer {
       case 'status': {
         const status = await this.service.status();
         return { ok: true, data: status };
-      }
-      case 'coverage': {
-        const cov = await this.service.coverage();
-        return { ok: true, data: cov };
       }
       case 'history': {
         const runs = await this.service.history(cmd.limit);

@@ -1,0 +1,33 @@
+{
+  "claim": {
+    "version": "v1",
+    "node": { "indexed_properties": ["attester_id", "run_id", "claim_status"] },
+    "vector": {
+      "projection": "[Context] {{run}} {{edges}}\n[Claim] {{text}} {{caveats}}",
+      "payload": ["modality", "claim_type", "claim_status", "verification_outcome", "attester_id", "run_id", "is_superseded", "attested_at"],
+      "payload_indexed": { "keyword": ["claim_type", "claim_status", "attester_id", "run_id"], "bool": ["is_superseded"] },
+      "models": ["gemini", "specter2"]
+    },
+    "read": { "strip_fields": ["track_note"], "pointer_when": { "field": "excerpt", "unless": "distributable" } }
+  },
+  "relation": {
+    "version": "v1",
+    "node": { "indexed_properties": ["attester_id", "run_id", "relation", "direction", "is_superseded"] },
+    "read": { "strip_fields": ["track_note"] }
+  },
+  "activity": {
+    "version": "v1",
+    "node": { "indexed_properties": ["attester_id", "run_id", "activity_type", "is_superseded"] },
+    "read": { "strip_fields": ["track_note"] }
+  },
+  "metric": {
+    "version": "v1",
+    "node": { "indexed_properties": ["attester_id", "run_id", "metric_type", "metric_name", "is_superseded"] },
+    "read": { "strip_fields": ["track_note"] }
+  },
+  "bundle": {
+    "version": "v1",
+    "node": { "indexed_properties": ["attester_id", "run_id", "is_superseded"] },
+    "read": { "strip_fields": ["track_note"] }
+  }
+}

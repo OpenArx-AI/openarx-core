@@ -1,0 +1,744 @@
+{
+  "methodology_version": "v1.3",
+  "_meta": {
+    "owner": "msi:openarx-methodist (content source-of-truth)",
+    "schema": "methodist_framework_v2.md §5 (procedures/steps/gate/route); door surface §3 (focus? on diagnose/course)",
+    "prompt_bodies": "design/methodist_v2/door_prompts.md (by door id) — Core lifts executable bodies from there; kept DRY, must stay in sync",
+    "primitives": "all v1; names = framework §6 vocabulary; wired by (id, version)",
+    "core_sync_needed": "exact I/O form of state-primitives finalized in Phase 2 against the live graph. Slot names aligned to Core's confirmed target column (tickets ...-0588/0589).",
+    "gated_disabled": "dedup-detect composition present in framework §6 but GATED (Vlad's standing requirement — own trial before autonomous). NOT wired into the live checkpoint publish path this wave.",
+    "confirmed_semantics": {
+      "verdict_branch": "write-graph-records branches internally on verdict: GO → scientific claim + quality-stamp; RETURN → path/fact only (attempt+why), NOT a claim. Upstream transforms run unconditionally (§5.4).",
+      "update_run_state": "one primitive, variant params, branch-by-data internally (verdict=GO → go_mark+advance; RETURN → no go_mark; status→set).",
+      "create_corrective_activity": "RESERVED for supersede-of-published-claim (GO refinement of a prior claim; immutability add+link §7 inv-6), input from apply-supersede-guards — NOT fired on RETURN (RETURN corrections live in the checkpoint_return outcome-activity's activity_content). Dormant in the live checkpoint this wave (tied to gated dedup/supersede). ticket ...-0597.",
+      "vectorize_and_store": "no-op on RETURN (no claim → no vector), branch-by-data-null. [confirm Core]",
+      "update_dossier_mapping": "derives delta from verdict+tier_signal: autonomy_by_context[cycle] ONLY from verdict.next_dose.autonomy.level (carrier judgment, never GO-count); tier_by_context[creative_element]=tier_signal.target_tier (only when probe fired); passed_units+=unit on GO-with-unit; corrections_history RETURN→not_yet / GO→mark-applied; patches_received+=verdict.patches.",
+      "update_dossier_mapping_ownership": "These rules are METHODOLOGY-OWNED POLICY, not primitive-intrinsic (framework §6: primitives are methodology-agnostic). v1: Core hardwires them into update-dossier for the single methodology (YAGNI, ticket ...-0590/0591). Target form: params-driven (rules as methodology params → generic flat-map writer). This _meta block is the SOURCE OF TRUTH for the rules; changing them is a methodology patch (methods-council), not a primitive change. Lift to params on the second methodology.",
+      "dose_storage": "property of the run node (Neo4j); current dose only; dose history = immutable journal activities.",
+      "agent_id_credential_id": "diagnose input agent_id maps to create-run credential_id (one entity) — confirm no lookup needed [Core]."
+    }
+  },
+  "prompts": {
+    "diagnose": "see door_prompts.md#D1 (ROLE + cycle diagnosis with signs + first dose; density from autonomy_by_context; focus? steers probe class)",
+    "checkpoint": "see door_prompts.md#D2 (two-axis: methodology-adherence + result-quality → GO|RETURN quality-stamp; verdict-by-criteria-not-match; tier-gate if probe present)",
+    "ask": "see door_prompts.md (merged course+consult: mid-stage direction/clarification, frame-anchored to cycle/stage; MAY adjust dose data-driven (course-mode) else pure clarification (consult-mode); never advance stage; never do the work)",
+    "verify": "see door_prompts.md#verify (claim↔evidence entailment; VERIFIED|UNVERIFIABLE; annotate not reject)"
+  },
+  "schemas": {
+    "diagnose_out": {
+      "cycle": "str",
+      "entry_point": "str",
+      "signs": "str[]",
+      "dose": {
+        "stage": "int",
+        "operations": "str[]",
+        "beacons": "str[]",
+        "expected_artifacts": "str[]",
+        "counters": "str[]",
+        "probe": {
+          "_opt": "creative stages only; injected by diagnose/course from tier-gate bank (tier_gate_and_course.md Part 2)",
+          "creative_element": "str — MANDATORY (Core keys tier_by_context from it)",
+          "tier": "str",
+          "task": "str",
+          "reference": "str (grading anchor; NOT shown to mentee as an answer)",
+          "D_criteria": "str"
+        },
+        "unit_id": "str?",
+        "unit_level": "str?"
+      },
+      "rationale": "str"
+    },
+    "checkpoint_verdict": {
+      "verdict": "GO|RETURN",
+      "methodology_adherence": {
+        "followed": "bool",
+        "notes": "str",
+        "crosscheck_flag": "bool?"
+      },
+      "quality": {
+        "dimensions": [
+          {
+            "name": "str",
+            "level": "str"
+          }
+        ],
+        "stamp_claim_text": "str?"
+      },
+      "tier_signal": {
+        "target_tier": "str (what Core writes to tier_by_context[creative_element])",
+        "probe_outcome": "pass|fail (route: fail→repeat-stage-simpler / pass→proceed-at-tier)",
+        "_vertex": "OPTIONAL — put in Vertex OBJECT `properties` so the model CAN emit it, but NOT in `required` (present only on creative stages where a probe was injected)"
+      },
+      "reasons": "str[]",
+      "corrections": [
+        {
+          "what": "str",
+          "why": "str",
+          "must_apply_before": "str"
+        }
+      ],
+      "patches": [
+        {
+          "id": "str",
+          "formulation": "str",
+          "applies_at": "str"
+        }
+      ],
+      "next_dose": "dose?"
+    },
+    "ask_out": {
+      "answer": "str",
+      "dose_adjustment": {
+        "_opt": "present only when the dose needs a mid-stage adjustment (course-mode); absent for pure clarification (consult-mode)",
+        "added_operations": "str[]?",
+        "patch": {
+          "id": "str",
+          "formulation": "str"
+        },
+        "beacon": "str?"
+      }
+    },
+    "verify_out": {
+      "outcome": "VERIFIED|UNVERIFIABLE",
+      "reason_category": "str",
+      "caveat": "str?"
+    },
+    "submission": {
+      "trace": "str",
+      "artifacts": [
+        {
+          "name": "str",
+          "uri_or_inline": "str",
+          "content_hash": "str"
+        }
+      ],
+      "counters": "obj",
+      "track_note": {
+        "intended": "str",
+        "did": "str",
+        "derived": "str"
+      },
+      "records": [
+        {
+          "local_id": "_:str",
+          "kind": "claim|relation|activity",
+          "_fields": "per layer_2 pillar §12; relation.source/target ref _:local_id; present ONLY on write-path stages"
+        }
+      ]
+    }
+  },
+  "procedures": [
+    {
+      "name": "diagnose",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "diagnose"
+      },
+      "steps": [
+        {
+          "id": "dossier",
+          "primitive": "fetch-dossier",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id"
+          },
+          "out": "dossier"
+        },
+        {
+          "id": "run",
+          "primitive": "create-run",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id",
+            "parent_run_id": "$input.payload.parent_run_id"
+          },
+          "out": "run"
+        },
+        {
+          "id": "ctx",
+          "primitive": "prepare-context",
+          "version": "v1",
+          "params": {
+            "prompt": "diagnose"
+          },
+          "in": {
+            "intent": "$input.payload.intent",
+            "focus": "$input.payload.focus",
+            "dossier_map": "$dossier.map"
+          },
+          "out": "ctx"
+        },
+        {
+          "id": "diag",
+          "primitive": "call-model",
+          "version": "v1",
+          "params": {
+            "output_schema": "diagnose_out",
+            "model": "gemini-3.1-pro-preview"
+          },
+          "in": {
+            "context": "$ctx"
+          },
+          "out": "diag"
+        },
+        {
+          "id": "persist",
+          "primitive": "update-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$run.run_id",
+            "stage": {
+              "const": 1
+            },
+            "cycle": "$diag.cycle",
+            "dose": "$diag.dose"
+          }
+        },
+        {
+          "id": "jrnl",
+          "primitive": "append-journal",
+          "version": "v1",
+          "in": {
+            "run_id": "$run.run_id",
+            "event": {
+              "const": "diagnose"
+            },
+            "payload": {
+              "intent": "$input.payload.intent",
+              "diagnosis": "$diag"
+            }
+          }
+        }
+      ],
+      "outcome_from": "diag",
+      "route": {
+        "default": {
+          "run_id": "$run.run_id",
+          "dose": "$diag.dose",
+          "rationale": "$diag.rationale"
+        }
+      }
+    },
+    {
+      "name": "checkpoint",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "checkpoint"
+      },
+      "_note": "Core of the protocol. Deterministic guards are early gates. Model call produces the two-axis verdict. Publish path folds in, driven by verdict (§4). Persist runs unconditionally (branch by data). dedup-detect NOT wired (gated).",
+      "steps": [
+        {
+          "id": "idem",
+          "primitive": "check-idempotency",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "stage": "$input.payload.stage",
+            "submission_hash": "$input.payload.submission_hash"
+          },
+          "out": "idem",
+          "gate": {
+            "when": "$idem.hit",
+            "outcome": "idempotent"
+          }
+        },
+        {
+          "id": "runpath",
+          "primitive": "fetch-run-path",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runpath"
+        },
+        {
+          "id": "stop",
+          "primitive": "check-stop-rule",
+          "version": "v1",
+          "in": {
+            "path_events": "$runpath.path_events",
+            "stage": "$input.payload.stage"
+          },
+          "out": "stop",
+          "gate": {
+            "when": "$stop.prev_not_go",
+            "outcome": "prev_stage_not_go"
+          }
+        },
+        {
+          "id": "runst",
+          "primitive": "fetch-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runst"
+        },
+        {
+          "id": "dossier",
+          "primitive": "fetch-dossier",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id"
+          },
+          "out": "dossier"
+        },
+        {
+          "id": "xcheck",
+          "primitive": "crosscheck-tool-usage",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "claimed_usage": "$input.payload.claimed_usage"
+          },
+          "out": "xcheck"
+        },
+        {
+          "id": "ctx",
+          "primitive": "prepare-context",
+          "version": "v1",
+          "params": {
+            "prompt": "checkpoint"
+          },
+          "in": {
+            "submission": "$input.payload.submission",
+            "dose": "$runst.dose",
+            "dossier_map": "$dossier.map",
+            "crosscheck": "$xcheck"
+          },
+          "out": "ctx"
+        },
+        {
+          "id": "verdict",
+          "primitive": "call-model",
+          "version": "v1",
+          "params": {
+            "output_schema": "checkpoint_verdict",
+            "model": "gemini-3.1-pro-preview"
+          },
+          "in": {
+            "context": "$ctx"
+          },
+          "out": "verdict"
+        },
+        {
+          "id": "resolved",
+          "primitive": "resolve-local-ids",
+          "version": "v1",
+          "in": {
+            "submission": "$input.payload.submission",
+            "verdict": "$verdict"
+          },
+          "out": "resolved"
+        },
+        {
+          "id": "validated",
+          "primitive": "validate-schema",
+          "version": "v1",
+          "in": {
+            "records": "$resolved"
+          },
+          "out": "validated",
+          "params": {
+            "schema_ref": "layer2_v12"
+          }
+        },
+        {
+          "id": "lang",
+          "primitive": "detect-language",
+          "version": "v1",
+          "in": {
+            "records": "$resolved"
+          },
+          "out": "lang"
+        },
+        {
+          "id": "vctx",
+          "primitive": "prepare-context",
+          "version": "v1",
+          "params": {
+            "prompt": "verify"
+          },
+          "in": {
+            "records": "$resolved"
+          },
+          "out": "vctx"
+        },
+        {
+          "id": "vstatus",
+          "primitive": "call-model",
+          "version": "v1",
+          "params": {
+            "output_schema": "verify_out",
+            "model": "gemini-3.1-pro-preview"
+          },
+          "in": {
+            "context": "$vctx"
+          },
+          "out": "vstatus"
+        },
+        {
+          "id": "canon",
+          "primitive": "canonicalize",
+          "version": "v1",
+          "in": {
+            "records": "$resolved"
+          },
+          "out": "canon",
+          "params": {
+            "hash_scope": "frame_default"
+          }
+        },
+        {
+          "id": "guarded",
+          "primitive": "apply-supersede-guards",
+          "version": "v1",
+          "in": {
+            "records": "$canon"
+          },
+          "out": "guarded"
+        },
+        {
+          "id": "hash",
+          "primitive": "compute-hash",
+          "version": "v1",
+          "in": {
+            "records": "$canon"
+          },
+          "out": "hash"
+        },
+        {
+          "id": "written",
+          "primitive": "write-graph-records",
+          "version": "v1",
+          "in": {
+            "records": "$guarded",
+            "verdict": "$verdict",
+            "verify_status": "$vstatus",
+            "language": "$lang",
+            "hash": "$hash",
+            "track_note": "$input.payload.submission.track_note",
+            "credential_id": "$input.agent_id",
+            "run_id": "$input.run_id",
+            "stage": "$input.payload.stage",
+            "cycle": "$runst.cycle"
+          },
+          "_note": "assembles the outcome-activity (checkpoint_go|checkpoint_return) carrying activity_content{run_id, stage, cycle_context, quality (GO), reasons+corrections (RETURN), track_note (both)}; GO also writes annotated scientific claims; RETURN writes only the outcome-activity (no claim).",
+          "out": "written"
+        },
+        {
+          "id": "committed",
+          "primitive": "commit-bundle-atomic",
+          "version": "v1",
+          "in": {
+            "written": "$written"
+          },
+          "out": "committed"
+        },
+        {
+          "id": "vec",
+          "primitive": "vectorize-and-store",
+          "version": "v1",
+          "in": {
+            "committed": "$committed"
+          },
+          "out": "vec"
+        },
+        {
+          "id": "rstate",
+          "primitive": "update-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "stage": "$input.payload.stage",
+            "verdict": "$verdict",
+            "next_dose": "$verdict.next_dose"
+          }
+        },
+        {
+          "id": "dwrite",
+          "primitive": "update-dossier",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id",
+            "verdict": "$verdict",
+            "tier_signal": "$verdict.tier_signal",
+            "cycle": "$runst.cycle",
+            "creative_element": "$runst.dose.probe.creative_element",
+            "unit_id": "$runst.dose.unit_id",
+            "unit_level": "$runst.dose.unit_level"
+          }
+        }
+      ],
+      "outcome_from": "verdict",
+      "route": {
+        "GO": {
+          "verdict": {
+            "const": "GO"
+          },
+          "next_dose": "$verdict.next_dose",
+          "reasons": "$verdict.reasons"
+        },
+        "RETURN": {
+          "verdict": {
+            "const": "RETURN"
+          },
+          "reasons": "$verdict.reasons",
+          "corrections": "$verdict.corrections"
+        },
+        "idempotent": {
+          "outcome": "$idem.outcome.verdict",
+          "reasons": "$idem.outcome.reasons",
+          "corrections": "$idem.outcome.corrections",
+          "ref": "$idem.outcome.ref"
+        },
+        "prev_stage_not_go": {
+          "error": {
+            "const": "prev_stage_not_go"
+          },
+          "missing": "$stop.missing"
+        }
+      }
+    },
+    {
+      "name": "ask",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "ask"
+      },
+      "_note": "MERGED course+consult (single-door route, §3). Mid-stage guidance/clarification within the CURRENT cycle-stage dose; frame-anchored (cycle/stage prominent, anti-drift). MAY emit a dose_adjustment (course-mode, data-driven) or answer as pure clarification (consult-mode). NEVER advances the stage; never does the mentee's work (boundary 1). update-run-state applies dose_adjustment branch-by-data (no-op when absent → consult-mode leaves state unchanged).",
+      "steps": [
+        {
+          "id": "runst",
+          "primitive": "fetch-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runst"
+        },
+        {
+          "id": "dossier",
+          "primitive": "fetch-dossier",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id"
+          },
+          "out": "dossier"
+        },
+        {
+          "id": "ctx",
+          "primitive": "prepare-context",
+          "version": "v1",
+          "params": {
+            "prompt": "ask"
+          },
+          "in": {
+            "question": "$input.payload.question",
+            "focus": "$input.payload.focus",
+            "cycle": "$runst.cycle",
+            "stage": "$runst.stage",
+            "dose": "$runst.dose",
+            "dossier_map": "$dossier.map"
+          },
+          "out": "ctx"
+        },
+        {
+          "id": "out",
+          "primitive": "call-model",
+          "version": "v1",
+          "params": {
+            "output_schema": "ask_out",
+            "model": "gemini-3.1-pro-preview"
+          },
+          "in": {
+            "context": "$ctx"
+          },
+          "out": "out"
+        },
+        {
+          "id": "adj",
+          "primitive": "update-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "dose_adjustment": "$out.dose_adjustment",
+            "advance_stage": {
+              "const": false
+            }
+          }
+        },
+        {
+          "id": "jrnl",
+          "primitive": "append-journal",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "event": {
+              "const": "ask"
+            },
+            "payload": "$out"
+          }
+        }
+      ],
+      "outcome_from": "out",
+      "route": {
+        "default": {
+          "answer": "$out.answer",
+          "dose_adjustment": "$out.dose_adjustment"
+        }
+      }
+    },
+    {
+      "name": "get_current_dose",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "get_current_dose"
+      },
+      "_note": "deterministic, no model — session-death recovery",
+      "steps": [
+        {
+          "id": "runst",
+          "primitive": "fetch-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runst"
+        },
+        {
+          "id": "runpath",
+          "primitive": "fetch-run-path",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runpath"
+        },
+        {
+          "id": "status",
+          "primitive": "derive-run-status",
+          "version": "v1",
+          "params": {
+            "process_ref": "final_stage_by_cycle"
+          },
+          "in": {
+            "path_events": "$runpath.path_events",
+            "cycle": "$runst.cycle"
+          },
+          "out": "status"
+        }
+      ],
+      "outcome_from": "runst",
+      "route": {
+        "default": {
+          "dose": "$runst.dose",
+          "stage": "$runst.stage",
+          "status": "$status.status"
+        }
+      }
+    },
+    {
+      "name": "report_need",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "report_need"
+      },
+      "_note": "deterministic — log need + pause run",
+      "steps": [
+        {
+          "id": "pause",
+          "primitive": "update-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "need": "$input.need"
+          }
+        },
+        {
+          "id": "jrnl",
+          "primitive": "append-journal",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id",
+            "event": {
+              "const": "report_need"
+            },
+            "payload": "$input.need"
+          }
+        }
+      ],
+      "route": {
+        "default": {
+          "recorded": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "name": "methodist",
+      "trigger": {
+        "kind": "endpoint",
+        "ref": "methodist"
+      },
+      "_note": "Single-door dispatcher (§3.1). fetch-run-state → route-intent decides diagnose|checkpoint|ask from run_state + payload, then dispatches to that sub-procedure. PUBLISH-SAFETY: checkpoint fires ONLY when the payload carries an explicit submission_hash (route-intent never synthesizes it); an artifact WITHOUT submission_hash always routes to ask, never to checkpoint.",
+      "steps": [
+        {
+          "id": "runst",
+          "primitive": "fetch-run-state",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runst"
+        },
+        {
+          "id": "route",
+          "primitive": "route-intent",
+          "version": "v1",
+          "params": {
+            "publish_signal": [
+              {
+                "field": "submission_hash"
+              }
+            ]
+          },
+          "in": {
+            "run_state": "$runst",
+            "payload": "$input.payload"
+          },
+          "out": "route",
+          "dispatch": {
+            "routes": {
+              "diagnose": "diagnose",
+              "checkpoint": "checkpoint",
+              "ask": "ask"
+            }
+          }
+        }
+      ],
+      "route": {}
+    }
+  ],
+  "_non_model_channels": {
+    "_note": "escalate + get_my_development are NON-model channels (framework §3), not carrier doors. Likely direct endpoint→primitive, no procedure needed; included minimally for completeness — confirm with Core whether they route through the interpreter or bypass it.",
+    "get_my_development": [
+      "fetch-dossier(credential_id) → dossier (pure DB read)"
+    ],
+    "escalate": [
+      "append-journal + create-corrective-activity(issue,class) → ticket (no model)"
+    ]
+  },
+  "_process": {
+    "_note": "§12.1 process-layer VALUES (methodist-owned; 2e reads from the methodology object). final_stage_by_cycle drives the run-derived `done` status (a checkpoint_go on the final stage). path_node_shapes = the field-sets of the typed path nodes. Process nodes are opaque/not content-addressed (§12.1); hash-scopes are NOT here. ⚠ NB: course_event + consult_event MERGED → ask_event — the single-door merge (in main) means the `ask` procedure journals a const `ask` event, so course/consult path-nodes no longer occur; ask_event carries the ask_out fields.",
+    "final_stage_by_cycle": { "c1": 6, "c2": 8, "c3": 6, "c4": 7, "c5": 8, "c6": 7, "c8": 7, "c9": 7 },
+    "path_node_shapes": {
+      "dose_issued": { "dose_content": ["operations", "beacons", "expected_artifacts", "counters", "probe?", "unit?"] },
+      "checkpoint_go": ["quality_stamp", "methodology_adherence", "reasons", "tier_signal?", "patches?", "next_dose_ref?", "track_note"],
+      "checkpoint_return": ["methodology_adherence", "reasons", "corrections", "tier_signal?", "patches?", "track_note"],
+      "ask_event": ["answer", "dose_adjustment?"],
+      "report_need": ["need"]
+    }
+  }
+}

@@ -1,7 +1,7 @@
 /**
  * RunnerService — business logic for the pipeline runner daemon.
  *
- * Handles: ingest (forward/backfill), stop, status, coverage, history.
+ * Handles: ingest (forward/backfill), stop, status, history.
  * Integrates arXiv fetching + document registration + PipelineOrchestrator.
  */
 
@@ -20,26 +20,24 @@ import {
 import type { Document } from '@openarx/types';
 import { PipelineOrchestrator } from '../pipeline/orchestrator.js';
 import { ReconciliationLoop } from './reconciliation-loop.js';
+import { CoverageRefreshLoop } from './coverage-refresh-loop.js';
 import { PwcLoader } from '../pipeline/enricher/pwc-loader.js';
 import { ArxivSource } from '../sources/arxiv-source.js';
 import type { ArxivEntry } from '../sources/arxiv-source.js';
 import { createChildLogger } from '../lib/logger.js';
-import { buildListedRows, buildListedInsertSql, flattenListedRows } from '../lib/listed-registry.js';
+import {
+  buildListedRows,
+  buildListedInsertSql,
+  flattenListedRows,
+} from '../lib/listed-registry.js';
 import { resolveDateBounds } from './date-bounds.js';
 import { Channel } from '../pipeline/channel.js';
 import { initProxyPool } from '../lib/proxy-pool.js';
 import { Semaphore } from '../lib/semaphore.js';
-import type {
-  Direction,
-  PipelineRun,
-  StatusResult,
-  CoverageResult,
-  AuditResult,
-} from './types.js';
+import type { Direction, PipelineRun, StatusResult, AuditResult } from './types.js';
 
 const log = createChildLogger('runner-service');
 
-const RATE_LIMIT_MS = 3000;
 const DATA_DIR = process.env.RUNNER_DATA_DIR ?? join(process.cwd(), 'data/samples/arxiv');
 
 /**
@@ -61,16 +59,36 @@ const DAY_FAILURE_BURST_THRESHOLD = 5;
 const DAY_FAILURE_BURST_WINDOW_MS = 60_000;
 
 /**
+ * Permanent (document-level) download failure — the source file is gone from
+ * arXiv (withdrawn / no-pdf), retrying can never help. These docs are closed
+ * as download_failed and MUST NOT feed the consecutive-failure burst counter:
+ * the auto-stop guard exists for infrastructure outages (network down, arXiv
+ * 5xx), and old-year day tails are dense with permanent 404s — counting them
+ * false-trips the guard and kills healthy backward waves (openarx-gf2h,
+ * run fba5c0e9: 150/150 errors were plain 404s).
+ *
+ * Message shape from arxiv-source: `Download failed: ${status} ${url}`.
+ * 4xx = permanent, EXCEPT 408 (request timeout) and 429 (rate limit), which
+ * are transient and must keep counting.
+ */
+export function isPermanentDownloadFailure(errMsg: string): boolean {
+  const m = /^Download failed: (\d{3}) /.exec(errMsg);
+  if (!m) return false;
+  const status = Number(m[1]);
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/**
  * Set by a producer when it bails out because consecutive day-failures
  * within DAY_FAILURE_BURST_WINDOW_MS exceed the threshold. Surfaced up to
  * runAllDirections so the finalize block can mark the run as failed and
  * write the cause into pipeline_runs.metrics.auto_stop.
  */
 export interface InfraFailure {
-  reason: string;          // e.g. 'consecutive_day_failures'
-  count: number;           // number of consecutive failures observed
-  windowMs: number;        // span of the burst from first to last failure
-  lastError: string;       // error message from the most recent failure
+  reason: string; // e.g. 'consecutive_day_failures'
+  count: number; // number of consecutive failures observed
+  windowMs: number; // span of the burst from first to last failure
+  lastError: string; // error message from the most recent failure
 }
 
 function minDate(a: Date | null, b: Date | null): Date | null {
@@ -83,10 +101,6 @@ function maxDate(a: Date | null, b: Date | null): Date | null {
   if (!a) return b;
   if (!b) return a;
   return a > b ? a : b;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Inclusive list of YYYY-MM-DD days, ascending. */
@@ -119,11 +133,18 @@ export class RunnerService {
 
   private documentStore: PgDocumentStore;
   private reconciliationLoop?: ReconciliationLoop;
+  private coverageRefreshLoop?: CoverageRefreshLoop;
   private vectorStore: QdrantVectorStore;
   private orchestrator!: PipelineOrchestrator;
   private arxivSource: ArxivSource;
 
   private currentRunId: string | null = null;
+  /** Synchronous busy-claim latch (openarx-y9ef). Set the instant a run is
+   *  claimed — BEFORE any await in ingest/registryUpdate/retry — so a second
+   *  concurrent command can't slip through the isRunning() check while the
+   *  first is still awaiting its INSERT and start a duplicate run. currentRunId
+   *  takes over the lock once the row exists; on setup error the latch clears. */
+  private starting = false;
   private currentStrategy: 'license_aware' | 'force_full' = 'license_aware';
   private currentBypassEmbedCache = false;
   /** Per-run categories — post-fetch processing filter. null = no filter,
@@ -153,7 +174,10 @@ export class RunnerService {
     try {
       await this.vectorStore.initDeletedPayloadIndex();
     } catch (err) {
-      log.warn({ err: err instanceof Error ? err.message : err }, 'Qdrant deleted-index init non-fatal');
+      log.warn(
+        { err: err instanceof Error ? err.message : err },
+        'Qdrant deleted-index init non-fatal',
+      );
     }
 
     // Soft-delete reconciliation loop (spec §7.1). Starts timer; ticks
@@ -161,6 +185,12 @@ export class RunnerService {
     // failures.
     this.reconciliationLoop = new ReconciliationLoop(this.vectorStore);
     this.reconciliationLoop.start();
+
+    // Coverage matview refresh (mv_coverage, migration 034) — drives Console's
+    // fast coverage/category aggregates. Refreshes during ingest runs + idle
+    // fallback. isRunning is read live so refreshes track run activity.
+    this.coverageRefreshLoop = new CoverageRefreshLoop(() => this.isRunning);
+    this.coverageRefreshLoop.start();
 
     // Crash recovery: reset documents stuck in intermediate statuses
     const stuck = await query<{ status: string; cnt: string }>(
@@ -215,7 +245,9 @@ export class RunnerService {
     log.info({ url: embedServiceUrl }, 'embed-service client configured');
 
     this.orchestrator = new PipelineOrchestrator(
-      this.documentStore, this.vectorStore, modelRouter,
+      this.documentStore,
+      this.vectorStore,
+      modelRouter,
       { pwcLoader, embedClient },
     );
 
@@ -230,7 +262,7 @@ export class RunnerService {
   }
 
   get isRunning(): boolean {
-    return this.currentRunId !== null;
+    return this.starting || this.currentRunId !== null;
   }
 
   // ─── Commands ────────────────────────────────────────────
@@ -244,6 +276,7 @@ export class RunnerService {
     bypassEmbedCache?: boolean,
     categories?: string[],
     downloadedFirst?: boolean,
+    reindexRequestedFirst?: boolean,
   ): Promise<PipelineRun> {
     if (this.isRunning) {
       throw new Error('Already running. Use "openarx status" to check progress.');
@@ -255,19 +288,21 @@ export class RunnerService {
     //   pending_only → downloaded-backlog-only run (no dates needed).
     let effectiveDirection: 'forward' | 'backward' = 'forward';
     let effectiveDownloadedFirst = downloadedFirst === true;
+    const effectiveReindexRequested = reindexRequestedFirst === true;
     if (direction === 'backward' || direction === 'backfill') effectiveDirection = 'backward';
     else if (direction === 'pending_only') effectiveDownloadedFirst = true;
 
-    if (!dateFrom && !dateTo && !effectiveDownloadedFirst) {
-      throw new Error('At least one of dateFrom/dateTo is required (or set downloadedFirst to process the downloaded backlog only).');
+    // reindexRequestedFirst, like downloadedFirst, operates on a backlog (demanded
+    // abstract_only docs) and needs no date range.
+    if (!dateFrom && !dateTo && !effectiveDownloadedFirst && !effectiveReindexRequested) {
+      throw new Error(
+        'At least one of dateFrom/dateTo is required (or set downloadedFirst / reindexRequestedFirst to process a backlog only).',
+      );
     }
 
     this.stopRequested = false;
     this.stopSignal = { requested: false };
     this.abortController = new AbortController();
-
-    // Sync coverage_map with actual DB state (catches docs from retries, manual reprocessing, etc.)
-    await this.syncCoverageMap();
 
     // Create pipeline_run record with launch params in metrics
     const runId = randomUUID();
@@ -275,9 +310,8 @@ export class RunnerService {
     const effectiveBypassEmbedCache = bypassEmbedCache === true;
     // No env fallback: if caller didn't pass categories, currentCategories
     // stays null and the registry selection takes every category.
-    const effectiveCategories = (categories && categories.length > 0)
-      ? categories.map((c) => c.trim()).filter(Boolean)
-      : null;
+    const effectiveCategories =
+      categories && categories.length > 0 ? categories.map((c) => c.trim()).filter(Boolean) : null;
     this.currentStrategy = effectiveStrategy;
     this.currentBypassEmbedCache = effectiveBypassEmbedCache;
     this.currentCategories = effectiveCategories;
@@ -285,22 +319,53 @@ export class RunnerService {
     if (dateFrom) runParams.dateFrom = dateFrom;
     if (dateTo) runParams.dateTo = dateTo;
     if (effectiveDownloadedFirst) runParams.downloadedFirst = true;
+    if (effectiveReindexRequested) runParams.reindexRequestedFirst = true;
     if (effectiveBypassEmbedCache) runParams.bypassEmbedCache = true;
     if (effectiveCategories) runParams.categories = effectiveCategories;
-    await query(
-      `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
-       VALUES ($1, 'running', $2, 'arxiv', $3, $4::jsonb)`,
-      [runId, effectiveDirection, effectiveCategories ?? [], JSON.stringify({ params: runParams })],
-    );
-    this.currentRunId = runId;
+    // Claim the run synchronously before the INSERT await, so a second
+    // concurrent ingest() can't pass the isRunning() guard during the INSERT
+    // and start a duplicate run (openarx-y9ef).
+    this.starting = true;
+    try {
+      await query(
+        `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
+         VALUES ($1, 'running', $2, 'arxiv', $3, $4::jsonb)`,
+        [
+          runId,
+          effectiveDirection,
+          effectiveCategories ?? [],
+          JSON.stringify({ params: runParams }),
+        ],
+      );
+      this.currentRunId = runId;
+    } finally {
+      this.starting = false;
+    }
 
     log.info(
-      { runId, limit, direction: effectiveDirection, dateFrom, dateTo, downloadedFirst: effectiveDownloadedFirst, strategy: effectiveStrategy, bypassEmbedCache: effectiveBypassEmbedCache },
+      {
+        runId,
+        limit,
+        direction: effectiveDirection,
+        dateFrom,
+        dateTo,
+        downloadedFirst: effectiveDownloadedFirst,
+        strategy: effectiveStrategy,
+        bypassEmbedCache: effectiveBypassEmbedCache,
+      },
       'Ingest started',
     );
 
     // Run in background — don't await
-    this.runIngest(runId, limit, effectiveDirection, dateFrom, dateTo, effectiveDownloadedFirst).catch((err) => {
+    this.runIngest(
+      runId,
+      limit,
+      effectiveDirection,
+      dateFrom,
+      dateTo,
+      effectiveDownloadedFirst,
+      effectiveReindexRequested,
+    ).catch((err) => {
       log.error({ err, runId }, 'Ingest failed unexpectedly');
     });
 
@@ -327,16 +392,35 @@ export class RunnerService {
     const runId = randomUUID();
     const direction = params.direction ?? 'forward';
     const limit = params.limit ?? 100;
-    await query(
-      `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
-       VALUES ($1, 'running', 'registry_update', 'arxiv', '{}', $2::jsonb)`,
-      [runId, JSON.stringify({ params: { dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit } })],
+    // Synchronous busy-claim before the INSERT await (openarx-y9ef).
+    this.starting = true;
+    try {
+      await query(
+        `INSERT INTO pipeline_runs (id, status, direction, source, categories, metrics)
+         VALUES ($1, 'running', 'registry_update', 'arxiv', '{}', $2::jsonb)`,
+        [
+          runId,
+          JSON.stringify({
+            params: { dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit },
+          }),
+        ],
+      );
+      this.currentRunId = runId;
+    } finally {
+      this.starting = false;
+    }
+
+    log.info(
+      { runId, dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit },
+      'Registry update started',
     );
-    this.currentRunId = runId;
 
-    log.info({ runId, dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit }, 'Registry update started');
-
-    this.runRegistryUpdate(runId, { dateFrom: params.dateFrom, dateTo: params.dateTo, direction, limit }).catch((err) => {
+    this.runRegistryUpdate(runId, {
+      dateFrom: params.dateFrom,
+      dateTo: params.dateTo,
+      direction,
+      limit,
+    }).catch((err) => {
       log.error({ err, runId }, 'Registry update failed unexpectedly');
     });
 
@@ -347,10 +431,12 @@ export class RunnerService {
     if (this.isRunning) {
       throw new Error('Already running. Use "openarx status" to check progress.');
     }
-
-    // Find retryable docs: failed/downloaded, excluding skip_retry and recent failures (3-day cooldown)
-    const { rows: retryIds } = await query<{ id: string }>(
-      `SELECT id FROM documents
+    // Synchronous busy-claim before the first await (the SELECT below) — openarx-y9ef.
+    this.starting = true;
+    try {
+      // Find retryable docs: failed/downloaded, excluding skip_retry and recent failures (3-day cooldown)
+      const { rows: retryIds } = await query<{ id: string }>(
+        `SELECT id FROM documents
        WHERE status IN ('failed', 'downloaded')
          AND (quality_flags->>'skip_retry' IS NULL OR quality_flags->>'skip_retry' != 'true')
          AND (
@@ -360,41 +446,47 @@ export class RunnerService {
          )
        ORDER BY random()
        LIMIT $1`,
-      [limit],
-    );
+        [limit],
+      );
 
-    const retryDocs: Document[] = [];
-    for (const { id } of retryIds) {
-      const doc = await this.documentStore.getById(id);
-      if (doc) retryDocs.push(doc);
-    }
+      const retryDocs: Document[] = [];
+      for (const { id } of retryIds) {
+        const doc = await this.documentStore.getById(id);
+        if (doc) retryDocs.push(doc);
+      }
 
-    if (retryDocs.length === 0) {
-      throw new Error('No retryable documents found (all skipped, on cooldown, or none failed).');
-    }
+      if (retryDocs.length === 0) {
+        throw new Error('No retryable documents found (all skipped, on cooldown, or none failed).');
+      }
 
-    log.info({ total: retryDocs.length, skippedByFlag: 'skip_retry', cooldown: '3 days' }, 'Retry: filtered docs');
+      log.info(
+        { total: retryDocs.length, skippedByFlag: 'skip_retry', cooldown: '3 days' },
+        'Retry: filtered docs',
+      );
 
-    this.stopRequested = false;
-    this.stopSignal = { requested: false };
-    this.abortController = new AbortController();
+      this.stopRequested = false;
+      this.stopSignal = { requested: false };
+      this.abortController = new AbortController();
 
-    const runId = randomUUID();
-    await query(
-      `INSERT INTO pipeline_runs (id, status, direction, source, categories, docs_fetched, metrics)
+      const runId = randomUUID();
+      await query(
+        `INSERT INTO pipeline_runs (id, status, direction, source, categories, docs_fetched, metrics)
        VALUES ($1, 'running', 'retry', 'arxiv', $2, $3, $4::jsonb)`,
-      [runId, [], retryDocs.length, JSON.stringify({ params: { limit, retry: true } })],
-    );
-    this.currentRunId = runId;
+        [runId, [], retryDocs.length, JSON.stringify({ params: { limit, retry: true } })],
+      );
+      this.currentRunId = runId;
 
-    log.info({ runId, count: retryDocs.length }, 'Retry started');
+      log.info({ runId, count: retryDocs.length }, 'Retry started');
 
-    // Run in background
-    this.runRetry(runId, retryDocs).catch((err) => {
-      log.error({ err, runId }, 'Retry failed unexpectedly');
-    });
+      // Run in background
+      this.runRetry(runId, retryDocs).catch((err) => {
+        log.error({ err, runId }, 'Retry failed unexpectedly');
+      });
 
-    return this.getRunById(runId);
+      return this.getRunById(runId);
+    } finally {
+      this.starting = false;
+    }
   }
 
   async stop(): Promise<StatusResult> {
@@ -404,7 +496,10 @@ export class RunnerService {
     this.stopRequested = true;
     this.stopSignal.requested = true;
     this.abortController.abort();
-    log.info({ runId: this.currentRunId }, 'Stop requested — waiting for in-flight documents to drain');
+    log.info(
+      { runId: this.currentRunId },
+      'Stop requested — waiting for in-flight documents to drain',
+    );
     return this.status();
   }
 
@@ -425,48 +520,6 @@ export class RunnerService {
         startedAt: run.startedAt,
         lastProcessedId: run.lastProcessedId,
       },
-    };
-  }
-
-  async coverage(): Promise<CoverageResult> {
-    const runsResult = await query<{
-      direction: string;
-      date_from: string | null;
-      date_to: string | null;
-      docs_processed: string;
-    }>(
-      `SELECT direction, date_from, date_to, docs_processed
-       FROM pipeline_runs
-       WHERE source = 'arxiv' AND status = 'completed' AND direction != 'seed'
-         AND docs_processed > 0
-       ORDER BY date_from ASC NULLS LAST`,
-    );
-
-    const forwardResult = await query<{ cursor: string | null }>(
-      `SELECT MAX(date_to) as cursor FROM pipeline_runs
-       WHERE source = 'arxiv' AND status = 'completed' AND direction IN ('forward','mixed')`,
-    );
-
-    const backfillResult = await query<{ cursor: string | null }>(
-      `SELECT MIN(date_from) as cursor FROM pipeline_runs
-       WHERE source = 'arxiv' AND status = 'completed' AND direction IN ('backfill','mixed')`,
-    );
-
-    const totalResult = await query<{ cnt: string }>(
-      `SELECT COUNT(*) as cnt FROM documents WHERE source = 'arxiv' AND status = 'ready'`,
-    );
-
-    return {
-      source: 'arxiv',
-      forwardCursor: forwardResult.rows[0]?.cursor ?? null,
-      backfillCursor: backfillResult.rows[0]?.cursor ?? null,
-      totalPapers: parseInt(totalResult.rows[0]?.cnt ?? '0', 10),
-      runs: runsResult.rows.map((r) => ({
-        direction: r.direction,
-        dateFrom: r.date_from,
-        dateTo: r.date_to,
-        docsProcessed: parseInt(r.docs_processed, 10),
-      })),
     };
   }
 
@@ -499,13 +552,22 @@ export class RunnerService {
     log.info({ days: daysToCheck.length }, 'Audit: checking processed days');
 
     const auditResult: AuditResult = {
-      daysChecked: 0, daysComplete: 0, daysWithGaps: 0,
-      totalMissing: 0, totalDownloaded: 0, details: [],
+      daysChecked: 0,
+      daysComplete: 0,
+      daysWithGaps: 0,
+      totalMissing: 0,
+      totalDownloaded: 0,
+      details: [],
     };
 
     for (const day of daysToCheck) {
       // Count papers in arXiv for this day (single-call probe to get total)
-      const { total: arxivCount } = await this.arxivSource.searchByDateWindow(day, 0, 1, this.abortController.signal);
+      const { total: arxivCount } = await this.arxivSource.searchByDateWindow(
+        day,
+        0,
+        1,
+        this.abortController.signal,
+      );
 
       // Count papers in our DB for this day. Registry rows (status='listed')
       // are metadata-only — counting them would mask never-downloaded gaps.
@@ -536,7 +598,12 @@ export class RunnerService {
       let downloaded = 0;
       let offset = 0;
       while (offset < arxivCount) {
-        const { entries } = await this.arxivSource.searchByDateWindow(day, offset, 200, this.abortController.signal);
+        const { entries } = await this.arxivSource.searchByDateWindow(
+          day,
+          offset,
+          200,
+          this.abortController.signal,
+        );
         if (entries.length === 0) break;
 
         // Keep the per-document registry in sync for audited days too.
@@ -550,7 +617,11 @@ export class RunnerService {
           if (existing && !(existing.status === 'listed' && !existing.deletedAt)) continue;
 
           try {
-            await this.arxivSource.downloadAndRegister(entry, this.documentStore, existing ?? undefined);
+            await this.arxivSource.downloadAndRegister(
+              entry,
+              this.documentStore,
+              existing ?? undefined,
+            );
             downloaded++;
             log.info({ arxivId: entry.arxivId, day }, 'Audit: downloaded missing paper');
           } catch (err) {
@@ -565,11 +636,14 @@ export class RunnerService {
       auditResult.details.push({ day, arxivCount, dbCount, missing, downloaded });
     }
 
-    log.info({
-      daysChecked: auditResult.daysChecked,
-      daysWithGaps: auditResult.daysWithGaps,
-      totalDownloaded: auditResult.totalDownloaded,
-    }, 'Audit complete');
+    log.info(
+      {
+        daysChecked: auditResult.daysChecked,
+        daysWithGaps: auditResult.daysWithGaps,
+        totalDownloaded: auditResult.totalDownloaded,
+      },
+      'Audit complete',
+    );
 
     return auditResult;
   }
@@ -586,7 +660,11 @@ export class RunnerService {
    * An explicit check name is REQUIRED for fix: running every fix unbounded
    * was only safe on the early small corpus.
    */
-  async doctor(fix?: boolean, check?: string, limit?: number): Promise<import('../doctor/types.js').DoctorReport | PipelineRun> {
+  async doctor(
+    fix?: boolean,
+    check?: string,
+    limit?: number,
+  ): Promise<import('../doctor/types.js').DoctorReport | PipelineRun> {
     const { runDoctor } = await import('../doctor/runner.js');
 
     if (!fix) {
@@ -603,7 +681,9 @@ export class RunnerService {
       throw new Error('Already running. Use "openarx status" to check progress.');
     }
     if (!check) {
-      throw new Error('doctor --fix requires an explicit --check <name>: running every fix at once, unbounded, is unsafe on the current corpus.');
+      throw new Error(
+        'doctor --fix requires an explicit --check <name>: running every fix at once, unbounded, is unsafe on the current corpus.',
+      );
     }
 
     this.stopRequested = false;
@@ -675,7 +755,48 @@ export class RunnerService {
 
   // ─── Internal ────────────────────────────────────────────
 
-  private async runIngest(runId: string, limit: number, direction: 'forward' | 'backward', dateFromOverride?: string, dateToOverride?: string, downloadedFirst?: boolean): Promise<void> {
+  /**
+   * Atomically claim ONE demanded-but-abstract_only document for full re-indexing.
+   * Selection: indexing_tier='abstract_only' (economically-deferred — license is a
+   * PRIORITY signal, not a restriction) + status='ready' + full-content demand
+   * (SUM(get_document_count)) > 1, highest demand first. The claim marks it
+   * downloaded + FORCES indexing_tier='full', so the re-index is full AND the doc
+   * leaves the abstract_only pool (no re-selection loop). FOR UPDATE SKIP LOCKED so
+   * concurrent claimers never grab the same row. Returns the fresh Document, or null
+   * when no candidate remains.
+   */
+  private async claimNextDemandReindexDoc(): Promise<Document | null> {
+    // Lead from the small document_demand table (only requested docs) via an
+    // IN-set of high-demand ids, then narrow to abstract_only/ready — ~20× cheaper
+    // than scanning the ~533k abstract_only rows and evaluating demand per row.
+    const r = await query<{ id: string }>(
+      `UPDATE documents SET status = 'downloaded', indexing_tier = 'full'
+        WHERE id = (
+          SELECT d.id FROM documents d
+           WHERE d.indexing_tier = 'abstract_only' AND d.status = 'ready'
+             AND d.id IN (
+               SELECT document_id FROM document_demand
+                GROUP BY document_id HAVING SUM(get_document_count) > 1)
+           ORDER BY (SELECT SUM(get_document_count)
+                       FROM document_demand dd WHERE dd.document_id = d.id) DESC
+           LIMIT 1
+           FOR UPDATE SKIP LOCKED)
+        RETURNING id`,
+    );
+    const id = r.rows[0]?.id;
+    if (!id) return null;
+    return this.documentStore.getById(id);
+  }
+
+  private async runIngest(
+    runId: string,
+    limit: number,
+    direction: 'forward' | 'backward',
+    dateFromOverride?: string,
+    dateToOverride?: string,
+    downloadedFirst?: boolean,
+    reindexRequestedFirst?: boolean,
+  ): Promise<void> {
     let remaining = limit;
     let totalFetched = 0;
     let totalProcessed = 0;
@@ -688,9 +809,16 @@ export class RunnerService {
     // decides which bound it fills (backward → upper, forward → lower); two
     // dates stay an explicit range. All date-scoped selection below uses these
     // resolved bounds, not the raw overrides.
-    const { lower: boundFrom, upper: boundTo } = resolveDateBounds(dateFromOverride, dateToOverride, direction);
+    const { lower: boundFrom, upper: boundTo } = resolveDateBounds(
+      dateFromOverride,
+      dateToOverride,
+      direction,
+    );
     if (dateFromOverride || dateToOverride) {
-      log.info({ dateFromOverride, dateToOverride, direction, boundFrom, boundTo }, 'Resolved date bounds');
+      log.info(
+        { dateFromOverride, dateToOverride, direction, boundFrom, boundTo },
+        'Resolved date bounds',
+      );
     }
 
     try {
@@ -702,7 +830,12 @@ export class RunnerService {
         if (pending.length > 0) {
           log.info({ count: pending.length, remaining }, 'Processing existing downloaded papers');
           const report = await this.orchestrator.processAll(
-            Math.min(pending.length, remaining), 1, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache,
+            Math.min(pending.length, remaining),
+            1,
+            runId,
+            this.stopSignal,
+            this.currentStrategy,
+            this.currentBypassEmbedCache,
           );
           for (const result of report.results) {
             if (result.status === 'ready') totalProcessed++;
@@ -719,13 +852,72 @@ export class RunnerService {
                 `SELECT MIN(published_at) as min_date, MAX(published_at) as max_date FROM documents WHERE id = ANY($1::uuid[])`,
                 [ids],
               );
-              if (dateResult.rows[0]?.min_date) dateFrom = minDate(dateFrom, dateResult.rows[0].min_date);
-              if (dateResult.rows[0]?.max_date) dateTo = maxDate(dateTo, dateResult.rows[0].max_date);
+              if (dateResult.rows[0]?.min_date)
+                dateFrom = minDate(dateFrom, dateResult.rows[0].min_date);
+              if (dateResult.rows[0]?.max_date)
+                dateTo = maxDate(dateTo, dateResult.rows[0].max_date);
             }
           }
 
-          log.info({ totalProcessed, totalFailed, remaining }, 'Existing downloaded papers processed');
+          log.info(
+            { totalProcessed, totalFailed, remaining },
+            'Existing downloaded papers processed',
+          );
         }
+      }
+
+      // Demand re-index stage (reindexRequestedFirst): re-index abstract_only docs
+      // that agents have REQUESTED (get_document demand > 1) to FULL. Runs AFTER the
+      // downloaded_first backlog, BEFORE new-doc indexing. Documents are claimed ONE
+      // at a time atomically (claimNextDemandReindexDoc marks downloaded + forces
+      // indexing_tier='full') and fed into the sliding window so several process
+      // concurrently — a free slot pulls the next; a full pool waits for a slot.
+      if (reindexRequestedFirst && remaining > 0 && !this.stopRequested) {
+        const maxConcurrentDocs = parseInt(process.env.PIPELINE_MAX_CONCURRENT_DOCS ?? '10', 10);
+        const sem = new Semaphore(maxConcurrentDocs);
+        const inFlight: Promise<void>[] = [];
+        let reindexed = 0;
+        let reindexFailed = 0;
+        while (remaining > 0 && !this.stopRequested) {
+          await sem.acquire();
+          if (this.stopRequested || remaining <= 0) {
+            sem.release();
+            break;
+          }
+          const doc = await this.claimNextDemandReindexDoc();
+          if (!doc) {
+            sem.release();
+            break; // no more demanded abstract_only docs
+          }
+          remaining -= 1;
+          const p = (async () => {
+            try {
+              const result = await this.orchestrator.processOneDoc(
+                doc,
+                runId,
+                this.stopSignal,
+                this.currentStrategy,
+                this.currentBypassEmbedCache,
+              );
+              if (result.status === 'ready') {
+                reindexed += 1;
+                totalProcessed += 1;
+                log.info({ sourceId: doc.sourceId, reindexed }, 'reindexRequestedFirst: doc re-indexed to full');
+              } else if (result.status === 'failed') {
+                reindexFailed += 1;
+                totalFailed += 1;
+              }
+            } finally {
+              sem.release();
+            }
+          })();
+          inFlight.push(p);
+        }
+        await Promise.allSettled(inFlight);
+        log.info(
+          { reindexed, reindexFailed, remaining },
+          'reindexRequestedFirst: demand re-index stage complete',
+        );
       }
 
       // Step 0b (force_full only): re-index existing abstract_only docs in date range.
@@ -744,32 +936,48 @@ export class RunnerService {
         );
 
         if (abstractOnly.rows.length > 0) {
-          const ids = abstractOnly.rows.map(r => r.id);
+          const ids = abstractOnly.rows.map((r) => r.id);
           await query(
             `UPDATE documents SET status = 'downloaded', indexing_tier = NULL
               WHERE id = ANY($1::uuid[])`,
             [ids],
           );
 
-          log.info({ count: ids.length, remaining, dateFrom: dateFromOverride, dateTo: dateToOverride },
-            'force_full: reset abstract_only docs for re-indexing');
+          log.info(
+            { count: ids.length, remaining, dateFrom: dateFromOverride, dateTo: dateToOverride },
+            'force_full: reset abstract_only docs for re-indexing',
+          );
 
           const report = await this.orchestrator.processAll(
-            ids.length, 1, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache,
+            ids.length,
+            1,
+            runId,
+            this.stopSignal,
+            this.currentStrategy,
+            this.currentBypassEmbedCache,
           );
 
           let step0bProcessed = 0;
           let step0bFailed = 0;
           let step0bSkipped = 0;
           for (const result of report.results) {
-            if (result.status === 'ready') { step0bProcessed++; totalProcessed++; }
-            else if (result.status === 'failed') { step0bFailed++; totalFailed++; }
-            else if (result.status === 'duplicate') { step0bSkipped++; totalSkipped++; }
+            if (result.status === 'ready') {
+              step0bProcessed++;
+              totalProcessed++;
+            } else if (result.status === 'failed') {
+              step0bFailed++;
+              totalFailed++;
+            } else if (result.status === 'duplicate') {
+              step0bSkipped++;
+              totalSkipped++;
+            }
           }
           remaining -= step0bProcessed + step0bSkipped;
 
-          log.info({ step0bProcessed, step0bFailed, step0bSkipped, remaining },
-            'force_full: abstract_only re-indexing complete');
+          log.info(
+            { step0bProcessed, step0bFailed, step0bSkipped, remaining },
+            'force_full: abstract_only re-indexing complete',
+          );
         }
       }
 
@@ -782,7 +990,15 @@ export class RunnerService {
       // (status IN listed/downloaded within the period), no arXiv listing
       // fetch. Stops at the limit or when the period is exhausted.
       if ((dateFromOverride || dateToOverride) && remaining > 0 && !this.stopRequested) {
-        const counters = { remaining, totalFetched: 0, processed: 0, failed: 0, skipped: 0, dateFrom: null as Date | null, dateTo: null as Date | null };
+        const counters = {
+          remaining,
+          totalFetched: 0,
+          processed: 0,
+          failed: 0,
+          skipped: 0,
+          dateFrom: null as Date | null,
+          dateTo: null as Date | null,
+        };
         const result = await this.processRegistryParallel(
           runId,
           { dateFrom: boundFrom, dateTo: boundTo, direction, categories: this.currentCategories },
@@ -804,9 +1020,7 @@ export class RunnerService {
       //   stopped    — operator explicitly stopped
       //   failed     — infrastructure burst detected (consecutive day-failures)
       //   completed  — normal end (range exhausted or limit hit)
-      const finalStatus = this.stopRequested
-        ? 'stopped'
-        : (infraFailure ? 'failed' : 'completed');
+      const finalStatus = this.stopRequested ? 'stopped' : infraFailure ? 'failed' : 'completed';
 
       const costResult = await query<{ total: string }>(
         `SELECT COALESCE(SUM(cost) FILTER (WHERE cost = cost), 0) as total FROM processing_costs
@@ -817,9 +1031,7 @@ export class RunnerService {
       // If we hit an infra burst, record the specific cause in metrics so
       // operators can see WHY the run was marked failed. Pattern matches the
       // existing fail_rate_exceeded auto_stop marker.
-      const metricsUpdate = infraFailure
-        ? JSON.stringify({ auto_stop: infraFailure })
-        : null;
+      const metricsUpdate = infraFailure ? JSON.stringify({ auto_stop: infraFailure }) : null;
 
       await query(
         `UPDATE pipeline_runs SET
@@ -832,16 +1044,33 @@ export class RunnerService {
             ELSE COALESCE(metrics, '{}'::jsonb) || $9::jsonb
           END
          WHERE id = $10`,
-        [finalStatus, dateFrom, dateTo, totalFetched, totalProcessed, totalFailed, totalSkipped,
-         parseFloat(costResult.rows[0]?.total ?? '0'), metricsUpdate, runId],
+        [
+          finalStatus,
+          dateFrom,
+          dateTo,
+          totalFetched,
+          totalProcessed,
+          totalFailed,
+          totalSkipped,
+          parseFloat(costResult.rows[0]?.total ?? '0'),
+          metricsUpdate,
+          runId,
+        ],
       );
 
-      log.info({
-        runId, status: finalStatus, totalProcessed, totalFailed, totalSkipped,
-        dateFrom: dateFrom?.toISOString(), dateTo: dateTo?.toISOString(),
-        ...(infraFailure ? { autoStop: infraFailure } : {}),
-      }, 'Ingest finished');
-
+      log.info(
+        {
+          runId,
+          status: finalStatus,
+          totalProcessed,
+          totalFailed,
+          totalSkipped,
+          dateFrom: dateFrom?.toISOString(),
+          dateTo: dateTo?.toISOString(),
+          ...(infraFailure ? { autoStop: infraFailure } : {}),
+        },
+        'Ingest finished',
+      );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await query(
@@ -849,7 +1078,14 @@ export class RunnerService {
          metrics = COALESCE(metrics, '{}'::jsonb) || $1::jsonb,
          docs_fetched = $2, docs_processed = $3, docs_failed = $4, docs_skipped = $5
          WHERE id = $6`,
-        [JSON.stringify({ error: errMsg }), totalFetched, totalProcessed, totalFailed, totalSkipped, runId],
+        [
+          JSON.stringify({ error: errMsg }),
+          totalFetched,
+          totalProcessed,
+          totalFailed,
+          totalSkipped,
+          runId,
+        ],
       );
       log.error({ err, runId }, 'Ingest failed');
     } finally {
@@ -868,7 +1104,9 @@ export class RunnerService {
       // Reset all docs to downloaded first
       for (const doc of docs) {
         await this.documentStore.updateStatus(doc.id, 'downloaded', {
-          step: 'retry', status: 'started', timestamp: new Date().toISOString(),
+          step: 'retry',
+          status: 'started',
+          timestamp: new Date().toISOString(),
         });
       }
 
@@ -886,15 +1124,21 @@ export class RunnerService {
           try {
             if (this.stopRequested) return;
 
-            const result = await this.orchestrator.processOneDoc(doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
+            const result = await this.orchestrator.processOneDoc(
+              doc,
+              runId,
+              this.stopSignal,
+              this.currentStrategy,
+              this.currentBypassEmbedCache,
+            );
 
             if (result.status === 'ready') {
               processed++;
               if (doc.publishedAt) {
-                const pubDate = doc.publishedAt instanceof Date ? doc.publishedAt : new Date(doc.publishedAt);
+                const pubDate =
+                  doc.publishedAt instanceof Date ? doc.publishedAt : new Date(doc.publishedAt);
                 dateFrom = minDate(dateFrom, pubDate);
                 dateTo = maxDate(dateTo, pubDate);
-                await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
               }
               log.info({ sourceId: doc.sourceId, processed }, 'Retry: document processed');
             } else if (result.status === 'failed') {
@@ -925,8 +1169,15 @@ export class RunnerService {
           docs_processed = $4, docs_failed = $5,
           total_cost = $6
          WHERE id = $7`,
-        [finalStatus, dateFrom, dateTo, processed, failed,
-         parseFloat(costResult.rows[0]?.total ?? '0'), runId],
+        [
+          finalStatus,
+          dateFrom,
+          dateTo,
+          processed,
+          failed,
+          parseFloat(costResult.rows[0]?.total ?? '0'),
+          runId,
+        ],
       );
 
       log.info({ runId, status: finalStatus, processed, failed }, 'Retry finished');
@@ -948,9 +1199,10 @@ export class RunnerService {
 
   /** Rebuild the download request (listing entry) from a registry row. */
   private docToEntry(doc: Document): ArxivEntry {
-    const pub = doc.publishedAt instanceof Date
-      ? doc.publishedAt.toISOString()
-      : String(doc.publishedAt ?? '');
+    const pub =
+      doc.publishedAt instanceof Date
+        ? doc.publishedAt.toISOString()
+        : String(doc.publishedAt ?? '');
     return {
       arxivId: doc.sourceId,
       title: doc.title,
@@ -982,9 +1234,22 @@ export class RunnerService {
    */
   private async produceRegistryDownloads(
     runId: string,
-    opts: { dateFrom?: string; dateTo?: string; direction: 'forward' | 'backward'; categories: string[] | null },
+    opts: {
+      dateFrom?: string;
+      dateTo?: string;
+      direction: 'forward' | 'backward';
+      categories: string[] | null;
+    },
     ch: Channel<{ entry: ArxivEntry; doc: Document }>,
-    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
+    counters: {
+      remaining: number;
+      totalFetched: number;
+      processed: number;
+      failed: number;
+      skipped: number;
+      dateFrom: Date | null;
+      dateTo: Date | null;
+    },
     stopFlag: { value: boolean },
   ): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> {
     let downloaded = 0;
@@ -1001,12 +1266,28 @@ export class RunnerService {
     let firstFailureAt: number | null = null;
 
     while (counters.remaining > 0 && !this.stopRequested && !stopFlag.value) {
-      const conds = [`source = 'arxiv'`, `status IN ('listed', 'downloaded')`, 'deleted_at IS NULL'];
+      const conds = [
+        `source = 'arxiv'`,
+        `status IN ('listed', 'downloaded')`,
+        'deleted_at IS NULL',
+      ];
       const params: unknown[] = [];
-      if (opts.dateFrom) { params.push(opts.dateFrom); conds.push(`published_at >= $${params.length}::date`); }
-      if (opts.dateTo) { params.push(opts.dateTo); conds.push(`published_at < $${params.length}::date + interval '1 day'`); }
-      if (opts.categories && opts.categories.length > 0) { params.push(opts.categories); conds.push(`categories && $${params.length}`); }
-      if (seen.size > 0) { params.push([...seen]); conds.push(`NOT (id = ANY($${params.length}::uuid[]))`); }
+      if (opts.dateFrom) {
+        params.push(opts.dateFrom);
+        conds.push(`published_at >= $${params.length}::date`);
+      }
+      if (opts.dateTo) {
+        params.push(opts.dateTo);
+        conds.push(`published_at < $${params.length}::date + interval '1 day'`);
+      }
+      if (opts.categories && opts.categories.length > 0) {
+        params.push(opts.categories);
+        conds.push(`categories && $${params.length}`);
+      }
+      if (seen.size > 0) {
+        params.push([...seen]);
+        conds.push(`NOT (id = ANY($${params.length}::uuid[]))`);
+      }
       params.push(Math.min(200, counters.remaining));
       const batch = await query<{ id: string }>(
         `SELECT id FROM documents
@@ -1017,52 +1298,79 @@ export class RunnerService {
       );
       if (batch.rows.length === 0) break; // period exhausted
 
-      await Promise.allSettled(batch.rows.map(({ id }) => dlSem.withResource(async () => {
-        if (counters.remaining <= 0 || this.stopRequested || stopFlag.value) return;
-        seen.add(id);
-        const doc = await this.documentStore.getById(id);
-        if (!doc || doc.deletedAt) return;
+      await Promise.allSettled(
+        batch.rows.map(({ id }) =>
+          dlSem.withResource(async () => {
+            if (counters.remaining <= 0 || this.stopRequested || stopFlag.value) return;
+            seen.add(id);
+            const doc = await this.documentStore.getById(id);
+            if (!doc || doc.deletedAt) return;
 
-        if (doc.status === 'downloaded') {
-          counters.remaining--;
-          counters.totalFetched++;
-          await ch.send({ entry: this.docToEntry(doc), doc });
-          return;
-        }
-        if (doc.status !== 'listed') return; // raced with another writer
+            if (doc.status === 'downloaded') {
+              counters.remaining--;
+              counters.totalFetched++;
+              await ch.send({ entry: this.docToEntry(doc), doc });
+              return;
+            }
+            if (doc.status !== 'listed') return; // raced with another writer
 
-        const entry = this.docToEntry(doc);
-        try {
-          const { document: downloadedDoc } = await this.arxivSource.downloadAndRegister(entry, this.documentStore, doc);
-          counters.remaining--;
-          counters.totalFetched++;
-          downloaded++;
-          consecutiveFailures = 0;
-          firstFailureAt = null;
-          log.info({ arxivId: doc.sourceId, format: downloadedDoc.sourceFormat, remaining: counters.remaining }, 'Downloaded (registry)');
-          await ch.send({ entry, doc: downloadedDoc });
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          log.error({ arxivId: doc.sourceId, err: errMsg }, 'Registry download failed');
-          try { await this.saveFailedDownload(entry, errMsg, doc.id); } catch { /* non-critical */ }
-          failed++;
-          if (consecutiveFailures === 0) firstFailureAt = Date.now();
-          consecutiveFailures++;
-          if (consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
-              firstFailureAt !== null &&
-              Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS) {
-            log.error({ consecutiveFailures, lastError: errMsg },
-              'Consecutive download failures within burst window — likely infrastructure issue, stopping run');
-            infraFailure = {
-              reason: 'consecutive_day_failures',
-              count: consecutiveFailures,
-              windowMs: Date.now() - firstFailureAt,
-              lastError: errMsg,
-            };
-            stopFlag.value = true;
-          }
-        }
-      })));
+            const entry = this.docToEntry(doc);
+            try {
+              const { document: downloadedDoc } = await this.arxivSource.downloadAndRegister(
+                entry,
+                this.documentStore,
+                doc,
+              );
+              counters.remaining--;
+              counters.totalFetched++;
+              downloaded++;
+              consecutiveFailures = 0;
+              firstFailureAt = null;
+              log.info(
+                {
+                  arxivId: doc.sourceId,
+                  format: downloadedDoc.sourceFormat,
+                  remaining: counters.remaining,
+                },
+                'Downloaded (registry)',
+              );
+              await ch.send({ entry, doc: downloadedDoc });
+            } catch (err) {
+              const errMsg = err instanceof Error ? err.message : String(err);
+              log.error({ arxivId: doc.sourceId, err: errMsg }, 'Registry download failed');
+              try {
+                await this.saveFailedDownload(entry, errMsg, doc.id);
+              } catch {
+                /* non-critical */
+              }
+              failed++;
+              // Permanent 404-class failures don't count toward the infra
+              // burst guard (and don't reset it — only a SUCCESS resets):
+              // the doc is closed as download_failed, the wave is healthy.
+              if (isPermanentDownloadFailure(errMsg)) return;
+              if (consecutiveFailures === 0) firstFailureAt = Date.now();
+              consecutiveFailures++;
+              if (
+                consecutiveFailures >= DAY_FAILURE_BURST_THRESHOLD &&
+                firstFailureAt !== null &&
+                Date.now() - firstFailureAt < DAY_FAILURE_BURST_WINDOW_MS
+              ) {
+                log.error(
+                  { consecutiveFailures, lastError: errMsg },
+                  'Consecutive download failures within burst window — likely infrastructure issue, stopping run',
+                );
+                infraFailure = {
+                  reason: 'consecutive_day_failures',
+                  count: consecutiveFailures,
+                  windowMs: Date.now() - firstFailureAt,
+                  lastError: errMsg,
+                };
+                stopFlag.value = true;
+              }
+            }
+          }),
+        ),
+      );
 
       if (seen.size > 100_000) break; // paranoia cap; the limit bounds it anyway
     }
@@ -1078,14 +1386,31 @@ export class RunnerService {
    */
   private async processRegistryParallel(
     runId: string,
-    opts: { dateFrom?: string; dateTo?: string; direction: 'forward' | 'backward'; categories: string[] | null },
-    counters: { remaining: number; totalFetched: number; processed: number; failed: number; skipped: number; dateFrom: Date | null; dateTo: Date | null },
+    opts: {
+      dateFrom?: string;
+      dateTo?: string;
+      direction: 'forward' | 'backward';
+      categories: string[] | null;
+    },
+    counters: {
+      remaining: number;
+      totalFetched: number;
+      processed: number;
+      failed: number;
+      skipped: number;
+      dateFrom: Date | null;
+      dateTo: Date | null;
+    },
   ): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> {
     type DownloadedItem = { entry: ArxivEntry; doc: Document };
     const ch = new Channel<DownloadedItem>(800);
     const stopFlag = { value: false };
 
-    const producer = async (): Promise<{ downloaded: number; failed: number; infraFailure?: InfraFailure }> => {
+    const producer = async (): Promise<{
+      downloaded: number;
+      failed: number;
+      infraFailure?: InfraFailure;
+    }> => {
       try {
         return await this.produceRegistryDownloads(runId, opts, ch, counters, stopFlag);
       } finally {
@@ -1109,22 +1434,36 @@ export class RunnerService {
           try {
             if (this.stopRequested || stopFlag.value) return;
 
-            const result = await this.orchestrator.processOneDoc(captured.doc, runId, this.stopSignal, this.currentStrategy, this.currentBypassEmbedCache);
+            const result = await this.orchestrator.processOneDoc(
+              captured.doc,
+              runId,
+              this.stopSignal,
+              this.currentStrategy,
+              this.currentBypassEmbedCache,
+            );
 
             if (result.status === 'ready') {
               counters.processed++;
               const pubDate = new Date(captured.entry.publishedAt);
               counters.dateFrom = minDate(counters.dateFrom, pubDate);
               counters.dateTo = maxDate(counters.dateTo, pubDate);
-              await this.refreshCoverageForDate(pubDate.toISOString().slice(0, 10));
             } else if (result.status === 'failed') {
               counters.failed++;
             }
-            await this.updateRunProgress(runId, counters.processed, counters.failed, counters.skipped, captured.doc.id);
+            await this.updateRunProgress(
+              runId,
+              counters.processed,
+              counters.failed,
+              counters.skipped,
+              captured.doc.id,
+            );
 
             const totalAttempted = counters.processed + counters.failed;
             if (totalAttempted >= 5 && counters.failed / totalAttempted > this.maxFailRate) {
-              log.error({ processed: counters.processed, failed: counters.failed }, 'Fail rate exceeded');
+              log.error(
+                { processed: counters.processed, failed: counters.failed },
+                'Fail rate exceeded',
+              );
               await query(
                 `UPDATE pipeline_runs SET metrics = COALESCE(metrics, '{}'::jsonb) || '{"auto_stop": "fail_rate_exceeded"}'::jsonb WHERE id = $1`,
                 [runId],
@@ -1139,7 +1478,9 @@ export class RunnerService {
       }
 
       // Drain channel to unblock producer's ch.send()
-      while (await ch.receive() !== null) { /* discard */ }
+      while ((await ch.receive()) !== null) {
+        /* discard */
+      }
 
       await Promise.allSettled(inFlight);
     };
@@ -1153,8 +1494,7 @@ export class RunnerService {
    * per-document registry (status='listed' rows) — the DISCOVERY half of the
    * registry model; downloading/processing is `ingest`. Days are atomic: a
    * started day is always finished, the entry limit is checked at day
-   * boundaries. coverage_map.expected is flushed ONCE per day from the full
-   * day's entries (the per-batch overwrite was the openarx-9vqv bug).
+   * boundaries.
    */
   private async runRegistryUpdate(
     runId: string,
@@ -1169,11 +1509,15 @@ export class RunnerService {
       const today = new Date().toISOString().slice(0, 10);
       // Single-date-anchor semantics (same as ingest): a lone date is an anchor
       // and direction picks the bound it fills; two dates = explicit range.
-      const { lower: bFrom, upper: bTo } = resolveDateBounds(opts.dateFrom, opts.dateTo, opts.direction);
+      const { lower: bFrom, upper: bTo } = resolveDateBounds(
+        opts.dateFrom,
+        opts.dateTo,
+        opts.direction,
+      );
       // Old-format arXiv ids (pre 2007-04) are not parseable by the entry
       // parser — clamp the open lower bound there.
       const lower = bFrom ?? '2007-04-01';
-      const upper = (bTo && bTo < today) ? bTo : today;
+      const upper = bTo && bTo < today ? bTo : today;
       const days = enumerateDays(lower, upper);
       if (opts.direction === 'backward') days.reverse();
 
@@ -1186,7 +1530,12 @@ export class RunnerService {
           let offset = 0;
           let total = Number.MAX_SAFE_INTEGER;
           while (offset < total && !this.stopRequested) {
-            const { total: t, entries } = await this.arxivSource.searchByDateWindow(dayCompact, offset, 200, this.abortController.signal);
+            const { total: t, entries } = await this.arxivSource.searchByDateWindow(
+              dayCompact,
+              offset,
+              200,
+              this.abortController.signal,
+            );
             total = t;
             if (entries.length === 0) break;
             dayEntries.push(...entries);
@@ -1194,7 +1543,6 @@ export class RunnerService {
           }
 
           inserted += await this.registerListedEntries(dayEntries);
-          await this.bumpCoverageExpected(dayCompact, dayEntries);
           fetched += dayEntries.length;
           daysProcessed++;
 
@@ -1202,10 +1550,22 @@ export class RunnerService {
             `UPDATE pipeline_runs SET docs_fetched = $1, docs_processed = $2, backfill_date = $3 WHERE id = $4`,
             [fetched, inserted, day, runId],
           );
-          log.info({ day, entries: dayEntries.length, listedInserted: inserted, fetched, limit: opts.limit }, 'registry-update: day complete');
+          log.info(
+            {
+              day,
+              entries: dayEntries.length,
+              listedInserted: inserted,
+              fetched,
+              limit: opts.limit,
+            },
+            'registry-update: day complete',
+          );
         } catch (err) {
           failedDays.push(day);
-          log.error({ day, err: err instanceof Error ? err.message : err }, 'registry-update: day failed, continuing with next day');
+          log.error(
+            { day, err: err instanceof Error ? err.message : err },
+            'registry-update: day failed, continuing with next day',
+          );
         }
       }
 
@@ -1215,11 +1575,22 @@ export class RunnerService {
           docs_fetched = $2, docs_processed = $3,
           metrics = COALESCE(metrics, '{}'::jsonb) || $4::jsonb
          WHERE id = $5`,
-        [finalStatus, fetched, inserted,
-         JSON.stringify({ days_processed: daysProcessed, listed_inserted: inserted, failed_days: failedDays }),
-         runId],
+        [
+          finalStatus,
+          fetched,
+          inserted,
+          JSON.stringify({
+            days_processed: daysProcessed,
+            listed_inserted: inserted,
+            failed_days: failedDays,
+          }),
+          runId,
+        ],
       );
-      log.info({ runId, status: finalStatus, daysProcessed, fetched, inserted, failedDays }, 'Registry update finished');
+      log.info(
+        { runId, status: finalStatus, daysProcessed, fetched, inserted, failedDays },
+        'Registry update finished',
+      );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await query(
@@ -1248,204 +1619,26 @@ export class RunnerService {
     try {
       const rows = buildListedRows(entries);
       const res = await query(buildListedInsertSql(rows.length), flattenListedRows(rows));
-      log.debug({ entries: entries.length, inserted: res.rowCount ?? 0 }, 'listed registry rows inserted');
+      log.debug(
+        { entries: entries.length, inserted: res.rowCount ?? 0 },
+        'listed registry rows inserted',
+      );
       return res.rowCount ?? 0;
     } catch (err) {
-      log.warn({ err: err instanceof Error ? err.message : err }, 'registerListedEntries failed (non-critical)');
+      log.warn(
+        { err: err instanceof Error ? err.message : err },
+        'registerListedEntries failed (non-critical)',
+      );
       return 0;
     }
   }
 
-  /**
-   * After fetching a day's entries from OAI-PMH, count papers per arxiv-cat
-   * and write coverage_map.expected (= papers existing on arxiv for this
-   * date with this cat). UPSERT preserves actual/breakdown which are
-   * maintained separately by refreshCoverageForDate.
-   *
-   * Each paper increments expected for every cat in its categories[].
-   */
-  private async bumpCoverageExpected(dayStr: string, entries: ArxivEntry[]): Promise<void> {
-    if (entries.length === 0) return;
-    // ISO date for SQL
-    const dateIso = dayStr.length === 8
-      ? `${dayStr.slice(0, 4)}-${dayStr.slice(4, 6)}-${dayStr.slice(6, 8)}`
-      : dayStr;
-    const expectedPerCat = new Map<string, number>();
-    for (const e of entries) {
-      for (const cat of e.categories ?? []) {
-        expectedPerCat.set(cat, (expectedPerCat.get(cat) ?? 0) + 1);
-      }
-    }
-    try {
-      for (const [cat, count] of expectedPerCat) {
-        await query(
-          `INSERT INTO coverage_map
-             (source, category, date, expected, actual, download_failed, skipped, status, breakdown, last_checked_at)
-           VALUES ('arxiv', $1, $2::date, $3, 0, 0, 0, 'expected_unknown', '{}'::jsonb, now())
-           ON CONFLICT (source, category, date) DO UPDATE SET
-             expected = EXCLUDED.expected,
-             status = CASE
-               WHEN coverage_map.actual >= EXCLUDED.expected THEN 'complete'
-               WHEN coverage_map.actual > 0 THEN 'partial'
-               ELSE 'not_started'
-             END,
-             last_checked_at = now()`,
-          [cat, dateIso, count],
-        );
-      }
-      log.debug({ dayStr, cats: expectedPerCat.size, entries: entries.length }, 'coverage_map.expected bumped per-cat');
-    } catch (err) {
-      log.warn({ dayStr, err: err instanceof Error ? err.message : err }, 'bumpCoverageExpected failed (non-critical)');
-    }
-  }
-
-  /**
-   * Refresh coverage_map for a single date by aggregating per-arxiv-category
-   * counts from `documents` (truth source). Replaces both the old
-   * `updateCoverage` (per-day finalize) and `incrementBreakdown` (per-doc
-   * progressive update) — coverage_map is now a derived view of documents.
-   *
-   * One paper with categories=[cs.AI, cs.LG] increments rows for BOTH cs.AI
-   * and cs.LG. Sum of `actual` across categories > unique paper count, but
-   * per-cat numbers are correct relative to documents.
-   *
-   * `expected` is preserved on conflict (set to NULL on first insert) — it
-   * is filled by a separate offline OAI-PMH refill (Phase 6, planned).
-   *
-   * Idempotent: every call recomputes from documents, drift impossible.
-   * Non-blocking: errors are logged but don't fail the pipeline.
-   */
-  private async refreshCoverageForDate(dateStr: string): Promise<void> {
-    interface DocRow {
-      status: string;
-      categories: string[] | null;
-      license: string | null;
-      indexing_tier: string | null;
-    }
-    interface CatStats {
-      actual: number;
-      dlFailed: number;
-      skipped: number;
-      licenses: Record<string, number>;
-      processing: Record<string, number>;
-    }
-
-    try {
-      const docs = await query<DocRow>(
-        `SELECT status, categories, license, indexing_tier
-         FROM documents
-         WHERE source = 'arxiv' AND published_at::date = $1::date`,
-        [dateStr],
-      );
-
-      const stats = new Map<string, CatStats>();
-      for (const doc of docs.rows) {
-        const cats = doc.categories ?? [];
-        for (const cat of cats) {
-          let s = stats.get(cat);
-          if (!s) {
-            s = { actual: 0, dlFailed: 0, skipped: 0, licenses: {}, processing: {} };
-            stats.set(cat, s);
-          }
-          switch (doc.status) {
-            case 'ready': {
-              s.actual++;
-              const lic = doc.license ?? 'unknown';
-              s.licenses[lic] = (s.licenses[lic] ?? 0) + 1;
-              const tier = doc.indexing_tier ?? 'unknown';
-              s.processing[tier] = (s.processing[tier] ?? 0) + 1;
-              break;
-            }
-            case 'download_failed':
-              s.dlFailed++;
-              break;
-            case 'skipped':
-              s.skipped++;
-              break;
-            default:
-              break;
-          }
-        }
-      }
-
-      if (stats.size === 0) return;
-
-      for (const [cat, s] of stats) {
-        const status = s.actual > 0 ? 'partial' : 'expected_unknown';
-        const breakdown = { licenses: s.licenses, processing: s.processing };
-        await query(
-          `INSERT INTO coverage_map
-             (source, category, date, expected, actual, download_failed, skipped, status, breakdown, last_checked_at)
-           VALUES ('arxiv', $1, $2::date, NULL, $3, $4, $5, $6, $7::jsonb, now())
-           ON CONFLICT (source, category, date) DO UPDATE SET
-             actual = EXCLUDED.actual,
-             download_failed = EXCLUDED.download_failed,
-             skipped = EXCLUDED.skipped,
-             status = CASE
-               WHEN coverage_map.expected IS NOT NULL AND EXCLUDED.actual >= coverage_map.expected THEN 'complete'
-               ELSE EXCLUDED.status
-             END,
-             breakdown = EXCLUDED.breakdown,
-             last_checked_at = now()`,
-          [cat, dateStr, s.actual, s.dlFailed, s.skipped, status, JSON.stringify(breakdown)],
-        );
-      }
-      log.debug({ date: dateStr, cats: stats.size }, 'coverage_map refreshed for date');
-    } catch (err) {
-      log.warn({ date: dateStr, err: err instanceof Error ? err.message : err }, 'refreshCoverageForDate failed (non-critical)');
-    }
-  }
-
-  /**
-   * Sync coverage_map per-arxiv-category from documents. Runs once at start
-   * of each ingest run. Catches drift from manual reprocessing, retries, or
-   * doc state changes outside the runner's incremental refresh path.
-   *
-   * Refreshes any date that has documents whose per-cat aggregation differs
-   * from what's in coverage_map. Skips dates where everything matches.
-   */
-  private async syncCoverageMap(): Promise<void> {
-    try {
-      // Find dates where documents per-cat sum doesn't match coverage_map.
-      // Cheap heuristic: total ready papers per date in documents vs sum(actual)
-      // /N (avg cats per paper). For correctness fall back to refreshing any
-      // date with a document whose published_at::date doesn't have a complete
-      // coverage_map entry.
-      const stale = await query<{ pub_date: string }>(
-        `WITH doc_dates AS (
-           SELECT DISTINCT published_at::date AS pub_date
-           FROM documents
-           WHERE source = 'arxiv' AND published_at IS NOT NULL
-         )
-         SELECT pub_date::text FROM doc_dates
-         WHERE NOT EXISTS (
-           SELECT 1 FROM coverage_map cm
-           WHERE cm.source = 'arxiv' AND cm.date = doc_dates.pub_date
-             AND cm.last_checked_at > now() - interval '1 hour'
-         )
-         ORDER BY pub_date DESC
-         LIMIT 60`,
-      );
-
-      if (stale.rows.length === 0) {
-        log.info('Coverage map: nothing to sync');
-        return;
-      }
-
-      log.info({ dates: stale.rows.length }, 'Coverage map: refreshing stale dates');
-      let refreshed = 0;
-      for (const row of stale.rows) {
-        await this.refreshCoverageForDate(row.pub_date);
-        refreshed++;
-      }
-      log.info({ refreshed }, 'Coverage map sync complete');
-    } catch (err) {
-      log.warn({ err: err instanceof Error ? err.message : String(err) }, 'Coverage map sync failed (non-critical)');
-    }
-  }
-
   private async updateRunProgress(
-    runId: string, processed: number, failed: number, skipped: number, lastId: string,
+    runId: string,
+    processed: number,
+    failed: number,
+    skipped: number,
+    lastId: string,
   ): Promise<void> {
     await query(
       `UPDATE pipeline_runs SET docs_processed = $1, docs_failed = $2, docs_skipped = $3, last_processed_id = $4 WHERE id = $5`,
@@ -1459,7 +1652,11 @@ export class RunnerService {
    * read-modify-write partial UPDATE (applyDownloadFailure): status flips,
    * the failure is APPENDED to processing_log, nothing else is touched.
    */
-  private async saveFailedDownload(entry: ArxivEntry, error: string, existingId?: string): Promise<void> {
+  private async saveFailedDownload(
+    entry: ArxivEntry,
+    error: string,
+    existingId?: string,
+  ): Promise<void> {
     if (existingId) {
       await this.documentStore.applyDownloadFailure(existingId, error);
       log.info({ arxivId: entry.arxivId, error }, 'Marked existing row download_failed');
@@ -1487,7 +1684,9 @@ export class RunnerService {
       datasetLinks: [],
       benchmarkResults: [],
       status: 'download_failed',
-      processingLog: [{ step: 'download', status: 'failed', timestamp: new Date().toISOString(), error }],
+      processingLog: [
+        { step: 'download', status: 'failed', timestamp: new Date().toISOString(), error },
+      ],
       processingCost: 0,
       provenance: [],
       externalIds: {

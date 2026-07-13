@@ -24,8 +24,25 @@ export interface TokenInfo {
     find_code: boolean;
     enrich: boolean;
   };
+  /**
+   * Profiles v3 (mcp_profiles_v3.md §3): flat top-level scope strings from the
+   * verify-token response, both api_token and OAuth2 branches. Portal maps
+   * consumer→[read], publisher/gov_participant→[read, write:documents, write:layer2].
+   * Used to filter the researcher-profile tool list by scope. Absent on legacy
+   * tokens (pre-v3 Portal / cache) — treated as "no scope info", falling back to
+   * the existing permissions/token-type gating.
+   */
+  scopes?: string[];
   creditsBalance?: number;
   reason?: string;
+  /**
+   * N-7 (§7.7): a Portal-side rate-limit (429) on verify-token is a RETRYABLE
+   * throttle, NOT a bad token — the gateway MUST surface 429+Retry-After, never
+   * 401 (which tells the client to re-authenticate). Transient, never cached.
+   */
+  rateLimited?: boolean;
+  /** Portal down / 5xx on verify-token — service-unavailable (503), not 401. Transient, never cached. */
+  upstreamUnavailable?: boolean;
 }
 
 interface CacheEntry {
@@ -41,6 +58,28 @@ function hashToken(token: string): string {
 
 export function isPortalAuthEnabled(): boolean {
   return INTERNAL_SECRET.length > 0;
+}
+
+/**
+ * The methodist AGENT credential minted from a verified token — a deterministic
+ * COMPOSITE of (userId, tokenId). 2f / §12.2 (ratified 2026-07-10): one token = one agent,
+ * there is NO credential table. For a direct api-token Bearer tokenId == api_tokens.id
+ * (stable) → the id is stable across calls, and a different userId/tokenId yields a
+ * different id (an INHERENT userId-guard: you cannot land on another agent's identity —
+ * and thus its dossier — without their userId+tokenId).
+ *
+ * SINGLE SOURCE of the credential everywhere it is derived — the methodist doors
+ * (credentialOf) AND the anti-gaming tool-log keying (logMethodistToolCall). If the two
+ * diverge, the run→tool-log linkage (listRunToolLog looks up by run.credential_id) silently
+ * breaks and the checkpoint crosscheck sees an empty log. Degrades to the raw userId for
+ * pre-2f tokens without a tokenId (backward-compatible), 'anonymous' with no userId.
+ */
+export function credentialFromToken(token: { userId?: string; tokenId?: string } | undefined): string {
+  const userId = token?.userId;
+  if (!userId) return 'anonymous';
+  const tokenId = token?.tokenId;
+  if (!tokenId) return userId;
+  return 'cred:' + createHash('sha256').update(`${userId}|${tokenId}`).digest('hex').slice(0, 40);
 }
 
 /**
@@ -68,6 +107,11 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
     });
 
     if (!resp.ok) {
+      // N-7: a throttle / upstream failure on verify-token is NOT a bad token.
+      // These are transient — returned WITHOUT caching (the early return skips the
+      // cache.set below), so recovery is immediate.
+      if (resp.status === 429) return { valid: false, reason: 'rate_limited', rateLimited: true };
+      if (resp.status >= 500) return { valid: false, reason: `portal_error_${resp.status}`, upstreamUnavailable: true };
       return { valid: false, reason: `portal_error_${resp.status}` };
     }
 
@@ -80,6 +124,9 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
       tokenId: raw.token_id as string | undefined,
       tokenType: raw.token_type as string | undefined,
       permissions: raw.permissions as TokenInfo['permissions'],
+      // v3 §3: flat top-level `scopes` (both verify-token branches). Only accepted
+      // as a string[]; anything else → undefined (fall back to legacy gating).
+      scopes: Array.isArray(raw.scopes) ? (raw.scopes as unknown[]).filter((s): s is string => typeof s === 'string') : undefined,
       creditsBalance: raw.credits_balance as number | undefined,
       reason: raw.reason as string | undefined,
     };
@@ -97,9 +144,9 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
 
     return info;
   } catch {
-    // Portal unreachable — fail open or closed?
-    // Fail closed: deny access if portal is down
-    return { valid: false, reason: 'portal_unreachable' };
+    // Portal unreachable (network/timeout) — service-unavailable, NOT an auth
+    // failure (N-7). Transient; not cached (this early return skips cache.set).
+    return { valid: false, reason: 'portal_unreachable', upstreamUnavailable: true };
   }
 }
 
@@ -344,6 +391,20 @@ export function hasPermission(info: TokenInfo, toolName: string): PermissionResu
     'create_upload_url',
     // create_draft — free; routes to Portal, billable event is publishing (amc7).
     'create_draft',
+    // layer2-profile tools — gated by the profile route (min_token_type=
+    // publisher), same pattern as pub writes above (openarx-contracts-rta3);
+    // free (0-credit) stabilization window per pillar §7.3 / economics_config
+    // b06bcec. Found missing by QA openarx-tester-4xo.
+    'submit_claim', 'submit_relation', 'submit_activity_batch',
+    'submit_metrics', 'submit_bundle',
+    'query_claims', 'query_relations', 'query_activities', 'query_bundle',
+    'verify_claim', 'link_supersedes', 'semantic_search_claims',
+    // A2 read-harness (§7.7 N-6) — new global/paginated reads, same free window.
+    'query_metrics', 'list_relations', 'enumerate_bundles',
+    // A5 methodist channel (mcp_profiles_v3.md §13) — gated by the `methodist`
+    // scope in the researcher-profile tool filter; hasPermission passes through.
+    'methodist_diagnose', 'methodist_checkpoint', 'methodist_escalate',
+    'get_my_development', 'methodist_course',
   ]);
   if (alwaysAllowed.has(toolName)) return { allow: true };
 
@@ -381,4 +442,60 @@ export function checkTier(tier: string | null, toolName: string): PermissionResu
     };
   }
   return { allow: true };
+}
+
+// ── §23.5 W2 — refund-notify (MCP path) ───────────────────────────────────────
+// After the gateway deducts the FULL cost for a Tier-2/3 publish outcome, Core
+// notifies Portal of the ledger refund op; Portal applies it verbatim (contract
+// 2a3ae4e §23.5, wire mechanics f0b0043). Fire-and-verify with retries; on
+// exhaustion an operator ALERT is logged (a silently lost refund is lost user
+// money — contracts-mandated hardening). Idempotent on request_ref.
+
+export interface PublishRefundOp {
+  tier: 2 | 3;
+  amount: number;
+  penalty: number;
+  reason: string;
+  core_document_id: string | null;
+}
+
+export async function applyPublishRefund(
+  userId: string,
+  tokenId: string | null,
+  op: PublishRefundOp,
+  requestRef: string,
+): Promise<boolean> {
+  const body = JSON.stringify({
+    user_id: userId,
+    token_id: tokenId,
+    tier: op.tier,
+    amount: op.amount,
+    penalty: op.penalty,
+    reason: op.reason,
+    core_document_id: op.core_document_id,
+    request_ref: requestRef,
+  });
+  const delays = [0, 1_000, 5_000]; // 3 attempts, exp-ish backoff
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt]! > 0) await new Promise((r) => setTimeout(r, delays[attempt]));
+    try {
+      const resp = await fetch(`${PORTAL_URL}/api/internal/apply-publish-refund`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': INTERNAL_SECRET },
+        body,
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (resp.ok) {
+        console.error(`[publish-refund] applied: user=${userId} tier=${op.tier} amount=${op.amount} request_ref=${requestRef}`);
+        return true;
+      }
+      console.warn(`[publish-refund] Portal returned ${resp.status} (attempt ${attempt + 1}/${delays.length})`);
+    } catch (err) {
+      console.warn(`[publish-refund] unreachable (attempt ${attempt + 1}/${delays.length}):`, err instanceof Error ? err.message : err);
+    }
+  }
+  console.error(
+    `[ALERT][publish-refund] FAILED after ${delays.length} attempts — refund NOT applied: user=${userId} tier=${op.tier} amount=${op.amount} request_ref=${requestRef}. Manual ledger op required.`,
+  );
+  return false;
 }

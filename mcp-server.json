@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -921,7 +921,7 @@
       },
       {
         "name": "get_document",
-        "description": "Retrieve full paper details by ID. Default returns metadata only (title, authors, abstract, license, codeLinks counts) — use includeChunks=true to fetch chunk content. For specific sections or content types, use chunkContentTypes/section filters or call get_chunks instead. For long papers, prefer filtered chunk retrieval over full chunks dump.",
+        "description": "Retrieve full paper details by ID. Default returns metadata only (title, authors, abstract, license, codeLinks counts) — use includeChunks=true to fetch chunk content. For specific sections or content types, use chunkContentTypes/section filters or call get_chunks instead. For long papers, prefer filtered chunk retrieval over full chunks dump. AVAILABILITY is two INDEPENDENT axes: indexingTier (none|abstract_only|full) = whether the full text is indexed and readable via get_chunks (chunkCount shows how many); sourceAccessibility (served_by_us|external_link_only|unavailable) = how to obtain the raw source file, with sourceUrl returned whenever known. To read content: if indexingTier='full' use get_chunks; else if sourceAccessibility!='unavailable' fetch sourceUrl yourself; only 'unavailable' means no full text. canServeFile is DEPRECATED — it gates raw-PDF delivery ONLY and is NOT a content-availability signal; use indexingTier + sourceAccessibility.",
         "inputSchema": {
           "type": "object",
           "properties": {
