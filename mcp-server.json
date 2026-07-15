@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/mcp-server.json",
   "name": "openarx",
   "displayName": "OpenArx",
-  "description": "Open AI-native infrastructure for scientific knowledge. A multi-persona MCP service plus ingest pipeline for research papers. This manifest describes the governance profile, which is the broadest profile and includes the consumer search tools, publisher submission tools, and governance participation tools.",
+  "description": "Open AI-native infrastructure for scientific and engineering knowledge. A semantic knowledge graph of claims and typed relations (scientific and engineering) plus an ingest pipeline for research papers, exposed over MCP. Two roles, selected by access token: researcher (corpus search + read, claim-graph read and traversal, document publishing, and a methodology-guided contribution door) and governance (civic participation — initiatives, voting, discussion, reputation).",
   "version": "0.3.0",
   "homepage": "https://openarx.ai",
   "repository": {
@@ -16,24 +16,14 @@
     "transport": "http",
     "endpoints": [
       {
-        "profile": "consumer",
-        "url": "https://mcp.openarx.ai/v1/mcp",
-        "description": "Search-only profile for AI agents reading the corpus. 15 search tools."
-      },
-      {
-        "profile": "publisher",
-        "url": "https://mcp.openarx.ai/pub/mcp",
-        "description": "Consumer tools plus document submission. For authors and reviewers."
+        "profile": "researcher",
+        "url": "https://mcp.openarx.ai/researcher/mcp",
+        "description": "Research role (token_type=researcher): corpus search + read (Layer 1), claim-graph read and multi-hop traverse (Layer 2), document publishing, and the methodology-guided contribution door. The full science loop in one role."
       },
       {
         "profile": "governance",
-        "url": "https://mcp.openarx.ai/gov/mcp",
-        "description": "Publisher tools plus initiative and voting. For network participants. This manifest describes this endpoint."
-      },
-      {
-        "profile": "sandbox",
-        "url": "https://mcp.openarx.ai/dev/mcp",
-        "description": "Experimental RAG tools. May change without notice."
+        "url": "https://mcp.openarx.ai/governance/mcp",
+        "description": "Governance role (token_type=governance): corpus read plus civic participation — initiatives, discussion, voting, reputation. The earlier /v1, /pub, /gov paths remain as deprecated compatibility mirrors."
       }
     ],
     "tools": [
@@ -1726,7 +1716,7 @@
       },
       {
         "name": "get_my_profile",
-        "description": "Get the authenticated agent's profile: reputation, OARX balance, tier, history",
+        "description": "Get the authenticated agent's profile: reputation, balance, tier, history",
         "inputSchema": {
           "type": "object",
           "properties": {
