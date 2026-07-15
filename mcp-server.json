@@ -2289,6 +2289,359 @@
         "execution": {
           "taskSupport": "forbidden"
         }
+      },
+      {
+        "name": "methodist",
+        "description": "START HERE with your research question. This is your step-by-step scientific METHOD guide: it works out what kind of research you're doing, hands you the concrete method one stage at a time, reviews each stage you submit (approves it or returns it for fixes), and controls what gets published. It DIRECTS your research process — it never does the work for you. (This guides HOW you conduct the work. It is NOT the tool for finding methods described in existing papers — for that, use the literature-search tools.)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "description": "The active run (omit to start a new run — routes to diagnose)"
+            },
+            "payload": {
+              "type": "object",
+              "additionalProperties": {},
+              "description": "Mode fields the routed sub-procedure reads: diagnose → {intent, focus?, parent_run_id?}; checkpoint → {submission{records[],track_note?}, submission_hash, stage, claimed_usage?}; ask → {question, focus?}"
+            }
+          },
+          "required": [
+            "payload"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_get_current_dose",
+        "description": "Return the run's current dose, stage and status (where am I). Deterministic — no model call.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_report_need",
+        "description": "Report a blocking need (e.g. missing access/resource); pauses the run and records the need.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "need": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "run_id",
+            "need"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_escalate",
+        "description": "Escalate above the methodist (PM/human). The mentee has a standing right to escalate over the methodist's head (inv-5). Returns a ticket; the resolution arrives via the next checkpoint or get_my_development.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "class": {
+              "type": "string",
+              "description": "Escalation class (open set): dispute | unfair-return | tier | other"
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_get_my_development",
+        "description": "The mentee's own development view: autonomy by context, passed units, tier, and pending corrections (the flat competence map the methodist keeps).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_get",
+        "description": "Fetch a scientific record by id (claim/relation/activity/metric/bundle). Process records (run/intent/decision/journal) are never exposed — the exposure boundary (§12.4/§12.5). Process-referencing fields are stripped.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_find",
+        "description": "Find scientific records related to a claim by its relations: the relations touching it + the connected records on the other endpoints. Scientific-only; process nodes never appear. Relations default to the epistemic §7 set (support/extend/qualify/refute/background/shared_evidence/same_as); pass relation_class=\"engineering\" (or \"all\") to include the engineering dependency graph (ENG_* depends_on/satisfies).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "from_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "relation_class": {
+              "type": "string",
+              "enum": [
+                "epistemic",
+                "engineering",
+                "all"
+              ],
+              "description": "relation class scope — default epistemic (§7); engineering = ENG_* dependency edges; all = both"
+            },
+            "subtype": {
+              "type": "string",
+              "description": "narrow to one relation subtype, e.g. support / extend / depends_on / satisfies"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "in",
+                "out"
+              ],
+              "description": "'out' = relations where from_id is the source; 'in' = from_id is the target"
+            },
+            "latest_only": {
+              "type": "boolean",
+              "description": "drop superseded records — return only current chain-heads (default off)"
+            },
+            "collapse_same_as": {
+              "type": "boolean",
+              "description": "collapse same_as-equivalent connected claims to one canonical (earliest), carrying same_as_members (default off)"
+            }
+          },
+          "required": [
+            "from_id"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_search",
+        "description": "Keyword search the scientific graph (claim/relation/activity/metric/bundle). Optionally narrow by kind. When searching relations they default to the epistemic §7 set; pass relation_class=\"engineering\"/\"all\" to include engineering edges. Process records are never searched or returned. (Semantic search over claims is methodist_search_semantic.)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "minLength": 1
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "claim",
+                "relation",
+                "activity",
+                "metric",
+                "bundle"
+              ]
+            },
+            "relation_class": {
+              "type": "string",
+              "enum": [
+                "epistemic",
+                "engineering",
+                "all"
+              ],
+              "description": "when kind=relation: class scope — default epistemic (§7); engineering / all opt-in"
+            },
+            "subtype": {
+              "type": "string",
+              "description": "when kind=relation: narrow to one relation subtype"
+            },
+            "latest_only": {
+              "type": "boolean",
+              "description": "drop superseded records — current chain-heads only (default off)"
+            },
+            "limit": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_search_semantic",
+        "description": "Semantic (embedding) search over methodist-published claims — the nearest claims to a natural-language query. scope=\"scientific\" (default) searches the §7 claim space (engineering edges excluded from the projection). scope=\"engineering\" is reuse-discovery: it searches the engineering-projected vector, scoped to engineering-connected claims — find past engineering approaches similar to a requirement (a text-similar non-engineering claim never leaks in). Returns claim ids + similarity scores + a text snippet.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "minLength": 1
+            },
+            "limit": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 50
+            },
+            "scope": {
+              "type": "string",
+              "enum": [
+                "scientific",
+                "engineering"
+              ],
+              "description": "scientific (default, §7 claim space) or engineering (reuse-discovery over engineering approaches)"
+            },
+            "claim_status": {
+              "type": "string",
+              "description": "optional filter on the claim_status payload field"
+            },
+            "latest_only": {
+              "type": "boolean",
+              "description": "return only current (non-superseded) claims (default off)"
+            },
+            "collapse_same_as": {
+              "type": "boolean",
+              "description": "collapse same_as-equivalent hits to ONE representative — the BEST-MATCHING member (a ranked face, NOT the §7.6 identity-canonical). Returns same_as_members[] + same_as_canonical_id (the earliest, i.e. the identity-canonical). Default off."
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_traverse",
+        "description": "Multi-hop traversal from a claim over typed relation edges of ONE class. Default walks the epistemic §7 edges transitively (support/extend/qualify/refute/background/shared_evidence/same_as); relation_class=\"engineering\" walks the ENG_DEPENDS_ON/ENG_SATISFIES dependency graph. direction=\"out\" = forward (dependencies / cited); \"in\" = reverse (impact set — who depends on this). For engineering it also returns cycle_detected (start claim in a dependency cycle). Class label-spaces are disjoint — a §7 walk never crosses into engineering edges and vice versa.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "from_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "relation_class": {
+              "type": "string",
+              "enum": [
+                "epistemic",
+                "engineering"
+              ],
+              "description": "edge class to traverse — default epistemic (§7)"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "in",
+                "out"
+              ],
+              "description": "'out' = forward (dependencies); 'in' = reverse (impact set)"
+            },
+            "max_hops": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 6,
+              "description": "transitive depth, default 3, max 6"
+            },
+            "subtype": {
+              "type": "string",
+              "description": "narrow to one edge subtype, e.g. depends_on / satisfies / support"
+            }
+          },
+          "required": [
+            "from_id"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
+      },
+      {
+        "name": "methodist_explore_topic",
+        "description": "Explore a topic: scientific claims matching the topic (keyword). Scientific-only. A lightweight entry into the graph — pair with methodist_find to walk relations.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "minLength": 1
+            },
+            "limit": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "topic"
+          ],
+          "additionalProperties": false,
+          "$schema": "http://json-schema.org/draft-07/schema#"
+        },
+        "execution": {
+          "taskSupport": "forbidden"
+        }
       }
     ]
   },
