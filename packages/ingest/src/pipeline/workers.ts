@@ -27,6 +27,8 @@ import {
   updateAspect3Fields,
   touchLastSeen,
   appendAuditEntry,
+  makeLlmLangId,
+  DEFAULT_LANG_DETECT_MODEL,
 } from '@openarx/api';
 import { runNoveltyWorker } from './review/novelty-worker.js';
 import { access, mkdir, writeFile } from 'node:fs/promises';
@@ -212,6 +214,47 @@ async function reDownloadSource(doc: Document, logger: PipelineContext['logger']
   return true;
 }
 
+const LANG_DETECT_MODEL = process.env.LANG_DETECT_MODEL ?? DEFAULT_LANG_DETECT_MODEL;
+const LANG_DETECT_CONFIDENCE = Number(process.env.LANG_GATE_CONFIDENCE ?? '0.7');
+
+/**
+ * english-only ingress (MASTER §3.4): detect the ACTUAL language of the parsed document and OVERRIDE
+ * the declared `document.language`, so the translation step routes by fact rather than the caller's
+ * claim (closes the "declared en but actually non-English" hole). Reads a SAMPLE (title + abstract +
+ * head of body) via flash-lite. Fail-open: an undetermined / low-confidence verdict or a detector
+ * error leaves the declared value untouched — never forces a spurious translation, never blocks ingest.
+ */
+async function detectAndOverrideLanguage(item: WorkItem, context: PipelineContext): Promise<void> {
+  const doc = item.document;
+  const body = item.parsedDocument ? sectionsToText(item.parsedDocument.sections) : '';
+  const sample = [doc.title, doc.abstract, body].filter(Boolean).join('\n');
+  const detect = makeLlmLangId(
+    async (prompt, opts) =>
+      (
+        await context.modelRouter.complete('enrichment', prompt, {
+          model: opts.model,
+          responseMimeType: opts.responseMimeType,
+          responseSchema: opts.responseSchema,
+          maxTokens: opts.maxTokens,
+        })
+      ).text,
+    LANG_DETECT_MODEL,
+  );
+  const r = await detect(sample);
+  if (r.lang === 'und' || r.confidence < LANG_DETECT_CONFIDENCE) {
+    context.logger.debug(
+      `language detect inconclusive (lang=${r.lang} conf=${r.confidence}) — keeping declared "${doc.language ?? 'none'}"`,
+    );
+    return;
+  }
+  if (doc.language !== r.lang) {
+    context.logger.info(
+      `language override: declared "${doc.language ?? 'none'}" → detected "${r.lang}" (conf ${r.confidence})`,
+    );
+    doc.language = r.lang;
+  }
+}
+
 export async function parseWorker(item: WorkItem, steps: PipelineSteps): Promise<void> {
   const { document: doc, context } = item;
 
@@ -294,6 +337,14 @@ export async function parseWorker(item: WorkItem, steps: PipelineSteps): Promise
   const t0 = performance.now();
   item.parsedDocument = await parseWithStrategy(item.document, context, steps.parserStep);
   item.timing.parseMs = Math.round(performance.now() - t0);
+
+  // english-only ingress (§3.4): override the declared language with the DETECTED one before the
+  // translation step routes on it. Best-effort — never fails the parse.
+  try {
+    await detectAndOverrideLanguage(item, context);
+  } catch (e) {
+    context.logger.warn(`language detection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 export async function chunkWorker(item: WorkItem, steps: PipelineSteps): Promise<void> {

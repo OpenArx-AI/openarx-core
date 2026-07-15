@@ -9,7 +9,7 @@ import {
 } from '../src/index.js';
 import { InMemoryStores } from '../src/testkit/index.js';
 
-const stubLang: LangId = (text) => (/[\u0430-\u044f]/i.test(text) ? { lang: 'ru', confidence: 0.99 } : { lang: 'en', confidence: 0.98 });
+const stubLang: LangId = async (text) => (/[\u0430-\u044f]/i.test(text) ? { lang: 'ru', confidence: 0.99 } : { lang: 'en', confidence: 0.98 });
 
 function reg(): Registry {
   const r = new Registry();
@@ -121,9 +121,9 @@ describe('validate-schema fail-closed enforcement (§12.8)', () => {
 
 // ── detect-language (injected lang-id) ────────────────────────────────────────
 describe('detect-language', () => {
-  it('routes text through the injected lang-id', async () => {
-    expect(ok(await call(reg(), 'detect-language', { inputs: { text: '\u043f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440' } }))).toEqual({ lang: 'ru', confidence: 0.99 });
-    expect(ok(await call(reg(), 'detect-language', { inputs: { text: 'hello world' } }))).toEqual({ lang: 'en', confidence: 0.98 });
+  it('routes text through the injected lang-id and flags confident non-English', async () => {
+    expect(ok(await call(reg(), 'detect-language', { inputs: { text: '\u043f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440' } }))).toEqual({ lang: 'ru', confidence: 0.99, non_english: true, non_english_lang: 'ru' });
+    expect(ok(await call(reg(), 'detect-language', { inputs: { text: 'hello world' } }))).toEqual({ lang: 'en', confidence: 0.98, non_english: false });
   });
 });
 

@@ -7,13 +7,17 @@
 //                                    exchange events (append) + the live tool-log
 //                                    the crosscheck reconciles against (list by run)
 //   hash-index                     → Postgres methodist_idempotency (047)
-//   vector                         → deferred (bd openarx-ywje): claims land in the
-//                                    graph now; full layer2 semantic projection later.
+//   vector                         → Layer2VectorStore (Qdrant `layer2_claims`): GO-claims are
+//                                    vectorized on WRITE via upsertClaimPoint — LIVE (bd openarx-ywje
+//                                    CLOSED, prod-verified @0.84 by paraphrase). NB the READ side is
+//                                    write-only here: Layer2VectorStore.searchClaims exists but no
+//                                    agent-facing semantic read over layer2 is wired/exposed yet.
 
 import { randomUUID } from 'node:crypto';
 import {
   neoGet,
   neoGetAny,
+  neoListActivitiesByType,
   neoPut,
   neoPutRelation,
   getDossier,
@@ -44,13 +48,20 @@ const asRec = (v: unknown): Rec => (v && typeof v === 'object' ? (v as Rec) : {}
 
 /** record_schemas registry (§12.7) — the graph writes read each type's `node` block from
  *  here to drive the Neo4j indexed scalars (schema-driven; replaces hardcoded attester_id). */
-export function buildStores(recordSchemas: Record<string, { node?: NodeSchema }> = {}): StoreProvider {
+export function buildStores(
+  recordSchemas: Record<string, { node?: NodeSchema }> = {},
+): StoreProvider {
   // §12.6/2c: the methodist GO-claim vector sink. Constructed once; ensureCollection is
   // idempotent (creates layer2_claims + payload indexes if absent, no-op otherwise).
   const vectorStore = new Layer2VectorStore();
   void vectorStore
     .ensureCollection()
-    .catch((e) => console.error('[methodist-v2] vector ensureCollection failed:', e instanceof Error ? e.message : e));
+    .catch((e) =>
+      console.error(
+        '[methodist-v2] vector ensureCollection failed:',
+        e instanceof Error ? e.message : e,
+      ),
+    );
   return {
     read(store: StoreName): ReadHandle {
       switch (store) {
@@ -96,12 +107,32 @@ export function buildStores(recordSchemas: Record<string, { node?: NodeSchema }>
               // Union the door exchange events (append-journal) with the LIVE tool-log
               // (MCP call-interception, migration 048) — crosscheck-tool-usage filters
               // entries carrying a `tool` field to reconcile claimed_usage (§8 inv-4).
-              const [events, tools] = await Promise.all([listRunJournal(runId), listRunToolLog(runId)]);
+              const [events, tools] = await Promise.all([
+                listRunJournal(runId),
+                listRunToolLog(runId),
+              ]);
               return [...events, ...tools];
             },
           };
+        case 'activities':
+          // §12.1 finalization read (fetch-run-closeout): list activities by indexed
+          // `activity_type` scalar (e.g. 'version_closeout'); the primitive filters the
+          // small result by run_id + is_superseded. Keyed get is not used on this path.
+          return {
+            store,
+            get: async () => undefined,
+            list: async (spec) => {
+              const activityType = asRec(spec).activity_type;
+              if (typeof activityType !== 'string') return [];
+              return neoListActivitiesByType(activityType);
+            },
+          };
         case 'hash-index':
-          return { store, get: async (key) => (await getMethodistIdempotency(key)) ?? undefined, list: async () => [] };
+          return {
+            store,
+            get: async (key) => (await getMethodistIdempotency(key)) ?? undefined,
+            list: async () => [],
+          };
         default:
           return { store, get: async () => undefined, list: async () => [] };
       }
@@ -113,9 +144,14 @@ export function buildStores(recordSchemas: Record<string, { node?: NodeSchema }>
             store,
             put: async (id, n) => {
               const r = asRec(n);
+              // §12.1 (oyq): expose `cycle` as a queryable INTEGER scalar (the filter/sort key —
+              // e.g. `MATCH (r:run) WHERE r.cycle = 9`) + `cycle_name` for display. The full value
+              // stays in _data (update-run-state normalized it); only add the scalar when present.
               await neoPut('run', 'run_id', id, r, {
                 credential_id: String(r.credential_id ?? ''),
                 status: String(r.status ?? ''),
+                ...(typeof r.cycle === 'number' ? { cycle: r.cycle } : {}),
+                ...(typeof r.cycle_name === 'string' ? { cycle_name: r.cycle_name } : {}),
               });
             },
             patch: async () => {},
@@ -225,9 +261,20 @@ export function buildStores(recordSchemas: Record<string, { node?: NodeSchema }>
                 attester_id: String(pf.attester_id ?? ''),
                 run_id: (pf.run_id ?? null) as string | null,
                 is_superseded: Boolean(pf.is_superseded ?? false),
-                attested_at: typeof pf.attested_at === 'string' ? pf.attested_at : new Date().toISOString(),
+                attested_at:
+                  typeof pf.attested_at === 'string' ? pf.attested_at : new Date().toISOString(),
+                is_engineering_connected: Boolean(r.is_engineering_connected ?? false), // §12.9 P3
               };
-              await vectorStore.upsertClaimPoint(ref, { gemini: vector as number[] }, payload);
+              // §12.9 P3: the primitive also embedded an engineering-edge projection (gemini_eng);
+              // upsert both named vectors (gemini §7 + gemini_eng) so eng-search can query the eng space.
+              const vectorEng = Array.isArray(r.vector_eng)
+                ? (r.vector_eng as number[])
+                : undefined;
+              await vectorStore.upsertClaimPoint(
+                ref,
+                { gemini: vector as number[], gemini_eng: vectorEng },
+                payload,
+              );
             },
             patch: async () => {},
             delete: async (id) => {

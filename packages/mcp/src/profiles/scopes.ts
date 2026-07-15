@@ -16,6 +16,10 @@
 
 export const SCOPE_READ = 'read';
 export const SCOPE_WRITE_DOCUMENTS = 'write:documents';
+// Portal-issued to publishers/gov_participants (above). Currently maps to NO tool: the layer2
+// write/read FACADE (submit_*/query_*/verify_claim/link_supersedes) was removed with the PG→Neo4j
+// teardown (9xgj); the methodist door is the sole graph-write path now (SCOPE_METHODIST). Kept as
+// the named Portal scope.
 export const SCOPE_WRITE_LAYER2 = 'write:layer2';
 export const SCOPE_METHODIST = 'methodist';
 
@@ -31,14 +35,6 @@ export const TOOL_REQUIRED_SCOPE: Record<string, string> = {
   create_new_version: SCOPE_WRITE_DOCUMENTS,
   create_draft: SCOPE_WRITE_DOCUMENTS,
   create_upload_url: SCOPE_WRITE_DOCUMENTS,
-  // ── Layer 2 writes (incl. verify_claim, which writes a verification block) ──
-  submit_claim: SCOPE_WRITE_LAYER2,
-  submit_relation: SCOPE_WRITE_LAYER2,
-  submit_activity_batch: SCOPE_WRITE_LAYER2,
-  submit_metrics: SCOPE_WRITE_LAYER2,
-  submit_bundle: SCOPE_WRITE_LAYER2,
-  link_supersedes: SCOPE_WRITE_LAYER2,
-  verify_claim: SCOPE_WRITE_LAYER2,
   // ── methodist channel ──
   methodist_diagnose: SCOPE_METHODIST,
   methodist_checkpoint: SCOPE_METHODIST,

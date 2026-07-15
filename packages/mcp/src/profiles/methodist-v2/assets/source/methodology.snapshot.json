@@ -1,5 +1,5 @@
 {
-  "methodology_version": "v1.3",
+  "methodology_version": "v1.8",
   "_meta": {
     "owner": "msi:openarx-methodist (content source-of-truth)",
     "schema": "methodist_framework_v2.md §5 (procedures/steps/gate/route); door surface §3 (focus? on diagnose/course)",
@@ -16,115 +16,6 @@
       "update_dossier_mapping_ownership": "These rules are METHODOLOGY-OWNED POLICY, not primitive-intrinsic (framework §6: primitives are methodology-agnostic). v1: Core hardwires them into update-dossier for the single methodology (YAGNI, ticket ...-0590/0591). Target form: params-driven (rules as methodology params → generic flat-map writer). This _meta block is the SOURCE OF TRUTH for the rules; changing them is a methodology patch (methods-council), not a primitive change. Lift to params on the second methodology.",
       "dose_storage": "property of the run node (Neo4j); current dose only; dose history = immutable journal activities.",
       "agent_id_credential_id": "diagnose input agent_id maps to create-run credential_id (one entity) — confirm no lookup needed [Core]."
-    }
-  },
-  "prompts": {
-    "diagnose": "see door_prompts.md#D1 (ROLE + cycle diagnosis with signs + first dose; density from autonomy_by_context; focus? steers probe class)",
-    "checkpoint": "see door_prompts.md#D2 (two-axis: methodology-adherence + result-quality → GO|RETURN quality-stamp; verdict-by-criteria-not-match; tier-gate if probe present)",
-    "ask": "see door_prompts.md (merged course+consult: mid-stage direction/clarification, frame-anchored to cycle/stage; MAY adjust dose data-driven (course-mode) else pure clarification (consult-mode); never advance stage; never do the work)",
-    "verify": "see door_prompts.md#verify (claim↔evidence entailment; VERIFIED|UNVERIFIABLE; annotate not reject)"
-  },
-  "schemas": {
-    "diagnose_out": {
-      "cycle": "str",
-      "entry_point": "str",
-      "signs": "str[]",
-      "dose": {
-        "stage": "int",
-        "operations": "str[]",
-        "beacons": "str[]",
-        "expected_artifacts": "str[]",
-        "counters": "str[]",
-        "probe": {
-          "_opt": "creative stages only; injected by diagnose/course from tier-gate bank (tier_gate_and_course.md Part 2)",
-          "creative_element": "str — MANDATORY (Core keys tier_by_context from it)",
-          "tier": "str",
-          "task": "str",
-          "reference": "str (grading anchor; NOT shown to mentee as an answer)",
-          "D_criteria": "str"
-        },
-        "unit_id": "str?",
-        "unit_level": "str?"
-      },
-      "rationale": "str"
-    },
-    "checkpoint_verdict": {
-      "verdict": "GO|RETURN",
-      "methodology_adherence": {
-        "followed": "bool",
-        "notes": "str",
-        "crosscheck_flag": "bool?"
-      },
-      "quality": {
-        "dimensions": [
-          {
-            "name": "str",
-            "level": "str"
-          }
-        ],
-        "stamp_claim_text": "str?"
-      },
-      "tier_signal": {
-        "target_tier": "str (what Core writes to tier_by_context[creative_element])",
-        "probe_outcome": "pass|fail (route: fail→repeat-stage-simpler / pass→proceed-at-tier)",
-        "_vertex": "OPTIONAL — put in Vertex OBJECT `properties` so the model CAN emit it, but NOT in `required` (present only on creative stages where a probe was injected)"
-      },
-      "reasons": "str[]",
-      "corrections": [
-        {
-          "what": "str",
-          "why": "str",
-          "must_apply_before": "str"
-        }
-      ],
-      "patches": [
-        {
-          "id": "str",
-          "formulation": "str",
-          "applies_at": "str"
-        }
-      ],
-      "next_dose": "dose?"
-    },
-    "ask_out": {
-      "answer": "str",
-      "dose_adjustment": {
-        "_opt": "present only when the dose needs a mid-stage adjustment (course-mode); absent for pure clarification (consult-mode)",
-        "added_operations": "str[]?",
-        "patch": {
-          "id": "str",
-          "formulation": "str"
-        },
-        "beacon": "str?"
-      }
-    },
-    "verify_out": {
-      "outcome": "VERIFIED|UNVERIFIABLE",
-      "reason_category": "str",
-      "caveat": "str?"
-    },
-    "submission": {
-      "trace": "str",
-      "artifacts": [
-        {
-          "name": "str",
-          "uri_or_inline": "str",
-          "content_hash": "str"
-        }
-      ],
-      "counters": "obj",
-      "track_note": {
-        "intended": "str",
-        "did": "str",
-        "derived": "str"
-      },
-      "records": [
-        {
-          "local_id": "_:str",
-          "kind": "claim|relation|activity",
-          "_fields": "per layer_2 pillar §12; relation.source/target ref _:local_id; present ONLY on write-path stages"
-        }
-      ]
     }
   },
   "procedures": [
@@ -266,6 +157,19 @@
           }
         },
         {
+          "id": "lang",
+          "primitive": "detect-language",
+          "version": "v1",
+          "in": {
+            "records": "$input.payload.submission.records"
+          },
+          "out": "lang",
+          "gate": {
+            "when": "$lang.non_english",
+            "outcome": "non_english_rejected"
+          }
+        },
+        {
           "id": "runst",
           "primitive": "fetch-run-state",
           "version": "v1",
@@ -342,15 +246,6 @@
           "params": {
             "schema_ref": "layer2_v12"
           }
-        },
-        {
-          "id": "lang",
-          "primitive": "detect-language",
-          "version": "v1",
-          "in": {
-            "records": "$resolved"
-          },
-          "out": "lang"
         },
         {
           "id": "vctx",
@@ -497,6 +392,15 @@
             "const": "prev_stage_not_go"
           },
           "missing": "$stop.missing"
+        },
+        "non_english_rejected": {
+          "error": {
+            "const": "non_english_rejected"
+          },
+          "reason": {
+            "const": "submission contains non-English text — resubmit in English"
+          },
+          "detected_lang": "$lang.non_english_lang"
         }
       }
     },
@@ -616,15 +520,21 @@
           "out": "runpath"
         },
         {
+          "id": "runclose",
+          "primitive": "fetch-run-closeout",
+          "version": "v1",
+          "in": {
+            "run_id": "$input.run_id"
+          },
+          "out": "runclose"
+        },
+        {
           "id": "status",
           "primitive": "derive-run-status",
           "version": "v1",
-          "params": {
-            "process_ref": "final_stage_by_cycle"
-          },
           "in": {
             "path_events": "$runpath.path_events",
-            "cycle": "$runst.cycle"
+            "finalized": "$runclose.finalized"
           },
           "out": "status"
         }
@@ -731,14 +641,42 @@
     ]
   },
   "_process": {
-    "_note": "§12.1 process-layer VALUES (methodist-owned; 2e reads from the methodology object). final_stage_by_cycle drives the run-derived `done` status (a checkpoint_go on the final stage). path_node_shapes = the field-sets of the typed path nodes. Process nodes are opaque/not content-addressed (§12.1); hash-scopes are NOT here. ⚠ NB: course_event + consult_event MERGED → ask_event — the single-door merge (in main) means the `ask` procedure journals a const `ask` event, so course/consult path-nodes no longer occur; ask_event carries the ask_out fields.",
-    "final_stage_by_cycle": { "c1": 6, "c2": 8, "c3": 6, "c4": 7, "c5": 8, "c6": 7, "c8": 7, "c9": 7 },
+    "_note": "§12.1 process-layer VALUES (methodist-owned; 2e reads from the methodology object). run-derived `done` status = presence of a non-superseded `version_closeout` activity for the run (durable append-only marker emitted at the closeout-checkpoint GO; v1.8 — done no longer recomputes against a mutable table). The stable final-stage map lives as a git-constant in Core's one-time back-fill script, NOT here (final_stage_by_cycle removed v1.8). path_node_shapes = the field-sets of the typed path nodes. Process nodes are opaque/not content-addressed (§12.1); hash-scopes are NOT here. ⚠ NB: course_event + consult_event MERGED → ask_event — the single-door merge (in main) means the `ask` procedure journals a const `ask` event, so course/consult path-nodes no longer occur; ask_event carries the ask_out fields.",
     "path_node_shapes": {
-      "dose_issued": { "dose_content": ["operations", "beacons", "expected_artifacts", "counters", "probe?", "unit?"] },
-      "checkpoint_go": ["quality_stamp", "methodology_adherence", "reasons", "tier_signal?", "patches?", "next_dose_ref?", "track_note"],
-      "checkpoint_return": ["methodology_adherence", "reasons", "corrections", "tier_signal?", "patches?", "track_note"],
-      "ask_event": ["answer", "dose_adjustment?"],
-      "report_need": ["need"]
+      "dose_issued": {
+        "dose_content": [
+          "operations",
+          "beacons",
+          "expected_artifacts",
+          "counters",
+          "probe?",
+          "unit?"
+        ]
+      },
+      "checkpoint_go": [
+        "quality_stamp",
+        "methodology_adherence",
+        "reasons",
+        "tier_signal?",
+        "patches?",
+        "next_dose_ref?",
+        "track_note"
+      ],
+      "checkpoint_return": [
+        "methodology_adherence",
+        "reasons",
+        "corrections",
+        "tier_signal?",
+        "patches?",
+        "track_note"
+      ],
+      "ask_event": [
+        "answer",
+        "dose_adjustment?"
+      ],
+      "report_need": [
+        "need"
+      ]
     }
   }
 }

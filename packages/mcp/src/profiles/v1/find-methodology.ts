@@ -17,7 +17,7 @@ interface MethodExtraction {
 export function registerFindMethodology(server: McpServer, ctx: AppContext): void {
   server.tool(
     'find_methodology',
-    'Find methodology approaches for a specific research task. Returns structured method-level results (not raw chunks): method name, key idea, dataset used, performance metric. Filters by task domain, dataset, metric. Built on LLM-classified contentType=methodology chunks combined with benchmark results JOIN. Use this instead of `search` when you want HOW researchers approach a problem rather than 10 papers about it. Note: surfaces any chunk classified as methodology, including ones where the task is mentioned only as a toy example. Filter by category (e.g. cs.CV for image tasks) to narrow scope.',
+    'Find methodology approaches for a specific research task. Returns structured method-level results (not raw chunks): method name, key idea, dataset used, performance metric. Filters by task domain, dataset, metric. Built on LLM-classified contentType=methodology chunks combined with benchmark results JOIN. Use this instead of `search` when you want HOW researchers approach a problem rather than 10 papers about it. Note: surfaces any chunk classified as methodology, including ones where the task is mentioned only as a toy example. Filter by category (e.g. cs.CV for image tasks) to narrow scope. This searches EXISTING papers for methods others have published (literature search) — it is NOT a guide for conducting your own research: for a step-by-step scientific method tailored to your own research question, start with the `methodist` door.',
     {
       task: z.string().describe(
         'Research task: "relation extraction", "question answering", "image classification"',

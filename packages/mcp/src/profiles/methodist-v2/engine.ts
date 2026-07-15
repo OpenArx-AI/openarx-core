@@ -6,7 +6,7 @@
 // call runEndpoint(engine, <endpoint>, input) against this.
 
 import { randomUUID } from 'node:crypto';
-import { VertexLlm, EmbedClient, recordMethodistLlmCost, validateRecordShape } from '@openarx/api';
+import { VertexLlm, EmbedClient, recordMethodistLlmCost, validateRecordShape, makeLlmLangId, DEFAULT_LANG_DETECT_MODEL } from '@openarx/api';
 import { assignRecordId, RECORD_TYPES, type Layer2Record } from '@openarx/types';
 import {
   Registry,
@@ -116,11 +116,28 @@ export function buildDoorEngine(): InterpreterDeps {
     },
   };
 
+  // english-only ingress (MASTER §3.4): the real detector for the checkpoint's detect-language step.
+  // flash-lite (Vlad: cheapest flash, NOT pro; detects the actual LANGUAGE so ANY non-English is
+  // caught, incl. Latin-script es/fr/de). LLM-agnostic detector over the injected vertex completion;
+  // the detect-language step's gate (methodist procedure) rejects a confident non-en fail-closed.
+  const langDetect = makeLlmLangId(
+    async (prompt, opts) =>
+      (
+        await vertex.complete('enrichment', prompt, {
+          model: opts.model,
+          responseMimeType: opts.responseMimeType,
+          responseSchema: opts.responseSchema,
+          maxTokens: opts.maxTokens,
+        })
+      ).text,
+    process.env.LANG_DETECT_MODEL ?? DEFAULT_LANG_DETECT_MODEL,
+  );
+
   const registry = new Registry();
   registry.registerAll(
     allPrimitives({
       assignId,
-      langId: () => ({ lang: 'en', confidence: 0.9 }),
+      langId: langDetect,
       embed: geminiEmbed,
       mintId: (credential: string) => `run:${credential}:${randomUUID()}`,
       now: () => new Date().toISOString(),

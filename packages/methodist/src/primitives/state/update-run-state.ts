@@ -15,6 +15,7 @@
 // out: { ok } · access: run-state · effects: run-state + journal (typed path-event).
 
 import { definePrimitive, RuntimeError, type Registration } from '../../runtime/index.js';
+import { normalizeCycle } from './cycle-label.js';
 
 interface RunNode {
   current_stage?: number | null;
@@ -28,8 +29,10 @@ type Verdict = { verdict?: 'GO' | 'RETURN' } | 'GO' | 'RETURN';
 interface In {
   run_id: string;
   stage?: number;
-  /** the diagnosed cycle — set on the run node at diagnose so $runst.cycle resolves later */
-  cycle?: string;
+  /** the diagnosed cycle — set on the run node at diagnose so $runst.cycle resolves later.
+   *  §12.1: the diagnose dose emits a canonical INTEGER (∈ {1..6,8,9}; 7 RESERVED). Accepted as a
+   *  string too for the legacy transition; normalized on write to `cycle` (integer) + `cycle_name`. */
+  cycle?: string | number;
   dose?: unknown;
   status?: 'active' | 'paused' | 'abandoned' | 'done';
   verdict?: Verdict;
@@ -47,7 +50,11 @@ function verdictValue(v: Verdict | undefined): 'GO' | 'RETURN' | undefined {
   return typeof v === 'string' ? v : v.verdict;
 }
 
-export const updateRunStatePrimitive: Registration = definePrimitive<Record<string, never>, In, Out>(
+export const updateRunStatePrimitive: Registration = definePrimitive<
+  Record<string, never>,
+  In,
+  Out
+>(
   {
     id: 'update-run-state',
     version: 'v1',
@@ -59,7 +66,8 @@ export const updateRunStatePrimitive: Registration = definePrimitive<Record<stri
   },
   async ({ inputs, ctx }) => {
     const current = (await ctx.read('run-state').get(inputs.run_id)) as RunNode | undefined;
-    if (current === undefined) throw new RuntimeError('bad-output', `run '${inputs.run_id}' does not exist`);
+    if (current === undefined)
+      throw new RuntimeError('bad-output', `run '${inputs.run_id}' does not exist`);
     const next: RunNode = { ...current };
     const verdict = verdictValue(inputs.verdict);
 
@@ -68,7 +76,24 @@ export const updateRunStatePrimitive: Registration = definePrimitive<Record<stri
     // payload.stage could forge current_stage (and past a RETURN it would stick). Only a
     // stage-setting call WITHOUT a verdict (diagnose) may set current_stage from inputs.
     if (inputs.stage !== undefined && verdict === undefined) next.current_stage = inputs.stage;
-    if (inputs.cycle !== undefined) next.cycle = inputs.cycle;
+    // §12.1 cycle-label normalization (oyq): store `run.cycle` as the canonical INTEGER (the
+    // filter/sort key AND — via $runst.cycle → write-graph-records → cycle_context.cycle_type — the
+    // §4.3-hashed claim value; JCS sees `9`, never `"9"`), plus a `run.cycle_name` display field.
+    if (inputs.cycle !== undefined) {
+      const norm = normalizeCycle(inputs.cycle);
+      if (norm) {
+        next.cycle = norm.cycle; // JS integer, type-locked
+        next.cycle_name = norm.cycle_name;
+      } else {
+        // An unmappable cycle (incl. the reserved 7) is an upstream bug — never invent a value.
+        // Keep run.cycle numeric-or-absent (NOT a string, which would fork claim ids), stash the raw
+        // in cycle_name for diagnosis, and surface it loudly.
+        console.error(
+          `[update-run-state] unmappable cycle for run ${inputs.run_id}: ${JSON.stringify(inputs.cycle)}`,
+        );
+        next.cycle_name = typeof inputs.cycle === 'string' ? inputs.cycle : String(inputs.cycle);
+      }
+    }
     if (inputs.status !== undefined) next.status = inputs.status;
     if (inputs.need !== undefined) next.need = inputs.need;
     if (inputs.dose !== undefined) next.dose = inputs.dose;
@@ -82,7 +107,10 @@ export const updateRunStatePrimitive: Registration = definePrimitive<Record<stri
 
     if (inputs.next_dose !== undefined) next.dose = inputs.next_dose; // GO carries the next stage's dose
     if (inputs.dose_adjustment !== undefined) {
-      next.dose = { ...((next.dose as Record<string, unknown> | null) ?? {}), ...inputs.dose_adjustment };
+      next.dose = {
+        ...((next.dose as Record<string, unknown> | null) ?? {}),
+        ...inputs.dose_adjustment,
+      };
     }
 
     await ctx.write('run-state').put(inputs.run_id, next);
@@ -110,7 +138,8 @@ export const updateRunStatePrimitive: Registration = definePrimitive<Record<stri
       event = 'dose_issued';
       payload = { stage: inputs.stage };
     }
-    if (event !== undefined) await ctx.write('journal').append({ run_id: inputs.run_id, event, payload });
+    if (event !== undefined)
+      await ctx.write('journal').append({ run_id: inputs.run_id, event, payload });
 
     return { outputs: { ok: true } };
   },

@@ -24,6 +24,12 @@ export function asRecordArray(input: unknown): RecordEntry[] {
 export function recordText(entry: RecordEntry): string {
   const rec = (entry.record ?? entry) as Record<string, unknown>;
   const content = rec.content as Record<string, unknown> | undefined;
-  if (typeof content?.text === 'string') return content.text;
+  const parts: string[] = [];
+  if (typeof content?.text === 'string') parts.push(content.text);
+  // A relation's citation_context is human-readable prose AND in the §4.3 hash-scope, so the
+  // english-only language gate must see it too (contracts §7.6 ruling 2026-07-13). Used only by
+  // detect-language — safe to include here without touching any embedding projection.
+  if (typeof rec.citation_context === 'string') parts.push(rec.citation_context);
+  if (parts.length > 0) return parts.join('\n');
   return JSON.stringify(rec);
 }

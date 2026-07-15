@@ -12,7 +12,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { runEndpoint } from '@openarx/methodist';
-import { getDossier, appendRunJournal, recordMethodistIdempotency } from '@openarx/api';
+import { getDossier, appendRunJournal, recordMethodistIdempotency, neoGet } from '@openarx/api';
 import { canonicalBytes } from '@openarx/types';
 
 /** SHA-256 hex over a string (the §4.3 JCS canonical bytes of a hand-in). */
@@ -32,8 +32,18 @@ function errJson(data: unknown): { content: [{ type: 'text'; text: string }]; is
  *  (boundary-1), never a free-typed param. Delegates to credentialFromToken (the SINGLE
  *  mint used here AND by the tool-log keying in index.ts — see 2f / §12.2). */
 function credentialOf(extra: unknown): string {
-  const token = (extra as Record<string, unknown> | undefined)?._portalToken as { userId?: string; tokenId?: string } | undefined;
+  const token = (extra as Record<string, unknown> | undefined)?._portalToken as
+    | { userId?: string; tokenId?: string }
+    | undefined;
   return credentialFromToken(token);
+}
+
+/** openarx-xckj: a run_id supplied by the mentee MUST reference a run that diagnose already
+ *  created. Checking here — before the interpreter runs a checkpoint / dose / report_need —
+ *  turns a call against a non-existent run into a clean `unknown_run` error instead of a
+ *  confusing downstream failure. Runs are process nodes (Neo4j `run`, keyed by run_id). */
+async function runExists(runId: string): Promise<boolean> {
+  return (await neoGet('run', 'run_id', runId)) !== undefined;
 }
 
 export function registerMethodistDoors(server: McpServer, _ctx: AppContext): void {
@@ -47,9 +57,16 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
   // live in `payload`, which the routed sub-procedure reads.
   server.tool(
     'methodist',
-    'The single methodist model door — routed by intent. No active run → diagnose (a research INTENT → the cycle + entry point + the first dose). An explicit publish signal in the payload → checkpoint (hand in a stage: GO publishes the quality-stamped claim + issues the next dose; RETURN gives corrections with WHY — you do not decide publication, the verdict does). Otherwise → ask (mid-stage direction or a stateless clarifying question — a hint/beacon/patch, never the solution; boundary 1). Directs, never does the work.',
+    // Cold-start-tuned description (methodist SoT door_tool_description.md v1; PM 0018 GO): a lead
+    // hook so the door is discoverable on a name/description scan + disambiguated vs find_methodology
+    // (literature-method search). The diagnose/checkpoint/ask routing detail lives in the `payload`
+    // parameter description below — this string is the high-level entry hook.
+    "START HERE with your research question. This is your step-by-step scientific METHOD guide: it works out what kind of research you're doing, hands you the concrete method one stage at a time, reviews each stage you submit (approves it or returns it for fixes), and controls what gets published. It DIRECTS your research process — it never does the work for you. (This guides HOW you conduct the work. It is NOT the tool for finding methods described in existing papers — for that, use the literature-search tools.)",
     {
-      run_id: z.string().optional().describe('The active run (omit to start a new run — routes to diagnose)'),
+      run_id: z
+        .string()
+        .optional()
+        .describe('The active run (omit to start a new run — routes to diagnose)'),
       payload: z
         .record(z.unknown())
         .describe(
@@ -58,6 +75,16 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
     },
     async ({ run_id, payload }, extra) => {
       try {
+        // openarx-xckj: a supplied run_id must reference an existing run (diagnose creates it).
+        // Guard before the interpreter → clean unknown_run instead of a confusing downstream error.
+        // No run_id → a new run (routes to diagnose), so the guard only fires when one is passed.
+        if (run_id && !(await runExists(run_id))) {
+          return errJson({
+            error: 'unknown_run',
+            run_id,
+            detail: 'No such run. Omit run_id to start a new run (diagnose), or verify the run_id.',
+          });
+        }
         const payloadObj = (payload ?? {}) as Record<string, unknown>;
         // openarx-abvc (A): SERVER-derive the idempotency key over the FULL hand-in (§4.3 JCS
         // over records + track_note + claimed_usage) — NOT the client-opaque submission_hash.
@@ -66,10 +93,16 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
         // stays idempotent (§2g intact). Also closes an anti-gaming surface — the mentee no
         // longer controls its own idempotency key. Server-set here so BOTH the check-idempotency
         // gate (inside runEndpoint) and the post-outcome record below use the same server value.
-        const sub = payloadObj.submission as { records?: unknown; track_note?: unknown } | undefined;
+        const sub = payloadObj.submission as
+          | { records?: unknown; track_note?: unknown }
+          | undefined;
         if (sub && typeof sub === 'object') {
           payloadObj.submission_hash = sha256Hex(
-            canonicalBytes({ records: sub.records ?? null, track_note: sub.track_note ?? null, claimed_usage: payloadObj.claimed_usage ?? null }),
+            canonicalBytes({
+              records: sub.records ?? null,
+              track_note: sub.track_note ?? null,
+              claimed_usage: payloadObj.claimed_usage ?? null,
+            }),
           );
         }
         const r = await runEndpoint(engine, 'methodist', {
@@ -92,7 +125,11 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
           if (r.outcome === 'GO' && typeof committed.bundle_id === 'string') {
             await recordMethodistIdempotency(key, { verdict: 'GO', ref: committed.bundle_id });
           } else if (r.outcome === 'RETURN') {
-            await recordMethodistIdempotency(key, { verdict: 'RETURN', reasons: resp.reasons ?? null, corrections: resp.corrections ?? null });
+            await recordMethodistIdempotency(key, {
+              verdict: 'RETURN',
+              reasons: resp.reasons ?? null,
+              corrections: resp.corrections ?? null,
+            });
           }
         }
         // openarx-abvc (C): transparent idempotent replay. A byte-identical hand-in (same
@@ -125,8 +162,10 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
         // cross-stage relations is actually populated on GO (empty id_map = the mentee submitted
         // claims WITHOUT local_ids _:cN → no ids returned → can't build cross-stage relations).
         if (r.outcome === 'GO' || r.outcome === 'RETURN') {
-          const submittedRecords = Array.isArray((payloadObj.submission as { records?: unknown })?.records)
-            ? ((payloadObj.submission as { records: unknown[] }).records).length
+          const submittedRecords = Array.isArray(
+            (payloadObj.submission as { records?: unknown })?.records,
+          )
+            ? (payloadObj.submission as { records: unknown[] }).records.length
             : 0;
           console.error(
             JSON.stringify({
@@ -143,7 +182,10 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
           ...(idMap && Object.keys(idMap).length > 0 ? { id_map: idMap } : {}),
         });
       } catch (e) {
-        return errJson({ error: 'methodist_failed', detail: e instanceof Error ? e.message : String(e) });
+        return errJson({
+          error: 'methodist_failed',
+          detail: e instanceof Error ? e.message : String(e),
+        });
       }
     },
   );
@@ -155,10 +197,20 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
     { run_id: z.string().min(1) },
     async ({ run_id }) => {
       try {
+        if (!(await runExists(run_id))) {
+          return errJson({
+            error: 'unknown_run',
+            run_id,
+            detail: 'No such run — check the run_id.',
+          });
+        }
         const r = await runEndpoint(engine, 'get_current_dose', { run_id });
         return jsonResult({ outcome: r.outcome, ...r.response });
       } catch (e) {
-        return errJson({ error: 'get_current_dose_failed', detail: e instanceof Error ? e.message : String(e) });
+        return errJson({
+          error: 'get_current_dose_failed',
+          detail: e instanceof Error ? e.message : String(e),
+        });
       }
     },
   );
@@ -170,10 +222,20 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
     { run_id: z.string().min(1), need: z.string().min(1) },
     async ({ run_id, need }) => {
       try {
+        if (!(await runExists(run_id))) {
+          return errJson({
+            error: 'unknown_run',
+            run_id,
+            detail: 'No such run — check the run_id.',
+          });
+        }
         const r = await runEndpoint(engine, 'report_need', { run_id, need });
         return jsonResult({ outcome: r.outcome, ...r.response });
       } catch (e) {
-        return errJson({ error: 'report_need_failed', detail: e instanceof Error ? e.message : String(e) });
+        return errJson({
+          error: 'report_need_failed',
+          detail: e instanceof Error ? e.message : String(e),
+        });
       }
     },
   );
@@ -184,7 +246,10 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
     "Escalate above the methodist (PM/human). The mentee has a standing right to escalate over the methodist's head (inv-5). Returns a ticket; the resolution arrives via the next checkpoint or get_my_development.",
     {
       run_id: z.string().optional(),
-      class: z.string().optional().describe('Escalation class (open set): dispute | unfair-return | tier | other'),
+      class: z
+        .string()
+        .optional()
+        .describe('Escalation class (open set): dispute | unfair-return | tier | other'),
       detail: z.string().optional(),
     },
     async ({ run_id, class: klass, detail }, extra) => {
@@ -194,12 +259,20 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
           await appendRunJournal({
             run_id,
             event: 'escalate',
-            payload: { credential: credentialOf(extra), class: klass ?? 'other', detail: detail?.slice(0, 500) ?? null, ticket },
+            payload: {
+              credential: credentialOf(extra),
+              class: klass ?? 'other',
+              detail: detail?.slice(0, 500) ?? null,
+              ticket,
+            },
           });
         }
         return jsonResult({ ticket, status: 'received', class: klass ?? 'other' });
       } catch (e) {
-        return errJson({ error: 'escalate_failed', detail: e instanceof Error ? e.message : String(e) });
+        return errJson({
+          error: 'escalate_failed',
+          detail: e instanceof Error ? e.message : String(e),
+        });
       }
     },
   );
@@ -207,12 +280,19 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
   // ── get_my_development (non-model channel — the mentee's own competence view) ─
   server.tool(
     'methodist_get_my_development',
-    'The mentee\'s own development view: autonomy by context, passed units, tier, and pending corrections (the flat competence map the methodist keeps).',
+    "The mentee's own development view: autonomy by context, passed units, tier, and pending corrections (the flat competence map the methodist keeps).",
     {},
     async (_args, extra) => {
       try {
         const d = await getDossier(credentialOf(extra));
-        if (!d) return jsonResult({ present: false, autonomy_by_context: {}, passed_units: [], tier_by_context: {}, corrections: [] });
+        if (!d)
+          return jsonResult({
+            present: false,
+            autonomy_by_context: {},
+            passed_units: [],
+            tier_by_context: {},
+            corrections: [],
+          });
         return jsonResult({
           present: true,
           autonomy_by_context: d.autonomy_by_context,
@@ -221,7 +301,10 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
           corrections: d.corrections,
         });
       } catch (e) {
-        return errJson({ error: 'get_my_development_failed', detail: e instanceof Error ? e.message : String(e) });
+        return errJson({
+          error: 'get_my_development_failed',
+          detail: e instanceof Error ? e.message : String(e),
+        });
       }
     },
   );

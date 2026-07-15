@@ -193,7 +193,10 @@ function formatChunk(
 
   const base: Record<string, unknown> = {
     chunkId: row.id,
-    content: truncateChunk(row.content),
+    // 872a (mcp_search.md drill-down semantics): detail=full returns the FULL chunk content
+    // (claims must be grounded on full sources, not snippets) — bounded naturally by the ingest
+    // chunk-size guard (~5000 chars). standard/minimal keep the truncateChunk(800) preview.
+    content: detail === 'full' ? row.content : truncateChunk(row.content),
     context: {
       sectionPath: row.section_path ?? ctx.sectionPath ?? null,
       sectionName: ctx.sectionName ?? null,

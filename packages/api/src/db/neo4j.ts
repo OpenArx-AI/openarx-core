@@ -69,6 +69,25 @@ export async function neoGetAny(
   }
 }
 
+/** List every `activity` record of a given `activity_type` (parsed from `_data`). `activity_type`
+ *  is an indexed scalar, so this scans only that type's nodes. Used by the §12.1 finalization read
+ *  (`fetch-run-closeout`): the caller filters the (small) result by run_id + is_superseded — those
+ *  live in `_data`, not as indexed props. `activityType` is code-controlled (never user input). */
+export async function neoListActivitiesByType(activityType: string): Promise<Record<string, unknown>[]> {
+  const session = getNeo4jDriver().session();
+  try {
+    const r = await session.run('MATCH (a:`activity` {activity_type: $t}) RETURN a._data AS data', { t: activityType });
+    const out: Record<string, unknown>[] = [];
+    for (const rec of r.records) {
+      const data = rec.get('data') as string | null;
+      if (data) out.push(JSON.parse(data) as Record<string, unknown>);
+    }
+    return out;
+  } finally {
+    await session.close();
+  }
+}
+
 /** Upsert a node: full record → `_data` JSON blob + indexed scalar properties. */
 export async function neoPut(
   label: string,

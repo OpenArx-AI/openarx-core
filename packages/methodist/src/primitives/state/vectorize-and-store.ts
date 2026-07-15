@@ -44,7 +44,11 @@ type SchemaMap = Record<string, { vector?: VectorSchema } | undefined>;
 /** Unwrap the committed set whether it arrives bare or as { committed: [...] }. */
 function committedRecords(input: unknown): ResolvedRecord[] {
   if (Array.isArray(input)) return input as ResolvedRecord[];
-  if (input && typeof input === 'object' && Array.isArray((input as { committed?: unknown }).committed)) {
+  if (
+    input &&
+    typeof input === 'object' &&
+    Array.isArray((input as { committed?: unknown }).committed)
+  ) {
     return (input as { committed: ResolvedRecord[] }).committed;
   }
   return [];
@@ -55,16 +59,23 @@ const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 /** 1-hop edges for a claim, from the committed relations; neighbour text from the
  *  committed claims. Deterministic order = write-set order. Best-effort: an edge whose
  *  neighbour text isn't in this write-set is skipped (enrichment, not correctness). */
-function edgesFor(claimId: string, records: ResolvedRecord[], textById: Map<string, string>): EnrichEdge[] {
+function edgesFor(
+  claimId: string,
+  records: ResolvedRecord[],
+  textById: Map<string, string>,
+  forClass: 'epistemic' | 'engineering' = 'epistemic',
+): EnrichEdge[] {
   const edges: EnrichEdge[] = [];
   for (const w of records) {
     if (w.record_type !== 'relation') continue;
     const r = w.record;
-    // §12.8 (c) vector-segmentation: engineering relations (dependency/satisfies) must NOT enter a
-    // claim's SCIENTIFIC embedding — else semantic search over the scientific corpus is confounded by
-    // engineering-path edges. Only epistemic (§7) relations enrich the claim vector (label-space split
-    // in the graph; class-filter here for the vector projection).
-    if (str(r.relation_class) === 'engineering') continue;
+    // §12.8 (c) vector-segmentation + §12.9 P3: each class enriches its OWN claim vector — epistemic
+    // (§7) edges the `gemini` (scientific) vector, engineering (ENG_*) edges the `gemini_eng` vector.
+    // A §7 semantic search is never confounded by engineering-path edges, and vice versa (label-space
+    // split in the graph; class-filter here selects which edges enter which projection).
+    const isEng = str(r.relation_class) === 'engineering';
+    if (forClass === 'epistemic' && isEng) continue; // §7 vector excludes engineering
+    if (forClass === 'engineering' && !isEng) continue; // eng vector = engineering-only
     const src = str(r.source_claim_id);
     const tgt = str(r.target_claim_id);
     const rel = str(r.relation) ?? 'related';
@@ -116,9 +127,11 @@ export function makeVectorizeAndStore(embed: Embed, recordSchemas: SchemaMap = {
         const content = (rec.content ?? {}) as Record<string, unknown>;
         // Computed enrichment (mirrors buildClaimProjection): run-context + 1-hop edges.
         const cycleType =
-          str((rec.cycle_context as Record<string, unknown> | undefined)?.cycle_type) ?? str(rec.cycle_type);
+          str((rec.cycle_context as Record<string, unknown> | undefined)?.cycle_type) ??
+          str(rec.cycle_type);
         const run = renderRunContext(str(rec.run_id), cycleType);
-        const edges = renderEdges(edgesFor(id, records, textById));
+        const edges = renderEdges(edgesFor(id, records, textById, 'epistemic'));
+        const engEdgesList = edgesFor(id, records, textById, 'engineering');
         // Flat projection+payload source: record top-level (eied denorms) + content fields.
         const flat: Record<string, unknown> = {
           text: str(content.text) ?? '',
@@ -135,13 +148,27 @@ export function makeVectorizeAndStore(embed: Embed, recordSchemas: SchemaMap = {
         const emb = buildEmbed(flat, vectorSchema, { run, edges });
         if (!emb.text.trim()) continue; // empty projection → nothing to embed
         const vector = await embed(emb.text);
+        // §12.9 P3: a SECOND projection over the ENGINEERING edges → the gemini_eng vector. GATED by
+        // LAYER2_ENG_VECTOR: the Qdrant collection must have the gemini_eng named vector FIRST (the
+        // recreate schema-op), so the whole feature is inert until that op enables the flag — this makes
+        // the code safe to deploy at any time. When enabled it is unconditional (every claim gets it;
+        // the cost-skip for non-engineering claims is a deferred post-wave optimization).
+        // is_engineering_connected marks claims with ≥1 ENG_* edge so eng-search read-filters to real
+        // engineering approaches (not merely text-similar claims).
+        let vectorEng: number[] | undefined;
+        if (process.env.LAYER2_ENG_VECTOR === 'true') {
+          const embEng = buildEmbed(flat, vectorSchema, { run, edges: renderEdges(engEdgesList) });
+          vectorEng = await embed(embEng.text);
+        }
         const vecId = `vec:${id}`;
-        // Hand the embedded vector + schema payload to the injected vector store; the
+        // Hand the embedded vector(s) + schema payload to the injected vector store; the
         // store-provider adds the computed ClaimPointPayload fields and upserts to Qdrant.
         await write.put(vecId, {
           id: vecId,
           ref: id,
           vector,
+          vector_eng: vectorEng,
+          is_engineering_connected: engEdgesList.length > 0,
           payload: emb.payload,
           text: emb.text,
           models: emb.models,

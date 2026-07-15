@@ -494,7 +494,11 @@ export async function handlePublishDocument(req: Request, res: Response, ctx: Ap
       license: normalizedLicense,
       licenses: licenseInfo.spdx !== 'NOASSERTION' ? { manual: licenseInfo.spdx } : {},
       keywords: (body.keywords as string[] | undefined) ?? undefined,
-      language: (body.language as string | undefined) ?? 'en',
+      // english-only ingress (§3.4): do NOT silent-default to 'en'. The caller-declared language is
+      // an advisory hint only; a null / absent / empty value stays undetermined and the ingest
+      // pipeline detects the ACTUAL language post-parse (workers.detectAndOverrideLanguage). Portal
+      // sends a null sentinel (branch english-only-2a) so an omitted language never reads as false 'en'.
+      language: typeof body.language === 'string' && body.language.trim() ? body.language : undefined,
       resourceType: (body.resource_type as string | undefined) ?? 'preprint',
       embargoUntil,
       portalMetadata,

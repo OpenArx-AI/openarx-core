@@ -54,8 +54,11 @@ describe('update-run-state', () => {
 
   it('diagnose form: sets stage + cycle + dose', async () => {
     const stores = seedRun({ current_stage: null });
+    // input cycle '3' (numeric string) → oyq §12.1 normalizes to canonical INTEGER 3 (run.cycle
+    // is integer; §4.3-identity-critical). Pre-existing stale expectation ('3') fixed to match the
+    // deployed oyq integer semantics (commit 21c4194) — see cycle-label.ts.
     await call(stores, 'update-run-state', { inputs: { run_id: 'r1', stage: 1, cycle: '3', dose: { stage: 1, operations: ['x'] } } });
-    expect(stores.dump('run-state').kv.get('r1')).toMatchObject({ current_stage: 1, cycle: '3', dose: { stage: 1 } });
+    expect(stores.dump('run-state').kv.get('r1')).toMatchObject({ current_stage: 1, cycle: 3, dose: { stage: 1 } });
     expect(stores.dump('journal').log[0].entry).toMatchObject({ run_id: 'r1', event: 'dose_issued', payload: { stage: 1 } });
   });
   it('checkpoint GO: marks GO for the judged stage, advances, carries next_dose', async () => {

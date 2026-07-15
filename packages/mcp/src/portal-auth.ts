@@ -74,7 +74,9 @@ export function isPortalAuthEnabled(): boolean {
  * breaks and the checkpoint crosscheck sees an empty log. Degrades to the raw userId for
  * pre-2f tokens without a tokenId (backward-compatible), 'anonymous' with no userId.
  */
-export function credentialFromToken(token: { userId?: string; tokenId?: string } | undefined): string {
+export function credentialFromToken(
+  token: { userId?: string; tokenId?: string } | undefined,
+): string {
   const userId = token?.userId;
   if (!userId) return 'anonymous';
   const tokenId = token?.tokenId;
@@ -111,7 +113,8 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
       // These are transient — returned WITHOUT caching (the early return skips the
       // cache.set below), so recovery is immediate.
       if (resp.status === 429) return { valid: false, reason: 'rate_limited', rateLimited: true };
-      if (resp.status >= 500) return { valid: false, reason: `portal_error_${resp.status}`, upstreamUnavailable: true };
+      if (resp.status >= 500)
+        return { valid: false, reason: `portal_error_${resp.status}`, upstreamUnavailable: true };
       return { valid: false, reason: `portal_error_${resp.status}` };
     }
 
@@ -126,7 +129,9 @@ export async function verifyToken(bearerToken: string): Promise<TokenInfo> {
       permissions: raw.permissions as TokenInfo['permissions'],
       // v3 §3: flat top-level `scopes` (both verify-token branches). Only accepted
       // as a string[]; anything else → undefined (fall back to legacy gating).
-      scopes: Array.isArray(raw.scopes) ? (raw.scopes as unknown[]).filter((s): s is string => typeof s === 'string') : undefined,
+      scopes: Array.isArray(raw.scopes)
+        ? (raw.scopes as unknown[]).filter((s): s is string => typeof s === 'string')
+        : undefined,
       creditsBalance: raw.credits_balance as number | undefined,
       reason: raw.reason as string | undefined,
     };
@@ -168,7 +173,13 @@ export async function deductCredit(
         'Content-Type': 'application/json',
         'X-Internal-Secret': INTERNAL_SECRET,
       },
-      body: JSON.stringify({ user_id: userId, token_id: tokenId, tool_name: toolName, ip_address: ipAddress, user_agent: userAgent }),
+      body: JSON.stringify({
+        user_id: userId,
+        token_id: tokenId,
+        tool_name: toolName,
+        ip_address: ipAddress,
+        user_agent: userAgent,
+      }),
       signal: AbortSignal.timeout(5_000),
     });
 
@@ -178,7 +189,7 @@ export async function deductCredit(
       return null;
     }
 
-    const data = await resp.json() as Record<string, unknown>;
+    const data = (await resp.json()) as Record<string, unknown>;
     return { creditsCharged: (data.credits_charged as number) ?? 1 };
   } catch (err) {
     console.error('[portal-auth] deduct-credit error:', err instanceof Error ? err.message : err);
@@ -223,7 +234,7 @@ export async function toolCheck(
       return null;
     }
 
-    const data = await resp.json() as Record<string, unknown>;
+    const data = (await resp.json()) as Record<string, unknown>;
     return {
       allowed: data.allowed as boolean,
       effectiveCost: (data.effective_cost as number) ?? 1,
@@ -271,7 +282,7 @@ export async function toolDeduct(
       return null;
     }
 
-    const data = await resp.json() as Record<string, unknown>;
+    const data = (await resp.json()) as Record<string, unknown>;
     return {
       balanceAfter: (data.balance_after as number) ?? 0,
       creditsCharged: effectiveCost,
@@ -368,43 +379,48 @@ export function hasPermission(info: TokenInfo, toolName: string): PermissionResu
     if (!p) {
       return {
         allow: false,
-        errorBody: { error: 'Permission denied', tool: toolName, reason: 'no_permissions_on_token' },
+        errorBody: {
+          error: 'Permission denied',
+          tool: toolName,
+          reason: 'no_permissions_on_token',
+        },
       };
     }
     return tokenGated[toolName](p)
       ? { allow: true }
       : {
           allow: false,
-          errorBody: { error: 'Permission denied', tool: toolName, reason: 'permission_flag_false' },
+          errorBody: {
+            error: 'Permission denied',
+            tool: toolName,
+            reason: 'permission_flag_false',
+          },
         };
   }
 
   // Always-free tools (meta / stats / user-scoped reads)
   const alwaysAllowed = new Set([
-    'get_system_stats', 'get_document_status', 'get_my_documents',
+    'get_system_stats',
+    'get_document_status',
+    'get_my_documents',
     // pub-profile writes/reads — gated by the profile route
     // (min_token_type=publisher); the per-tool permission check
     // intentionally passes through here (openarx-contracts-rta3).
-    'submit_document', 'create_new_version', 'get_my_document_review',
+    'submit_document',
+    'create_new_version',
+    'get_my_document_review',
     // presigned-upload URL request — free; the publish call is the billed
     // event (openarx-contracts-xuqi).
     'create_upload_url',
     // create_draft — free; routes to Portal, billable event is publishing (amc7).
     'create_draft',
-    // layer2-profile tools — gated by the profile route (min_token_type=
-    // publisher), same pattern as pub writes above (openarx-contracts-rta3);
-    // free (0-credit) stabilization window per pillar §7.3 / economics_config
-    // b06bcec. Found missing by QA openarx-tester-4xo.
-    'submit_claim', 'submit_relation', 'submit_activity_batch',
-    'submit_metrics', 'submit_bundle',
-    'query_claims', 'query_relations', 'query_activities', 'query_bundle',
-    'verify_claim', 'link_supersedes', 'semantic_search_claims',
-    // A2 read-harness (§7.7 N-6) — new global/paginated reads, same free window.
-    'query_metrics', 'list_relations', 'enumerate_bundles',
     // A5 methodist channel (mcp_profiles_v3.md §13) — gated by the `methodist`
     // scope in the researcher-profile tool filter; hasPermission passes through.
-    'methodist_diagnose', 'methodist_checkpoint', 'methodist_escalate',
-    'get_my_development', 'methodist_course',
+    'methodist_diagnose',
+    'methodist_checkpoint',
+    'methodist_escalate',
+    'get_my_development',
+    'methodist_course',
   ]);
   if (alwaysAllowed.has(toolName)) return { allow: true };
 
@@ -416,7 +432,11 @@ export function hasPermission(info: TokenInfo, toolName: string): PermissionResu
   console.warn(`[hasPermission] unknown tool (not in any map): ${toolName}`);
   return {
     allow: false,
-    errorBody: { error: 'tool_not_permitted', tool: toolName, reason: 'tool_not_in_permission_map' },
+    errorBody: {
+      error: 'tool_not_permitted',
+      tool: toolName,
+      reason: 'tool_not_in_permission_map',
+    },
   };
 }
 
@@ -486,12 +506,19 @@ export async function applyPublishRefund(
         signal: AbortSignal.timeout(5_000),
       });
       if (resp.ok) {
-        console.error(`[publish-refund] applied: user=${userId} tier=${op.tier} amount=${op.amount} request_ref=${requestRef}`);
+        console.error(
+          `[publish-refund] applied: user=${userId} tier=${op.tier} amount=${op.amount} request_ref=${requestRef}`,
+        );
         return true;
       }
-      console.warn(`[publish-refund] Portal returned ${resp.status} (attempt ${attempt + 1}/${delays.length})`);
+      console.warn(
+        `[publish-refund] Portal returned ${resp.status} (attempt ${attempt + 1}/${delays.length})`,
+      );
     } catch (err) {
-      console.warn(`[publish-refund] unreachable (attempt ${attempt + 1}/${delays.length}):`, err instanceof Error ? err.message : err);
+      console.warn(
+        `[publish-refund] unreachable (attempt ${attempt + 1}/${delays.length}):`,
+        err instanceof Error ? err.message : err,
+      );
     }
   }
   console.error(

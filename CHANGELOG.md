@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-07-16
+
+Deeper graph reads and safer contribution. The methodology surface gains richer,
+de-duplicated ways to read the Layer 2 graph, run completion becomes a durable fact,
+and ingest learns the language a document is written in.
+
+### Added
+
+- **Scientific-graph read-adapter.** The methodology surface can now search claims
+  semantically, traverse typed relations multi-hop (with cycle detection and an
+  explicit `truncated` signal instead of a silent cap), search engineering-relation
+  vectors, filter to the latest version of a claim, and collapse `same_as` clusters to
+  a canonical id — so graph reads are richer and de-duplicated.
+- **Document language detection at ingest.** Documents are language-detected on the way
+  in (via a lightweight LLM detector) rather than assumed to be English; non-English
+  methodology submissions are rejected with a clear reason.
+
+### Changed
+
+- **Run completion is now a durable fact.** A methodology run's `done` status is derived
+  from the presence of a durable completion record, not recomputed against a mutable
+  stage table — a run that finished stays finished even as the methodology evolves.
+- **`detail=full` returns whole sources.** `get_chunks` and `get_document` with
+  `detail=full` now return full chunk content, so claims can be grounded on complete
+  sources rather than previews.
+- **Clearer methodology entry point.** The methodist door leads with "start here", and
+  `find_methodology` now disambiguates itself (search for methods in existing papers)
+  from the guided research process.
+- Methodology runs use canonical integer cycle labels; methodology prompts and schemas
+  are single-sourced.
+
+### Removed
+
+- Dead PostgreSQL graph-implementation code — the scientific graph runs on Neo4j.
+
 ## [0.2.0] — 2026-07-13
 
 Layer 2 — a semantic knowledge graph with built-in quality control. OpenArx moves

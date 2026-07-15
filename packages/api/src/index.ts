@@ -1,6 +1,12 @@
 // @openarx/api — Phase 0 backend
 export { pool, query } from './db/pool.js';
-export { computeOarxId, OARX_ID_RE, LEGACY_OARX_ID_RE, OARX_ID_HEX_LENGTH, LEGACY_OARX_ID_HEX_LENGTH } from './lib/oarx-id.js';
+export {
+  computeOarxId,
+  OARX_ID_RE,
+  LEGACY_OARX_ID_RE,
+  OARX_ID_HEX_LENGTH,
+  LEGACY_OARX_ID_HEX_LENGTH,
+} from './lib/oarx-id.js';
 export { PgDocumentStore, APPLY_DOWNLOAD_SUCCESS_SQL } from './storage/document-store.js';
 export { QdrantVectorStore } from './storage/vector-store.js';
 export { SearchStore, type BM25Result } from './storage/search-store.js';
@@ -69,31 +75,24 @@ export {
   type RerankResponse,
   retry,
   type RetryOptions,
+  makeLlmLangId,
+  DEFAULT_LANG_DETECT_MODEL,
+  type LangResult,
 } from './model-router/index.js';
 
 // ── Layer 2 — pillar storage. The PG record-graph (claims/relations/activities/metrics/
-// bundles + the events outbox) was TORN DOWN (openarx-1woy): those stores are removed — Neo4j
-// is the canonical graph and the methodist 2c path writes claim vectors directly to Qdrant.
-// What remains below: the PURE schema-validation + same_as-dedup logic (kept for the Neo4j
-// port, №4) and the Qdrant vector-store / claim projection (reused by the methodist path).
+// bundles + the events outbox) was TORN DOWN (openarx-1woy) and the dead PG-facade ingress/query
+// subsystem removed (9xgj): Neo4j is the canonical graph, the methodist 2c path writes claim
+// vectors directly to Qdrant. What remains below: validateRecordShape (the methodist's live
+// shape-check), the pure same_as cluster/election logic (buildSameAsClusters — live in the
+// read-adapter; electCanonicalId — kept for the №4 Neo4j-dedup port), and the Qdrant vector-store
+// / claim projection (reused by the methodist path).
+export { validateRecordShape, type ValidationIssue } from './storage/layer2-validate.js';
 export {
-  runIngressValidation,
-  validateRecordSchema,
-  validateRecordShape,
-  existingRecordIds,
-  type ValidateLevel,
-  type ValidateOptions,
-  type ValidationIssue,
-  type ValidationResult,
-} from './storage/layer2-validate.js';
-export {
-  loadSameAsClusters,
   buildSameAsClusters,
   electCanonicalId,
-  auditSameAsClusters,
   type SameAsClusters,
   type CanonicalElectRow,
-  type SameAsAuditReport,
 } from './storage/layer2-same-as.js';
 export {
   handinHash,
@@ -124,7 +123,17 @@ export {
 } from './storage/layer2-vector-store.js';
 
 // ── wave-v2 methodist door-engine backends (F2.3) ────────────────────────────
-export { neoGet, neoGetAny, neoPut, neoPutRelation, neoGraphCounts, neoDelete, getNeo4jDriver, closeNeo4j } from './db/neo4j.js';
+export {
+  neoGet,
+  neoGetAny,
+  neoListActivitiesByType,
+  neoPut,
+  neoPutRelation,
+  neoGraphCounts,
+  neoDelete,
+  getNeo4jDriver,
+  closeNeo4j,
+} from './db/neo4j.js';
 export {
   getDossier,
   upsertDossier,

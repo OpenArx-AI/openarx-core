@@ -1,10 +1,11 @@
-// ── mcp_profiles_v4 role-gate (F2.7) — mount-ready ───────────────────────────
+// ── mcp_profiles_v4 role-gate (F2.7) — LIVE ──────────────────────────────────
 //
 // The role-gate: the Core-v4 gateway reads ONLY `token_type` from verify-token
 // (§8 — no scopes/permissions) and serves that role's tools/list. `roleFor` IS the
-// gate. BUILD-only here; the gateway swap deploys synchronously with Portal-v4's
-// verify-token change in the Phase 3 window (removing scopes breaks the live v3 path,
-// so there is no risk-free additive-earlier part — it ships as one piece).
+// gate. LIVE since the Phase-3 cutover: index.ts main() serves token_type=researcher|
+// governance via V4_ROLES (the advertised surface at /versions, v4.0.0). The v3 profiles
+// remain only as superseded compatibility facades for legacy tokens (no v3 tokens exist
+// post-cutover). [Was "BUILD-only / Phase-3-pending" pre-cutover — updated to reflect live.]
 
 import { RESEARCHER } from './researcher.js';
 import { GOVERNANCE } from './governance.js';

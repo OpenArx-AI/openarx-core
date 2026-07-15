@@ -42,11 +42,11 @@ const METHODIST_MECHANISM_DOORS = new Set([
   'methodist_get_my_development',
 ]);
 
-// Layer2 PG-graph consumers removed with the PG→Neo4j teardown (openarx-1woy): the embed
-// worker (PG layer2_claims → Qdrant) + the §7.6 dedup consumer operated on the dropped
-// layer2_* tables. The methodist path now writes claim vectors DIRECTLY to Qdrant (2c), and
-// Neo4j is the canonical graph. The Qdrant Layer2VectorStore + buildClaimProjection stay
-// (reused by 2c). Full worker/consumer FILE removal is a staged follow-up (openarx-1woy).
+// Layer2 PG-graph consumers were removed with the PG→Neo4j teardown (openarx-1woy) + the dead-code
+// cleanup (openarx-contracts-9xgj): the embed worker (PG layer2_claims → Qdrant) + the §7.6 dedup
+// consumer operated on the dropped layer2_* tables. The methodist path now writes claim vectors
+// DIRECTLY to Qdrant (2c), Neo4j is the canonical graph, and the Qdrant Layer2VectorStore +
+// buildClaimProjection stay (reused by 2c).
 import { initLegalVersions } from './lib/legal-versions.js';
 
 /**

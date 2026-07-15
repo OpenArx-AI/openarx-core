@@ -31,6 +31,10 @@ export interface ClaimPointPayload {
   run_id: string | null;
   is_superseded: boolean;
   attested_at: string;
+  /** §12.9 P3: this claim participates in the engineering dependency graph (≥1 ENG_* edge). The
+   *  eng-search read-filters on this so scope=engineering returns only engineering approaches, not
+   *  text-similar non-engineering claims. Absent on legacy points (treated as false by the filter). */
+  is_engineering_connected?: boolean;
 }
 
 export interface ClaimSearchHit {
@@ -64,12 +68,15 @@ export class Layer2VectorStore {
   async ensureCollection(): Promise<void> {
     const { collections } = await this.client.getCollections();
     if (!collections.some((c) => c.name === LAYER2_COLLECTION)) {
-      await this.client.createCollection(LAYER2_COLLECTION, {
-        vectors: {
-          gemini: { size: 3072, distance: 'Cosine' },
-          specter2: { size: 768, distance: 'Cosine' },
-        },
-      });
+      const vectors: Record<string, { size: number; distance: 'Cosine' }> = {
+        gemini: { size: 3072, distance: 'Cosine' }, // §7-scientific claim projection
+        specter2: { size: 768, distance: 'Cosine' },
+      };
+      // §12.9 P3: the engineering-edge projection vector is added only when the feature is enabled, so a
+      // fresh collection matches the deployed state (the live collection is migrated by the recreate op).
+      if (process.env.LAYER2_ENG_VECTOR === 'true')
+        vectors.gemini_eng = { size: 3072, distance: 'Cosine' };
+      await this.client.createCollection(LAYER2_COLLECTION, { vectors });
     }
     const indexFields: Array<[string, 'keyword' | 'bool']> = [
       ['claim_id', 'keyword'],
@@ -81,10 +88,15 @@ export class Layer2VectorStore {
       ['attester_id', 'keyword'],
       ['run_id', 'keyword'],
       ['is_superseded', 'bool'],
+      ['is_engineering_connected', 'bool'], // §12.9 P3 eng-search read-filter
     ];
     for (const [field, schema] of indexFields) {
       await this.client
-        .createPayloadIndex(LAYER2_COLLECTION, { field_name: field, field_schema: schema, wait: true })
+        .createPayloadIndex(LAYER2_COLLECTION, {
+          field_name: field,
+          field_schema: schema,
+          wait: true,
+        })
         .catch(() => undefined); // already exists
     }
   }
@@ -104,14 +116,21 @@ export class Layer2VectorStore {
     // (specter2 is a later schema-driven swap, out of the current spec). A point with just
     // the gemini named vector is valid — it's searchable by gemini. The live PG-embed
     // worker still passes BOTH, so its behaviour is unchanged.
-    vectors: { gemini: number[]; specter2?: number[] },
+    vectors: { gemini: number[]; specter2?: number[]; gemini_eng?: number[] },
     payload: ClaimPointPayload,
   ): Promise<void> {
     const vector: Record<string, number[]> = { gemini: vectors.gemini };
     if (vectors.specter2) vector.specter2 = vectors.specter2;
+    if (vectors.gemini_eng) vector.gemini_eng = vectors.gemini_eng; // §12.9 P3 engineering projection
     await this.client.upsert(LAYER2_COLLECTION, {
       wait: true,
-      points: [{ id: pointIdForClaim(claimId), vector, payload: payload as unknown as Record<string, unknown> }],
+      points: [
+        {
+          id: pointIdForClaim(claimId),
+          vector,
+          payload: payload as unknown as Record<string, unknown>,
+        },
+      ],
     });
   }
 
@@ -139,12 +158,15 @@ export class Layer2VectorStore {
     const out = new Set<string>();
     let offset: string | number | undefined | null = undefined;
     do {
-      const res: Awaited<ReturnType<QdrantClient['scroll']>> = await this.client.scroll(LAYER2_COLLECTION, {
-        limit: 1000,
-        with_payload: { include: ['claim_id'] },
-        with_vector: false,
-        offset: offset ?? undefined,
-      });
+      const res: Awaited<ReturnType<QdrantClient['scroll']>> = await this.client.scroll(
+        LAYER2_COLLECTION,
+        {
+          limit: 1000,
+          with_payload: { include: ['claim_id'] },
+          with_vector: false,
+          offset: offset ?? undefined,
+        },
+      );
       for (const p of res.points) {
         const cid = (p.payload as { claim_id?: string } | null)?.claim_id;
         if (cid) out.add(cid);
@@ -154,8 +176,48 @@ export class Layer2VectorStore {
     return out;
   }
 
+  /** Scroll ALL points with their named vectors + payload. Migration/audit use only
+   *  (§12.9 P3 recreate reads this to preserve gemini/specter2 byte-exact across a
+   *  collection recreate). HARDCODED to LAYER2_COLLECTION — never any other collection. */
+  async scrollAllWithVectors(): Promise<
+    Array<{ id: string | number; vector: Record<string, number[]>; payload: ClaimPointPayload }>
+  > {
+    const out: Array<{
+      id: string | number;
+      vector: Record<string, number[]>;
+      payload: ClaimPointPayload;
+    }> = [];
+    let offset: string | number | undefined | null = undefined;
+    do {
+      const res: Awaited<ReturnType<QdrantClient['scroll']>> = await this.client.scroll(
+        LAYER2_COLLECTION,
+        {
+          limit: 250,
+          with_payload: true,
+          with_vector: true,
+          offset: offset ?? undefined,
+        },
+      );
+      for (const p of res.points) {
+        out.push({
+          id: p.id,
+          vector: (p.vector ?? {}) as Record<string, number[]>,
+          payload: p.payload as unknown as ClaimPointPayload,
+        });
+      }
+      offset = res.next_page_offset as string | number | null;
+    } while (offset !== null && offset !== undefined);
+    return out;
+  }
+
+  /** Drop the layer2_claims collection. Recreate-migration use only (§12.9 P3).
+   *  HARDCODED to LAYER2_COLLECTION — cannot target `chunks` or any other collection. */
+  async dropCollection(): Promise<void> {
+    await this.client.deleteCollection(LAYER2_COLLECTION);
+  }
+
   async searchClaims(
-    vectorName: 'gemini' | 'specter2',
+    vectorName: 'gemini' | 'specter2' | 'gemini_eng',
     vector: number[],
     filter: Record<string, unknown> | undefined,
     limit: number,

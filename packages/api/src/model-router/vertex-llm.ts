@@ -283,9 +283,13 @@ export class VertexLlm {
           // pro fallback (gemini-3.1-pro-preview) therefore needs 'low', else it
           // 400s intermittently (~15% of pro retries observed 2026-06-03) and the
           // batch degrades to paragraph splitting (null-meta). openarx-cmnj.
-          thinkingConfig: {
-            thinkingLevel: model.includes('pro') ? 'low' : 'minimal',
-          },
+          // thinkingLevel is Gemini-3 syntax. Gemini-2.x models (e.g. gemini-2.5-flash-lite, used
+          // for the english-only language detector) reject it with 400 "thinking_level is not
+          // supported by this model" — so only send it for Gemini-3 models. 2.x models don't spend
+          // hidden thinking by default, so omitting it is exactly the intended "no thinking" behavior.
+          ...(model.includes('gemini-3')
+            ? { thinkingConfig: { thinkingLevel: model.includes('pro') ? 'low' : 'minimal' } }
+            : {}),
           // Structured output: when both fields are set the model is
           // constrained to emit JSON matching responseSchema. Eliminates the
           // class of silent parse failures observed in openarx-dlv6 (Gemini

@@ -28,7 +28,10 @@ import type { AppContext } from './context.js';
 import { handlePublishDocument } from './publish-document.js';
 import { handleUserDocuments } from './user-documents.js';
 import { resolveConceptLatest } from './concept-latest.js';
-import { methodology as methodistMethodology } from './profiles/methodist-v2/assets/content.js';
+import {
+  methodology as methodistMethodology,
+  doorPrompts as methodistDoorPrompts,
+} from './profiles/methodist-v2/assets/content.js';
 import type { SearchResult, Document } from '@openarx/types';
 import type { BM25Result, ReportTier } from '@openarx/api';
 import {
@@ -660,14 +663,18 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
     const m = methodistMethodology as unknown as {
       methodology_version?: string;
       procedures?: Array<{ name?: string }>;
-      schemas?: Record<string, unknown>;
       _process?: unknown;
     };
+    // §5 single-source (prompt-shadowing): the output/record SCHEMAS live in doorPrompts — the
+    // inert methodology.schemas stub was removed (engine.ts spreads doorPrompts.schemas as the
+    // live source). Read the schema NAMES from doorPrompts so the passport reflects the DEPLOYED
+    // schemas, not the dropped stub (the dead `submission` key, only in the old stub, drops here).
+    const dp = methodistDoorPrompts as unknown as { schemas?: Record<string, unknown> };
     res.json({
       methodology_version: m.methodology_version ?? null,
       procedures: (m.procedures ?? []).map((p) => p.name).filter((n): n is string => typeof n === 'string'),
       process: m._process ?? null,
-      schemas: Object.keys(m.schemas ?? {}),
+      schemas: Object.keys(dp.schemas ?? {}),
     });
   });
 
@@ -738,9 +745,10 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
           return;
         }
         const meta = r.rows[0]?.meta ?? {};
-        const ownerId = (r.rows[0]?.publisher_user_id ?? undefined)
-          ?? (meta['uploader_id'] as string | undefined)
-          ?? (meta['user_id'] as string | undefined);
+        const ownerId =
+          r.rows[0]?.publisher_user_id ??
+          (meta['uploader_id'] as string | undefined) ??
+          (meta['user_id'] as string | undefined);
         if (ownerId && ownerId !== userId) {
           res.status(403).json({ error: 'not_owner' });
           return;

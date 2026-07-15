@@ -4,17 +4,15 @@
 // layer2-store.ts. This module holds the CLUSTER logic P2 (canonical-collapse read
 // filter) and P3 (verify-event re-election) share:
 //
-//   - loadSameAsClusters(): read the same_as edges (graph read: SELECT over the
-//     first-class relation rows), build the transitive closure into clusters, and
-//     record each member's same_as degree. On Neo4j this edge-read becomes a
-//     `MATCH ()-[:same_as]->()`; the union-find closure is app-side either way and
-//     survives the migration unchanged (no relational-only construct — §5.3).
+//   - buildSameAsClusters(): from the same_as edges build the transitive closure into
+//     clusters and record each member's same_as degree (pure union-find). The edge-read
+//     itself is the caller's (the read-adapter reads `MATCH ()-[:same_as]->()` from Neo4j);
+//     the closure is app-side and survives the migration unchanged (no relational-only
+//     construct — §5.3).
 //   - electCanonicalId(): the read-time canonical rule from the dossier —
 //     verified > convergent-degree > evidence-strength > earliest attested_at > id.
 //     Pure and deterministic; the canonical is NOT stored (computed on read, like
 //     the F-11 superseded_by pattern) so it re-elects for free as state changes.
-
-import { query } from '../db/pool.js';
 
 export interface SameAsClusters {
   /** member claim id → cluster root id (present only for claims in ≥1 same_as edge). */
@@ -30,7 +28,9 @@ export interface SameAsClusters {
  * so the closure logic is unit-testable. Empty maps for no edges (the common case
  * until the dedup pipeline runs), so collapse is a cheap no-op on today's corpus.
  */
-export function buildSameAsClusters(edges: ReadonlyArray<{ a: string; b: string }>): SameAsClusters {
+export function buildSameAsClusters(
+  edges: ReadonlyArray<{ a: string; b: string }>,
+): SameAsClusters {
   const parent = new Map<string, string>();
   const ensure = (x: string): void => {
     if (!parent.has(x)) parent.set(x, x);
@@ -90,18 +90,6 @@ export function buildSameAsClusters(edges: ReadonlyArray<{ a: string; b: string 
   return { rootOf, membersOf, degreeOf };
 }
 
-/**
- * Load all same_as edges (graph read over the first-class relation rows) and build
- * their transitive-closure clusters. On Neo4j the edge-read becomes a
- * `MATCH ()-[:same_as]->()`; the closure stays app-side (buildSameAsClusters).
- */
-export async function loadSameAsClusters(): Promise<SameAsClusters> {
-  const r = await query<{ a: string; b: string }>(
-    `SELECT source_claim_id AS a, target_claim_id AS b FROM layer2_relations WHERE relation = 'same_as'`,
-  );
-  return buildSameAsClusters(r.rows);
-}
-
 /** Minimal shape needed to elect a cluster's canonical (a SELECT * row works). */
 export interface CanonicalElectRow {
   id: string;
@@ -131,6 +119,14 @@ function millis(at: string | Date): number {
 }
 
 /**
+ * KEPT-FOR-FUTURE (9xgj PG-graph cleanup, 2026-07-14): currently UNUSED — its only caller,
+ * `auditSameAsClusters`, was a dead PG-query (SELECT over the dropped layer2_* tables) and was
+ * removed. Retained deliberately as the reference implementation of the §7.6 canonical-election
+ * rule for the planned Neo4j-dedup port (№4 / §12.6 GREEN-parity with the old PG dedup behaviour);
+ * the read-adapter's collapse uses a simpler earliest-only rule, not this full ranking.
+ * DELETE THIS (with its helpers + tests) when №4 lands and ports the rule to Neo4j — or if №4 is
+ * dropped from the roadmap. It must NOT linger as a permanent orphan.
+ *
  * Elect a cluster's canonical representative from its member rows (§7.6 P2).
  * Order (each level breaks the previous tie):
  *   1. verified            — a VERIFIED claim outranks an unverified one
@@ -159,55 +155,4 @@ export function electCanonicalId(rows: CanonicalElectRow[], degreeOf: Map<string
         (x.id < y.id ? -1 : x.id > y.id ? 1 : 0),
     );
   return ranked[0]!.id;
-}
-
-// ── P3 support — consistency audit + re-election ─────────────────────────────
-
-export interface SameAsAuditReport {
-  cluster_count: number;
-  member_count: number;
-  largest_cluster: number;
-  /** current canonical per cluster (computed, not stored — like F-11 superseded_by). */
-  canonicals: Array<{ root: string; canonical_id: string; size: number }>;
-  /** integrity anomalies (e.g. a same_as edge pointing at a claim that no longer exists). */
-  issues: string[];
-}
-
-/**
- * P3 consistency-audit safety net (§7.6 P3): load every same_as cluster, elect its
- * canonical from the live member rows, and flag integrity anomalies (dangling edges).
- * Read-only — the canonical is computed, never materialized, so this is a validation
- * pass, not a write. The dedup consumer runs it periodically; also the re-election
- * primitive the future dedup cache will call.
- */
-export async function auditSameAsClusters(): Promise<SameAsAuditReport> {
-  const clusters = await loadSameAsClusters();
-  const memberIds = [...clusters.membersOf.values()].flat();
-  const rowById = new Map<string, CanonicalElectRow>();
-  if (memberIds.length) {
-    const rows = await query<CanonicalElectRow & Record<string, unknown>>(
-      `SELECT id, attested_at, verification, content FROM layer2_claims WHERE id = ANY($1)`,
-      [memberIds],
-    );
-    for (const row of rows.rows) rowById.set(row.id, row);
-  }
-  const canonicals: SameAsAuditReport['canonicals'] = [];
-  const issues: string[] = [];
-  let largest = 0;
-  for (const [root, members] of clusters.membersOf) {
-    largest = Math.max(largest, members.length);
-    const memberRows = members.map((m) => rowById.get(m)).filter(Boolean) as CanonicalElectRow[];
-    if (memberRows.length !== members.length) {
-      issues.push(`cluster ${root}: ${members.length - memberRows.length} same_as member(s) reference a missing claim`);
-    }
-    if (memberRows.length === 0) continue;
-    canonicals.push({ root, canonical_id: electCanonicalId(memberRows, clusters.degreeOf), size: members.length });
-  }
-  return {
-    cluster_count: clusters.membersOf.size,
-    member_count: memberIds.length,
-    largest_cluster: largest,
-    canonicals,
-    issues,
-  };
 }

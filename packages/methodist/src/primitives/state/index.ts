@@ -1,5 +1,6 @@
 export * from './create-run.js';
 export * from './update-run-state.js';
+export * from './cycle-label.js';
 export * from './update-dossier.js';
 export * from './append-journal.js';
 export * from './write-graph-records.js';
@@ -38,7 +39,13 @@ export function statePrimitives(
     appendJournalPrimitive,
     makeWriteGraphRecords(assignId, now),
     commitBundleAtomicPrimitive,
-    makeVectorizeAndStore(embed, recordSchemas as Record<string, { vector?: import('../../adapters/embed.js').VectorSchema } | undefined>),
+    makeVectorizeAndStore(
+      embed,
+      recordSchemas as Record<
+        string,
+        { vector?: import('../../adapters/embed.js').VectorSchema } | undefined
+      >,
+    ),
     linkSupersedesPrimitive,
     createCorrectiveActivityPrimitive,
   ];
