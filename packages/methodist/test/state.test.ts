@@ -91,6 +91,60 @@ describe('update-run-state', () => {
     const out = await call(new InMemoryStores(), 'update-run-state', { inputs: { run_id: 'ghost', status: 'done' } });
     expect(out.status).toBe('rejected');
   });
+
+  // §12.1 Model U (t5rb): with the dose_by_cycle_stage table present, the dose is a WRITE-THROUGH
+  // PROJECTION of the authoritative (cycle, current_stage) — re-derived on every write, overriding
+  // any caller-passed dose, so it can never lag the stage. No table ⇒ legacy caller-set dose stands.
+  const DOSE_TABLE = {
+    c3: {
+      '1': { operations: ['diagnose ops'], beacons: ['b1'], counters: ['ct1'], expected_artifacts: ['a1'] },
+      '2': { operations: ['stage2 ops'], beacons: ['b2'], counters: ['ct2'], expected_artifacts: ['a2'] },
+    },
+  };
+  it('Model U diagnose: dose is DERIVED from the table (overrides any passed LLM dose)', async () => {
+    const stores = seedRun({ current_stage: null });
+    await call(stores, 'update-run-state', {
+      inputs: { run_id: 'r1', stage: 1, cycle: '3', dose: { stage: 1, operations: ['IGNORED LLM dose'] } },
+      params: { dose_by_cycle_stage: DOSE_TABLE },
+    });
+    const n = stores.dump('run-state').kv.get('r1') as Record<string, unknown>;
+    expect(n.cycle).toBe(3);
+    expect(n.current_stage).toBe(1);
+    expect(n.dose).toEqual({ operations: ['diagnose ops'], beacons: ['b1'], counters: ['ct1'], expected_artifacts: ['a1'], stage: 1 });
+  });
+  it('Model U checkpoint GO: next dose is re-derived for the ADVANCED stage (no lag), not the passed next_dose', async () => {
+    const stores = seedRun({ cycle: 3, current_stage: 1 });
+    await call(stores, 'update-run-state', {
+      inputs: { run_id: 'r1', verdict: { verdict: 'GO' }, next_dose: { stage: 2, operations: ['IGNORED'] } },
+      params: { dose_by_cycle_stage: DOSE_TABLE },
+    });
+    const n = stores.dump('run-state').kv.get('r1') as Record<string, unknown>;
+    expect(n.current_stage).toBe(2);
+    expect(n.dose).toEqual({ operations: ['stage2 ops'], beacons: ['b2'], counters: ['ct2'], expected_artifacts: ['a2'], stage: 2 });
+  });
+  it('Model U miss (GO past the last authored cell) clears the dose (done-view, no dose)', async () => {
+    const stores = seedRun({ cycle: 3, current_stage: 2 });
+    const out = await call(stores, 'update-run-state', {
+      inputs: { run_id: 'r1', verdict: { verdict: 'GO' } },
+      params: { dose_by_cycle_stage: DOSE_TABLE },
+    });
+    const n = stores.dump('run-state').kv.get('r1') as Record<string, unknown>;
+    expect(n.current_stage).toBe(3);
+    expect(n.dose).toBeNull();
+    // done case: the RETURNED dose is null too → route.GO surfaces "no next dose" gracefully
+    expect((out as { outputs: { dose: unknown } }).outputs.dose).toBeNull();
+  });
+  it('Model U: update-run-state RETURNS the materialized dose (route.GO reads $rstate.dose — no dangling $verdict.next_dose)', async () => {
+    const stores = seedRun({ cycle: 3, current_stage: 1 });
+    const out = await call(stores, 'update-run-state', {
+      inputs: { run_id: 'r1', verdict: { verdict: 'GO' } },
+      params: { dose_by_cycle_stage: DOSE_TABLE },
+    });
+    expect(out.status).toBe('ok');
+    expect((out as { outputs: { dose: unknown } }).outputs.dose).toEqual({
+      operations: ['stage2 ops'], beacons: ['b2'], counters: ['ct2'], expected_artifacts: ['a2'], stage: 2,
+    });
+  });
 });
 
 // ── update-dossier (verdict → delta, methodology-owned rules) ──────────────────

@@ -165,6 +165,60 @@ export async function neoPutRelation(
   }
 }
 
+/** §12.1 bundle-by-reference (openarx-1ed5): a `narrative_synthesis` bundle persists as its
+ *  node-record (source of truth) PLUS one (bundle)-[:HAS_MEMBER {bundle_id}]->(claim) edge per
+ *  referenced member — each drawn ONLY when the member claim ALREADY exists (OPTIONAL MATCH). The
+ *  members are REFERENCES to existing canonical claim_ids (never re-minted); claims are committed
+ *  before the bundle in the write-set, so a same-run member resolves. Unresolved members are
+ *  logged (observability) — no stub claim nodes. The edge carries ONLY `bundle_id` (a pointer to
+ *  the node); it is OUTSIDE the §4.3 hash-scope (identity lives on the node). */
+export async function neoPutBundle(
+  key: string,
+  record: Record<string, unknown>,
+  scalars: Record<string, string | number | boolean>,
+  edges: { members: string[]; label: string },
+): Promise<void> {
+  // The relationship type cannot be parameterized in Cypher, so `label` is interpolated as a
+  // literal — SAFE: pre-sanitized to [A-Z0-9_] (graphMapping), re-validated here as defense-in-depth.
+  const label = /^[A-Z0-9_]+$/.test(edges.label) ? edges.label : 'HAS_MEMBER';
+  const session = getNeo4jDriver().session();
+  try {
+    const res = await session.run(
+      `MERGE (n:\`bundle\` {id: $key}) SET n._data = $data, n += $scalars
+       WITH n
+       UNWIND $members AS memberId
+       OPTIONAL MATCH (c:\`claim\` {id: memberId})
+       FOREACH (_ IN CASE WHEN c IS NOT NULL THEN [1] ELSE [] END |
+         MERGE (n)-[e:\`${label}\` {bundle_id: $key}]->(c))
+       RETURN count(c) AS resolved`,
+      { key, data: JSON.stringify(record), scalars, members: edges.members },
+    );
+    // Observability (mirrors neoPutRelation): a bundle node ALWAYS merges, but each member edge
+    // is created only when that member claim already exists. A resolved<total gap surfaces a
+    // dangling reference (member id mismatch) instead of a silently under-linked bundle.
+    const rawResolved = res.records[0]?.get('resolved') as unknown;
+    const resolved =
+      rawResolved != null && typeof rawResolved === 'object' && 'toNumber' in rawResolved
+        ? (rawResolved as { toNumber(): number }).toNumber()
+        : Number(rawResolved ?? 0);
+    const total = edges.members.length;
+    const edgesCreated = res.summary.counters.updates().relationshipsCreated;
+    console.error(
+      JSON.stringify({
+        at: 'neoPutBundle',
+        bundle_id: key.slice(0, 48),
+        label,
+        members: total,
+        resolved,
+        edgesCreated,
+        ...(resolved < total ? { WARN: `${total - resolved} member(s) NOT found — edge(s) NOT drawn` } : {}),
+      }),
+    );
+  } finally {
+    await session.close();
+  }
+}
+
 /** Live cheap graph counts for the methodist stats page (Console 694n): node counts by label
  *  + relationship counts by type. Neo4j maintains these, so the queries are ~O(1) — safe to
  *  serve live without a rollup. */

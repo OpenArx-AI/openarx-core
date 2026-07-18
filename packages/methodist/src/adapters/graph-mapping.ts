@@ -54,6 +54,21 @@ export function relationLabel(relationType: string, relationClass?: string): str
  *  endpoint order (smaller id first) so the projection is deterministic regardless of record order. */
 const SYMMETRIC_RELATIONS = new Set(['same_as']);
 
+/** §12.1 bundle-by-reference (openarx-1ed5): a `narrative_synthesis` bundle projects one
+ *  (bundle)-[:HAS_MEMBER {bundle_id}]->(claim) edge per referenced member claim — each drawn only
+ *  when the member claim ALREADY exists (OPTIONAL MATCH, no re-mint). Members are REFERENCES to
+ *  existing canonical claim_ids; the edges give AAR/traversal one node per proposition (no
+ *  fragmentation). The label is a distinct space (HAS_MEMBER), so the §7 epistemic multi-hop
+ *  `[:SUPPORT|EXTEND|…]` never matches a bundle edge (non-confounding, structural). */
+export interface BundleMemberEdges {
+  /** referenced member claim ids (existing canonical claim_ids). */
+  members: string[];
+  /** the bundle record's canonical id — the property each member edge carries. */
+  bundleId: string;
+  /** the Neo4j relationship LABEL for member edges. */
+  label: string;
+}
+
 export interface GraphNodeMapping {
   /** Neo4j label = the record type. */
   label: string;
@@ -66,6 +81,9 @@ export interface GraphNodeMapping {
   /** §12.8: present for `relation` records — the companion traversal edge to project atomically
    *  alongside the node (undefined for non-relation records / a relation missing its endpoints). */
   edge?: GraphEdgeProjection;
+  /** §12.1: present for a `bundle` record carrying `members` — the member-reference edges to
+   *  project (undefined for an RO-Crate bundle / a bundle with no members). */
+  bundleEdges?: BundleMemberEdges;
 }
 
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
@@ -115,6 +133,18 @@ export function graphMapping(
         relId: String(record.id ?? ''),
         label: relationLabel(relationType, relationClass),
       };
+    }
+  }
+  // §12.1 bundle-by-reference (openarx-1ed5): a bundle carrying `members` projects one
+  // (bundle)-[:HAS_MEMBER {bundle_id}]->(claim) edge per referenced member — drawn only when the
+  // member claim already exists (neoPutBundle OPTIONAL MATCH; no re-mint). An RO-Crate bundle
+  // (manifest, no members) takes the plain node upsert.
+  if (recordType === 'bundle') {
+    const members = Array.isArray(record.members)
+      ? (record.members as unknown[]).filter((m): m is string => typeof m === 'string' && m.length > 0)
+      : [];
+    if (members.length > 0) {
+      mapping.bundleEdges = { members, bundleId: String(record.id ?? ''), label: 'HAS_MEMBER' };
     }
   }
   return mapping;

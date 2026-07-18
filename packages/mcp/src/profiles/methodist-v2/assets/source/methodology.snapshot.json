@@ -1,5 +1,5 @@
 {
-  "methodology_version": "v1.8",
+  "methodology_version": "v1.11",
   "_meta": {
     "owner": "msi:openarx-methodist (content source-of-truth)",
     "schema": "methodist_framework_v2.md §5 (procedures/steps/gate/route); door surface §3 (focus? on diagnose/course)",
@@ -36,16 +36,6 @@
           "out": "dossier"
         },
         {
-          "id": "run",
-          "primitive": "create-run",
-          "version": "v1",
-          "in": {
-            "credential_id": "$input.agent_id",
-            "parent_run_id": "$input.payload.parent_run_id"
-          },
-          "out": "run"
-        },
-        {
           "id": "ctx",
           "primitive": "prepare-context",
           "version": "v1",
@@ -70,19 +60,53 @@
           "in": {
             "context": "$ctx"
           },
-          "out": "diag"
+          "out": "diag",
+          "gate": {
+            "when": {
+              "field": "cycle",
+              "op": "falsy"
+            },
+            "outcome": "rejected"
+          }
+        },
+        {
+          "id": "run",
+          "primitive": "create-run",
+          "version": "v1",
+          "in": {
+            "credential_id": "$input.agent_id",
+            "parent_run_id": "$input.payload.parent_run_id"
+          },
+          "out": "run"
+        },
+        {
+          "id": "derive",
+          "primitive": "derive-dose",
+          "version": "v1",
+          "params": {
+            "process_ref": "dose_by_cycle_stage"
+          },
+          "in": {
+            "cycle": "$diag.cycle",
+            "current_stage": {
+              "const": 1
+            }
+          },
+          "out": "derive"
         },
         {
           "id": "persist",
           "primitive": "update-run-state",
           "version": "v1",
+          "params": {
+            "process_ref": "dose_by_cycle_stage"
+          },
           "in": {
             "run_id": "$run.run_id",
             "stage": {
               "const": 1
             },
-            "cycle": "$diag.cycle",
-            "dose": "$diag.dose"
+            "cycle": "$diag.cycle"
           }
         },
         {
@@ -105,8 +129,16 @@
       "route": {
         "default": {
           "run_id": "$run.run_id",
-          "dose": "$diag.dose",
+          "dose": "$derive.dose",
           "rationale": "$diag.rationale"
+        },
+        "rejected": {
+          "status": {
+            "const": "diagnose_failed"
+          },
+          "message": {
+            "const": "Diagnosis could not map your intent to a methodology cycle. Please restate your research intent more concretely — are you trying to: discover something new (c1), verify a specific published claim (c2), synthesize/map a field (c3), study or build a method (c4), map a live dispute (c5), set a research agenda (c6), engineer a solution to a practical need (c8), or review a work already on the platform (c9)? — then call diagnose again."
+          }
         }
       }
     },
@@ -343,11 +375,14 @@
           "id": "rstate",
           "primitive": "update-run-state",
           "version": "v1",
+          "out": "rstate",
+          "params": {
+            "process_ref": "dose_by_cycle_stage"
+          },
           "in": {
             "run_id": "$input.run_id",
             "stage": "$input.payload.stage",
-            "verdict": "$verdict",
-            "next_dose": "$verdict.next_dose"
+            "verdict": "$verdict"
           }
         },
         {
@@ -371,7 +406,7 @@
           "verdict": {
             "const": "GO"
           },
-          "next_dose": "$verdict.next_dose",
+          "next_dose": "$rstate.dose",
           "reasons": "$verdict.reasons"
         },
         "RETURN": {
@@ -677,6 +712,1129 @@
       "report_need": [
         "need"
       ]
+    },
+    "dose_by_cycle_stage": {
+      "_meta": {
+        "purpose": "GENERIC (task-agnostic) per-(cycle,stage) dose table = deterministic source for Core's derive-dose primitive (t5rb). Replaces the task-specific LLM-expansion (the reproducibility bug). Authored from production_door_prompts_v2.md §D playbooks + §C universal spine; cross-checked vs dose_dump_reference_2026-07-16.md.",
+        "keyed_by": "internal current_stage INTEGER. c2-c9: §D-label == current_stage. ★ c1 (only 0-indexed §D): current_stage = §D-label + 1 → c1 St0->key 1 ... St6->key 7 (done=8). c1 cells keyed 1-7, NOT 0-6 (Core empirical catch 0031). c7 RESERVED (no stages).",
+        "dose_field_set": [
+          "operations",
+          "beacons",
+          "counters",
+          "expected_artifacts"
+        ],
+        "note": "operations = task-agnostic protocol steps (ward tailors to its concrete task in EXECUTION, not in the dose). beacons = key requirements / quality-gates. counters = 'do NOT' guards. expected_artifacts = stage outputs. Derive-dose emits the FULL field-set every stage. Closeout stages share the §C closeout-spine counters (no bundle manifest; no content-nesting of relation/metric/activity; no evidence in metric/activity).",
+        "methodology_version_target": "v1.9",
+        "rollout": "complete-table-first (Vlad GO 2026-07-16, contract rev12 commit 7a5e552 / rollout-ruling 5fc4d81). fallback = safety-net + coverage-log only, NOT phasing.",
+        "status": "COMPLETE — all cycles authored; c3.5 carries the #1+#4 bundle fix; allowed ward activity_type = {version_closeout} (strict)."
+      },
+      "c1": {
+        "1": {
+          "operations": [
+            "Sweep the literature open-eyed to find a TENSION (one of: contradiction / unresolved debate / silenced question / unexplained pattern / missed connection).",
+            "Formulate an OPERATIONALIZABLE question.",
+            "Fix a contribution criterion (significant advance vs technical refinement).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Tension explicitly categorized as one of the 5 valid types.",
+            "Question is operationalizable with exact metrics.",
+            "Contribution criterion fixed before proceeding."
+          ],
+          "counters": [
+            "Do not proceed without a clear operationalizable question.",
+            "Do not dress a technical refinement as a discovery."
+          ],
+          "expected_artifacts": [
+            "tension_identification.md",
+            "question_statement.md",
+            "contribution_criteria.md"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Phase A: establish what the hypothesis stands on (foundations).",
+            "Phase B (unsaidness): is this ALREADY said? Search >=3 channels — document-semantic on concepts, citations-from-foundations, keyword on the thesis, and methodist_search_semantic over the layer-2 claim graph (the paraphrase-robust near-duplicate check that protects the novelty guarantee), plus methodist_search + methodist_find.",
+            "On 'already said' -> explicit decision (reframe / accept derivative / close).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Unsaidness checked across >=3 channels INCLUDING the layer-2 semantic near-dup.",
+            "Watch for a recent (1-2y) missed work."
+          ],
+          "counters": [
+            "Do not skip the layer-2 paraphrase-robust check (keyword search misses paraphrases)."
+          ],
+          "expected_artifacts": [
+            "foundations.md",
+            "unsaidness_check.md"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Map the landscape (map-reduce): approaches, active vs faded zones, SILOS, GAPS.",
+            "Flag ABC-bridges, transfer-candidates, lifted-assumptions.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Silos and gaps identified; bridges/transfers flagged.",
+            "Active-vs-faded distinction made."
+          ],
+          "counters": [
+            "Do not conflate active and faded zones."
+          ],
+          "expected_artifacts": [
+            "landscape map (claim/relation records)"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Generate hypotheses (delegate by MOVE TYPE, not topic): ABC-bridging / method-transfer / result-composition / assumption-lifting / frame-shift / inversion.",
+            "Each candidate: claim_type = inference|analogy, outcome = UNVERIFIABLE.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Every move-type represented.",
+            "Candidates are concrete, not 'it would be nice if'."
+          ],
+          "counters": [
+            "Do not leave a move-type unrepresented.",
+            "Do not submit vague candidates."
+          ],
+          "expected_artifacts": [
+            "hypothesis candidate claim records"
+          ]
+        },
+        "5": {
+          "operations": [
+            "IdeaRank per candidate (Utility / Grounding / Contribution).",
+            "Pointwise unsaidness re-check per candidate.",
+            "Assess feasibility.",
+            "Select ONE with justification + a development plan.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "One selected with justification + development plan.",
+            "Per-candidate unsaidness re-check done."
+          ],
+          "counters": [
+            "Do not select without a justification and development plan."
+          ],
+          "expected_artifacts": [
+            "selection.md (selected hypothesis + development plan)"
+          ]
+        },
+        "6": {
+          "operations": [
+            "EviBound core: Approval Gate (evidence-contract).",
+            "Obtain evidence — FORMAL slice (code/benchmark/proof, platform-closable) vs EMPIRICAL slice (platform gives experiment-prep only; validation is off-platform, a stated limit not a defect).",
+            "Record verification.outcome; pass the Verification Gate.",
+            "Targeted P5' (main agent reads first-hand).",
+            "Log failed attempts (a negative result IS a result).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "EviBound Approval + Verification passed.",
+            "P5' first-hand on load-bearing outcomes.",
+            "Failed attempts logged."
+          ],
+          "counters": [
+            "Do not skip the Approval Gate.",
+            "Do not treat off-platform empirical validation as a defect."
+          ],
+          "expected_artifacts": [
+            "evidence claim records with verification.outcome"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Integration & publication: update landscape + foundations.",
+            "Branch by outcome — VERIFIED -> positive discovery + get_my_document_review + publish; REJECTED -> negative-result genre (or return to Stage-0); UNVERIFIABLE -> seed cycle 4/6.",
+            "Compute AAR (PCov/claim_survival/CTran) via methodist_traverse(relation_class=epistemic) over the §7 closeout relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint (cross-stage relations + AAR metrics + version_closeout activity).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final discovery-note / short-communication in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): a concise claim + the genuinely NEW evidence (not only argumentation/citations) + priority-timestamp + attribution. GUARD: introduce new evidence; avoid salami-slicing."
+          ],
+          "beacons": [
+            "Outcome-branch taken explicitly.",
+            "AAR graph-computed (not hand-reconstructed).",
+            "Disconfirmation if any AAR >= 0.95."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest (auto-composes).",
+            "Do not nest relation/metric/activity under content.",
+            "Do not include evidence in metric or activity records."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c2": {
+        "1": {
+          "operations": [
+            "Select a claim to verify + justify the reason (one of: fundamental / long-unchecked / reproducibility-suspicion / missing-artifacts / active-dispute).",
+            "State expected value (all 'low' => refuse).",
+            "Fix scope + explicit exclusions.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Reason categorized; expected value stated.",
+            "Scope + exclusions explicit."
+          ],
+          "counters": [
+            "Do not verify a claim whose expected value is all-low."
+          ],
+          "expected_artifacts": [
+            "selection + scope record"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Main-agent first-hand read; extract operationalizable checkable claims (measurement/inference; fill value_unit_method_uncertainty).",
+            "FIX non-operationalizable claims separately (itself a result).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Claims operationalizable with value/unit/method/uncertainty.",
+            "Non-operationalizable claims flagged separately."
+          ],
+          "counters": [
+            "Do not extract from snippets (P-4).",
+            "Do not submit composite claims (P-2)."
+          ],
+          "expected_artifacts": [
+            "checkable claim records"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Materials inventory: repo open? code smoke-tests? data? method described enough? hidden params?",
+            "Delta 'have vs need'; record the dependency-discovery path.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Have-vs-need delta explicit.",
+            "Dependency path recorded."
+          ],
+          "counters": [
+            "Do not skip smoke-testing available code."
+          ],
+          "expected_artifacts": [
+            "materials inventory record"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Reproduction (core): Approval Gate.",
+            "REAL repetition per claim (computational: run; empirical: prep only, external validation off-platform).",
+            "Record outcome + audit_replayable; pass the Verification Gate.",
+            "Targeted P5' on ALL outcomes.",
+            "Determinism-check: 3x identical seed -> bit-identical (not multi-seed unless confirmed stochastic).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Approval + Verification gates passed.",
+            "P5' on all outcomes; audit_replayable set.",
+            "Determinism vs stochastic handled correctly."
+          ],
+          "counters": [
+            "Do not skip the Approval Gate.",
+            "Do not multi-seed unless the process is confirmed stochastic."
+          ],
+          "expected_artifacts": [
+            "reproduction claim records with verification.outcome + audit_replayable"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Refine bounds — VERIFIED: was it over-claimed? which params/assumptions. REJECTED: is there a narrow working zone? UNVERIFIABLE: exact cause.",
+            "Rewrite the claims precisely.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Over-claim / working-zone / cause identified.",
+            "Claims rewritten precisely."
+          ],
+          "counters": [
+            "Do not leave an over-claim unqualified."
+          ],
+          "expected_artifacts": [
+            "refined claim records"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Reusable artifacts (main output): cleaned documented code (README + repro + deps + smoke), structured dataset, methodology note, refined claim as standalone.",
+            "Ensure handoff without author help.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Artifacts reusable + handoff-ready without author help."
+          ],
+          "counters": [
+            "Do not treat the cycle as done without this stage (it is the meaningful output)."
+          ],
+          "expected_artifacts": [
+            "reusable code/data/methodology artifact records"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Side findings (optional): classify each as a seed to cycle 1/6/5/4.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Side findings routed as seeds."
+          ],
+          "counters": [
+            "Do not drop a side finding without classifying it."
+          ],
+          "expected_artifacts": [
+            "seed records"
+          ]
+        },
+        "8": {
+          "operations": [
+            "Publish re-check (distinct genre).",
+            "PSnd is the MAIN metric (low PSnd = important negative finding), computed with the AAR set via methodist_traverse(relation_class=epistemic) over the §7 relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final empirical report in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail) per IMRaD hourglass: Introduction → Methods → Results → Discussion + the applicable reporting-checklist (enumerated checkable items). GUARD: report execution-verified results, not self-reported intention."
+          ],
+          "beacons": [
+            "PSnd graph-computed; disconfirmation if any AAR >= 0.95.",
+            "Low PSnd surfaced as a finding, not hidden."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest.",
+            "Do not nest relation/metric/activity under content.",
+            "Do not include evidence in metric or activity records."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c3": {
+        "1": {
+          "operations": [
+            "Define the central review question.",
+            "Set the explicit ABSTRACTION LEVEL (the saturation anchor).",
+            "Choose the review format (scoping / narrative / systematic / critical).",
+            "Search for existing reviews (search_semantic + contentType=[survey]).",
+            "For each predecessor found, analyse scope/date/level and author a differentiation_plan.",
+            "Decide theorem-rich vs theorem-poor (top-N calibration).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Central review question defined; explicit abstraction level (saturation anchor) set.",
+            "Format chosen; predecessor reviews found and analysed with a differentiation_plan per predecessor.",
+            "theorem-rich vs theorem-poor decided."
+          ],
+          "counters": [
+            "Do not skip searching for existing reviews first.",
+            "Do not leave the abstraction level vague.",
+            "Do not proceed without a differentiation plan vs prior work."
+          ],
+          "expected_artifacts": [
+            "central_question.md",
+            "abstraction_level.md",
+            "predecessors_analysis.md",
+            "differentiation_plan.md"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Delegate corpus clusters (map-reduce): sub-agents with a HARD record-schema return and a NEUTRAL extraction prompt (pass authors' language; no headline/strongest).",
+            "Run two-check saturation.",
+            "Apply the Approval Gate on each record.",
+            "Assess coverage by concepts / citations / categories / diversity / bridges.",
+            "Run methodist_search_semantic over the layer-2 graph to surface prior claims meaning-near the topic (reuse existing, do not re-derive).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Neutral extraction prompt (no headline/strongest); two-check saturation met.",
+            "One proposition = one claim = one record (P-2 atomicity).",
+            "Reuse prior graph claims where present."
+          ],
+          "counters": [
+            "Do not use a shared biasing prompt (fan-out does NOT average bias — neutral prompt + P5').",
+            "Do not extract from snippets (P-4 — full chunks only).",
+            "Do not submit composite claims (P-2)."
+          ],
+          "expected_artifacts": [
+            "claim records (content-nested; evidence[] present on every record)"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Structure claims by approach/theme; mark load_bearing.",
+            "Establish ClaimFlow relations across clusters (support / extend / qualify / refute / shared_evidence).",
+            "Use canonical claim_ids from prior-stage GO id_maps for cross-stage relations; local_ids (_:cN) for intra-stage.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "qualify REQUIRES a mediator {variable, condition, rationale} or it is blocked.",
+            "shared_evidence for same-data-different-interpretation."
+          ],
+          "counters": [
+            "Do not nest relation records under content (relations are FLAT / top-level).",
+            "Do not use engineering relations for epistemic links.",
+            "Do not invent speculative relation types."
+          ],
+          "expected_artifacts": [
+            "relation records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Establish the chronology / temporal evolution.",
+            "Optional TRIZ frame: T-21 (9 laws) + T-23 (multiscreen) two-pass; transfer-by-analogy T-24 (refusal legitimate).",
+            "Forecasts ONLY with an executable falsifier.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Temporal evolution mapped.",
+            "Any forecast carries an executable falsifier."
+          ],
+          "counters": [
+            "Do not emit a forecast without a falsifier."
+          ],
+          "expected_artifacts": [
+            "chronology / temporal-evolution records"
+          ]
+        },
+        "5": {
+          "_fix": "#1 dup-claim + #4 grader — reference-by-id bundle (was: 'top-N 12-25' read as re-mint >=12 claim records).",
+          "operations": [
+            "First-hand read the load-bearing theorems / central-core / L-axis + a negative control.",
+            "Apply machine-readable claim typing ([sourced] / [derived] / [author_synthesis]).",
+            "SELECT the top-N 12-25 core-narrative claims by REFERENCING their existing canonical claim_ids (from prior-stage GO id_maps) in a narrative_synthesis bundle record (field: members) — do NOT re-submit already-committed claims as new records.",
+            "Submit genuinely-NEW synthesis propositions (integrative insights) as new claim records.",
+            "Targeted-P5' disposition = a dedicated claim record (not a track_note).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "Bundle record shape (explicit) — a synthesis bundle = { record_type:'bundle', bundle_type:'narrative_synthesis', members:[existing canonical claim_ids from prior-GO id_maps], synthesis_narrative:str }. bundle_type is REQUIRED (validator accepts {ro_crate, narrative_synthesis}); do NOT set record_type to 'narrative_synthesis' — that is the bundle_type."
+          ],
+          "beacons": [
+            "Top-N selection is BY REFERENCE (existing claim_ids in bundle.members), never re-mint.",
+            "New synthesis insight = new claim; an existing claim = referenced in the bundle."
+          ],
+          "counters": [
+            "Do not re-submit existing claims as new records (creates duplicates disconnected from their §7 edges).",
+            "Do not submit activity records here (activities are reserved for the Stage-6 version_closeout).",
+            "Do not put the P5' disposition in a track_note — it must be a claim record."
+          ],
+          "expected_artifacts": [
+            "narrative_synthesis bundle (members = existing canonical claim_ids + synthesis_narrative)",
+            "new synthesis claim records (if any)",
+            "targeted_p5 claim record"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Overlap / completeness / currency audit vs predecessors.",
+            "RIGOURATE overstatement audit + dual-coverage check.",
+            "Compute AAR metrics (PCov / PSnd / CTran) via methodist_traverse(relation_class=epistemic) over the §7 closeout relations (graph-computed, class-pure).",
+            "Perform the disconfirmation check if any AAR metric >= 0.95.",
+            "Separate works-ratio from claims-ratio.",
+            "Submit the closeout checkpoint (cross-stage relations + AAR metric records + version_closeout activity).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final review as a genre-structured SURVEY in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail) per skeleton: (1) Introduction (motivate, scope, POSITION vs existing surveys, contributions); (2) Background; (3) Main body by ONE taxonomy (function / system-layer / application); (4) Transversal sections; (5) Future-directions (3-5 challenges). ~100-120 references; PRISMA-style selection flow. GUARD: active synthesis (patterns/contradictions), NOT literature-compilation."
+          ],
+          "beacons": [
+            "Disconfirmation required if any AAR >= 0.95 (esp. 1.00 — self-confirming red flag).",
+            "Works-ratio separated from claims-ratio.",
+            "Metric and version_closeout records are FLAT / top-level."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest (the closeout bundle auto-composes from committed ids).",
+            "Do not nest relation / metric / activity records under content.",
+            "Do not include evidence in metric or activity records."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records (PCov/PSnd/CTran)",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c4": {
+        "1": {
+          "operations": [
+            "Identify the question + mode (signal: studying -> A / limiting -> B / constructing -> B).",
+            "Mode fixes stages 4-7; set the Mode-B level (conceptual/prototype/full).",
+            "State the success criterion.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Mode fixed; success criterion stated."
+          ],
+          "counters": [
+            "Do not leave the mode ambiguous (it fixes the later stages)."
+          ],
+          "expected_artifacts": [
+            "question + mode record"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Apply cycle-3 methodology on methods-papers (incl. methodist_search_semantic to surface prior method-claims in the graph).",
+            "Each method claim carries {method_family, key_assumptions, typical_applications, known_limitations, developer_group}.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Method claims carry the 5 method fields.",
+            "Prior graph method-claims reused."
+          ],
+          "counters": [
+            "Do not omit known_limitations / key_assumptions."
+          ],
+          "expected_artifacts": [
+            "method claim records"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Applicability & limits: where each method works / breaks.",
+            "Identify HIDDEN preconditions inherited from origin.",
+            "Build a 2-D applicability map; identify failure zones.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Hidden preconditions surfaced; failure zones mapped."
+          ],
+          "counters": [
+            "Do not assume a method's origin-preconditions transfer silently."
+          ],
+          "expected_artifacts": [
+            "applicability map + failure-zone records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Generalize or design (dividing point) — A: a generalization claim (inference, theoretical) + Approval Gate; B: a new-method design + evidence-contract; A+B in parallel.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Approval Gate / evidence-contract set per mode."
+          ],
+          "counters": [
+            "Do not produce 'result language' before the evidence-contract (ResearchLoop)."
+          ],
+          "expected_artifacts": [
+            "generalization claim (A) / method design (B) records"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Validate — A: new cases / boundaries / counterexamples. B: prototype + benchmark vs existing on the same tasks.",
+            "Verification Gate + Targeted P5' on all.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Verification Gate passed; P5' on all outcomes."
+          ],
+          "counters": [
+            "Do not compare on non-matched tasks."
+          ],
+          "expected_artifacts": [
+            "validation claim records with verification.outcome"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Prepare reuse — A: methodology note + applicability bounds; B: code + docs + API + examples + benchmarks.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Reuse package complete for the mode."
+          ],
+          "counters": [
+            "Do not omit applicability bounds."
+          ],
+          "expected_artifacts": [
+            "reuse package records"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Publish/release — A: methods paper; B: paper + implementation.",
+            "Compute AAR (PCov/claim_survival) via methodist_traverse(relation_class=epistemic) over the §7 relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final methods/evaluation document in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): fair-comparison protocol (≥2 baselines [simple+strong], equal budgets, ablations preplanned, statistical tests, report HPO-space/#trials) + benchmark construction + contamination controls + variance over trials. GUARD: sealed/independent execution; beware Goodhart."
+          ],
+          "beacons": [
+            "AAR graph-computed; disconfirmation if any AAR >= 0.95."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest.",
+            "Do not nest relation/metric/activity under content.",
+            "Do not include evidence in metric or activity records."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c5": {
+        "1": {
+          "operations": [
+            "Identify the live dispute (check >=2 of 4 signs); separate from terminological/technical/artifact.",
+            "Fix the sides (2-4); fix the age.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            ">=2 of 4 dispute-signs present; sides (2-4) fixed."
+          ],
+          "counters": [
+            "Do not map a non-dispute or a >5-sided field."
+          ],
+          "expected_artifacts": [
+            "dispute identification record"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Contextualize: origin (empirical/methodological/theoretical/triggered/compound); STAKES (who/what changes on resolution; special case 'both right in their regime' = separation of applicability zones); embedding (larger problem -> seed for cycle 6).",
+            "EviBound gate on stakes (abstract stakes => do NOT launch).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Concrete stakes established (EviBound gate).",
+            "Embedding seed emitted if applicable."
+          ],
+          "counters": [
+            "Do not launch on abstract stakes."
+          ],
+          "expected_artifacts": [
+            "contextualization record (origin + stakes)"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Build a symmetric corpus: one sub-agent per side, PARALLEL launch; symmetry each round (<=1:2 measured on CLAIMS not works).",
+            "qualify needs a mediator else excluded; record evidence.provenance; provenance-aware unification (don't collapse different-provenance claims).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Symmetry <=1:2 on claims each round.",
+            "qualify carries a mediator; provenance preserved."
+          ],
+          "counters": [
+            "Do not run sequential sweeps (selection bias).",
+            "Do not over-merge (synonymity) or drop a side's oddly-worded args."
+          ],
+          "expected_artifacts": [
+            "symmetric per-side claim records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Extract concrete positions per side (primary / response / counter-response).",
+            "Mark reconstructed=true when implicit.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Positions concrete per side; reconstructed flagged."
+          ],
+          "counters": [
+            "Do not present a reconstructed position as explicit."
+          ],
+          "expected_artifacts": [
+            "position records"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Arguments<->evidence: per position list the evidence.",
+            "MARK same-data-different-interpretation (often the center).",
+            "EviBound chain_complete else excluded.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Same-data-different-interpretation marked.",
+            "chain_complete per included argument."
+          ],
+          "counters": [
+            "Do not include an argument whose chain is not complete."
+          ],
+          "expected_artifacts": [
+            "argument<->evidence relation records"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Divergence points (core): categorize each — Factual / Interpretational / Theoretical / Methodological.",
+            "Encode as relations [refute / qualify]; AAR.CTran high.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Each divergence categorized; encoded as refute/qualify relations."
+          ],
+          "counters": [
+            "Do not re-submit prior claims as new records — divergence is encoded as RELATIONS (forward-guard)."
+          ],
+          "expected_artifacts": [
+            "divergence relation records"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Resolution conditions (main output): per point, what would suffice (experiment / new observation in a discriminating regime / premise proof / uncontested dataset / comparator study).",
+            "Route to cycles 1/2/4/6; assess feasibility (now / needs infra / impossible => 'fundamental dispute' is a valid result).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Per-point resolution condition + route + feasibility."
+          ],
+          "counters": [
+            "Do not leave a divergence without a resolution condition."
+          ],
+          "expected_artifacts": [
+            "resolution-condition records + seeds"
+          ]
+        },
+        "8": {
+          "operations": [
+            "Publish the map — symmetric (no side embellished).",
+            "AAR (CTran main) via methodist_traverse(relation_class=epistemic) over the §7 relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint with seeds to 1/2/4/6.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final dispute/position map in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): openness-gate first (is the dispute genuinely open?) → symmetric per-side Toulmin (Claim/Data/Warrant/Backing/Qualifier/Rebuttal) + steelman + categorized divergence-points + resolution-conditions. GUARD: no false-balance on a pseudo-controversy."
+          ],
+          "beacons": [
+            "Map is symmetric.",
+            "CTran graph-computed; CTran=1.00 is a self-confirming RED FLAG (disconfirmation), not success."
+          ],
+          "counters": [
+            "Do not embellish a side.",
+            "Do not submit a bundle manifest; no content-nesting; no evidence in metric/activity."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c6": {
+        "1": {
+          "operations": [
+            "Map the current state: apply cycle-3 to the area.",
+            "Mark claim_status = open_question.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Area mapped; open_questions marked."
+          ],
+          "counters": [
+            "Do not leave gaps unmarked as open_question."
+          ],
+          "expected_artifacts": [
+            "state map + open_question claim records"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Open questions & gaps: sources — explicitly-named / empty semantic zones / unarbitrated contradictions / method limitations / SILENCED directions.",
+            "AGGREGATE seeds (c1 UNVERIFIABLE, c2 REJECTED, c4 gaps, c5 resolution-conditions) using methodist_search_semantic (claim_status=open_question) to find near-open-questions + empty semantic zones.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Seeds aggregated from prior cycles; empty semantic zones detected."
+          ],
+          "counters": [
+            "Do not emit a vague 'more research needed'."
+          ],
+          "expected_artifacts": [
+            "open-question claim records (aggregated)"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Significance: per question — how many studies affected? practical payoff? bottleneck for adjacent fields?",
+            "EviBound gate on significance (contract 'significant because 1..2..3..').",
+            "Filter significance vs mere interest.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Significance contract per question (EviBound gate)."
+          ],
+          "counters": [
+            "Do not confuse significance with mere interest."
+          ],
+          "expected_artifacts": [
+            "significance records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Readiness: methods / data / tools each yes/partial/no -> Ready / Partially / Infrastructure-bound.",
+            "Infra-bound -> seed cycle 4/1.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Readiness classified; infra-bound seeded."
+          ],
+          "counters": [
+            "Do not call a question Ready without methods+data+tools."
+          ],
+          "expected_artifacts": [
+            "readiness records + seeds"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Attention shifts: what became hot / what quietly left.",
+            "Optional TRIZ-dissolution: T-21 (9 laws) + T-23 (multiscreen) two-pass; T-24 transfer (refusal legitimate); forecast baseline mandatory.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Attention shifts identified; forecast baseline present."
+          ],
+          "counters": [
+            "Do not forecast without a baseline."
+          ],
+          "expected_artifacts": [
+            "attention-shift records"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Assemble programs (main output): group questions into programs (>=3 linked) by theme / methods / infra / dependency.",
+            "Sequence + milestones.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Programs have >=3 LINKED questions (relations); sequence + milestones set."
+          ],
+          "counters": [
+            "Do not re-submit the grouped questions as new records — group them by REFERENCE / relations (forward-guard)."
+          ],
+          "expected_artifacts": [
+            "program records + linking relations"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Publish the agenda.",
+            "Compute AAR via methodist_traverse(relation_class=epistemic) over the §7 relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint with seeds to 1/4.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final research-agenda / roadmap in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): stable-vision + uncertain-path (two stability levels); challenges scored on Impact/Ambition/Feasibility/Interdisciplinarity/Measurability; 3×3 Urgency×Importance prioritization. GUARD: accountability — state claims so later follow-up can check fulfillment."
+          ],
+          "beacons": [
+            "AAR graph-computed; disconfirmation if any AAR >= 0.95."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest; no content-nesting; no evidence in metric/activity."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c8": {
+        "1": {
+          "operations": [
+            "Decompose the goal into ATOMIC verifiable requirements (functional / quality / constraint).",
+            "EviBound gate (no requirement without a verification criterion).",
+            "SEAL the customer's prior sketch (hash) until stage 5 (P10 — the sketch must not predetermine).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "Each requirement has a verification criterion (EviBound gate).",
+            "Prior sketch sealed."
+          ],
+          "counters": [
+            "Do not submit a requirement without a verification criterion.",
+            "Do not let the sketch predetermine the design."
+          ],
+          "expected_artifacts": [
+            "atomic requirement claim records"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Decompose vs graph: cut into 'distinguishable scientific-direction'-scale elements.",
+            "Run a corpus-coherence probe per element (OpenArx-first) -> coherent/too_broad/too_narrow/gap; iterate; gaps -> seeds (1/6).",
+            "Build the dependency map BEFORE dispatch and submit its edges as relation_class:engineering relations (depends_on element->element, satisfies element->requirement) at closeout — NOT as §7 scientific relations.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Elements coherence-probed; dependency map built as engineering relations."
+          ],
+          "counters": [
+            "Do not encode engineering dependency/satisfaction as §7 scientific relations."
+          ],
+          "expected_artifacts": [
+            "element records + engineering dependency map"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Dispatch to sub-cycles (composer core): per element choose the sub-cycle by state — state-of-art -> c3 mini; readiness -> c6-stage4 mini; contested -> c5 mini; needs verified numbers -> c2; gap -> c1/6 seed.",
+            "Parallel dispatch of independent elements (mini-runs = maintenance-class ~10-20%, service-purpose).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Each element dispatched by state; independents in parallel."
+          ],
+          "counters": [
+            "Do not run a full-weight cycle where a maintenance-class mini suffices."
+          ],
+          "expected_artifacts": [
+            "dispatch records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Select solutions per element: surface reusable prior engineering via methodist_search_semantic(scope=engineering).",
+            "Filters in order: requirements-fit -> readiness -> confirmedness (verified > convergent > single) -> risk (contested flags).",
+            "Read each candidate's engineering neighbours (methodist_find relation_class=engineering, subtype=depends_on|satisfies) to check prerequisites + satisfaction.",
+            "P5 — a 'solves-everything-without-compromise' candidate is a RED FLAG (seek disconfirmation).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Filters applied in order; prerequisites checked via engineering neighbours."
+          ],
+          "counters": [
+            "Do not accept a 'solves-everything' candidate without disconfirmation."
+          ],
+          "expected_artifacts": [
+            "solution-selection records (engineering relations)"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Assembly (THE TRIZ HOUSE): fuse approaches; build a contradiction inventory in the TRIZ slot format {improve, degrade, mechanism, resolution in trade_off|redesign|unresolved|prerequisite|validated-existing}.",
+            "Run the TRIZ contradiction pipeline (Gate §0 -> T-01 slot (P-8) -> T-02 validity -> T-03 4-separations -> T-04 7-heuristics -> T-13 -> escalate to methodist).",
+            "OT-test (operative-time: time-separation valid only within operative time — a lifecycle roadmap is deferral not resolution).",
+            "Order the assembly by traversing the dependency DAG (methodist_traverse relation_class=engineering, subtype=depends_on); cycle_detected=true => return to Stage-2 decomposition.",
+            "UNSEAL the prior sketch and compare (converged/exceeded/diverged + cause).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "A contradiction IS a claim (claim_type=inference) carrying the 6 claim fields + the TRIZ slot fields.",
+            "OT-test applied; no dependency cycle in the assembled DAG."
+          ],
+          "counters": [
+            "Do not disguise an unresolved contradiction.",
+            "Do not compare to the sketch before independent assembly.",
+            "Do not accept a lifecycle roadmap as a resolution."
+          ],
+          "expected_artifacts": [
+            "TRIZ contradiction claim records",
+            "assembly record"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Validate the whole: for each requirement, methodist_traverse(from=requirement, relation_class=engineering, subtype=satisfies) to reach satisfying components.",
+            "JUDGE coverage vs the acceptance criterion (path to validated -> fulfilled / to designed-only -> partial / zero path -> not-covered / unverifiable).",
+            "Bridge critical elements to experiment (c2); build a risk register.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Each requirement fulfilled/partial/not/unverifiable with honest 'designed != validated' boundary."
+          ],
+          "counters": [
+            "Do not report 'designed' as 'validated'."
+          ],
+          "expected_artifacts": [
+            "validation records + risk register"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Solution-dossier & publish: reproducible dossier (every choice traceable to graph records).",
+            "Compute AAR (PCov) via methodist_traverse(relation_class=epistemic) over the §7 closeout relations (graph-computed, class-pure).",
+            "Submit the closeout checkpoint; emit gap-seeds (1/6) + experimental checks (2).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final design-doc / spec in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): ADR (Context/Decision/Consequences/Status) + requirements (atomic, stable-ID, shall-language RFC2119, verification-method-per-requirement, IEEE 830 quality attributes). GUARD: RFC2119-compliance ≠ safety; capture the deciding evidence (no 'ghost architecture')."
+          ],
+          "beacons": [
+            "Every choice traceable; AAR graph-computed."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest; no content-nesting; no evidence in metric/activity."
+          ],
+          "expected_artifacts": [
+            "solution dossier + closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records (both classes)",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      },
+      "c9": {
+        "1": {
+          "operations": [
+            "Intake & profile: suitability gate (must be a layer-1 work with full chunks; abstract-only => honest refusal).",
+            "Inventory code/data links; choose re-check depth by feasibility.",
+            "Pre-registered reviewer predictions (P10) — hash mandatory (anti-gaming).",
+            "Relation declaration (author / co-author / commissioned / independent — switches anti-gaming mode).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Suitability gate passed; P10 hash + relation-declaration recorded."
+          ],
+          "counters": [
+            "Do not review an abstract-only work (honest refusal).",
+            "Do not skip the P10 hash."
+          ],
+          "expected_artifacts": [
+            "intake profile + P10 pre-registration record"
+          ]
+        },
+        "2": {
+          "operations": [
+            "Extract load-bearing claims ONLY (main results with conditions, method statements, declared boundaries, key reliances); 15-40 per paper.",
+            "Discipline P-4/P-5/P-8/P-7.",
+            "MANDATORY >=1 limitations-claim (else self-review completeness is asymmetric).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "P-2 atomicity (extract atomically from the start) — one proposition = one claim; numbers separated from interpretations; distinct findings from the same work = separate records (incl. temporal/phase claims). Composite claims are rejected — atomize up front to avoid re-work."
+          ],
+          "beacons": [
+            "15-40 load-bearing claims; >=1 limitations-claim."
+          ],
+          "counters": [
+            "Do not extract non-load-bearing claims.",
+            "Do not omit the limitations-claim."
+          ],
+          "expected_artifacts": [
+            "load-bearing claim records"
+          ]
+        },
+        "3": {
+          "operations": [
+            "Integrate into the graph (core): per claim add convergence candidates (same_as -> shared_evidence until dedup exists); support/extend/qualify(+mediator)/refute edges; dispute membership (if it enters a cycle-5 map); coherence-neighborhood probe.",
+            "Others' claims are NEVER superseded — errors become refute/qualify edges + a report section ('the graph argues with the work, does not edit it').",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Integration is by EDGES; others' claims never superseded."
+          ],
+          "counters": [
+            "Do not edit others' claims — fix by edges (refute/qualify), not edits.",
+            "Do not re-submit others' claims as new records (forward-guard)."
+          ],
+          "expected_artifacts": [
+            "integration relation records"
+          ]
+        },
+        "4": {
+          "operations": [
+            "Materials & replication: data/code exist / accessible / match?",
+            "DETERMINISTIC core -> reproduce (honest NOT_TESTED where reference unreachable); heavy -> not reproduced + what's needed.",
+            "Status discipline: self-run = self-reported; confirmed only by an independent replica.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Replication status honest (self-reported vs confirmed)."
+          ],
+          "counters": [
+            "Do not call a self-run 'confirmed'."
+          ],
+          "expected_artifacts": [
+            "replication status records"
+          ]
+        },
+        "5": {
+          "operations": [
+            "Citation fidelity: each cited_external fragment verified against source — exact / sharpened / distorted; internal number self-consistency.",
+            "Misquotes -> qualify/refute edges (NOT edits).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Each citation classified exact/sharpened/distorted."
+          ],
+          "counters": [
+            "Do not edit misquotes — encode as qualify/refute edges."
+          ],
+          "expected_artifacts": [
+            "citation-fidelity relation records"
+          ]
+        },
+        "6": {
+          "operations": [
+            "Review synthesis: assemble the review_dossier — integration map + PROFILE-verdict (novelty by T-10 scale / reproducibility / citation rigor / integrability — MEASURED, not accept/reject) + verification part + findings-to-author + honest review-boundaries + P10 reconciliation.",
+            "Each dimension carries status self-declared / co-signed / independently-confirmed.",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes."
+          ],
+          "beacons": [
+            "Profile-verdict is MEASURED per dimension with a status label; P10 reconciled."
+          ],
+          "counters": [
+            "Do not issue an accept/reject verdict (measure, don't gatekeep)."
+          ],
+          "expected_artifacts": [
+            "review_dossier records (measured profile-verdict)"
+          ]
+        },
+        "7": {
+          "operations": [
+            "Publish & hand back: closeout checkpoint (work claims + integration edges + review-attestation records in submission.records[]).",
+            "Compute AAR (PCov) via methodist_traverse(relation_class=epistemic) over the §7 relations (graph-computed, class-pure).",
+            "Seeds to 1/5/6; non-reproducible -> cycle 2. Co-sign = 'visibility guarantee' (co-signed ranks full-weight, self-declared discounted).",
+            "HUMAN-CHANNEL (Block C) — Log a human-facing research-log entry for this stage into submission.track_note: goal · key decisions + why-NOT-alternatives · dead-ends/negative-results + reason · provenance · date. Honest scientist's journal — capture dead-ends, not only successes.",
+            "HUMAN-CHANNEL (Block C) — Compose the final review / referee-report in version_closeout.content.deliverable_document (in-graph, object form — NOT by mail): six-facet (Novelty/Soundness/Clarity/Advancement/Compliance/Overall) + Recommendation + Confidence; comments WHAT-WHY-HOW, grounded + actionable. GUARD: watch reviewer-inconsistency + tone-disparity; measure, don't gatekeep."
+          ],
+          "beacons": [
+            "AAR graph-computed; co-sign discipline applied.",
+            "review-attestation rides on the version_closeout activity content (interim: no separate ward activity_type until the deferred c9 review-attestation design)."
+          ],
+          "counters": [
+            "Do not submit a bundle manifest; no content-nesting; no evidence in metric/activity."
+          ],
+          "expected_artifacts": [
+            "closeout checkpoint submission",
+            "AAR metric records",
+            "version_closeout activity record",
+            "cross-stage relation records",
+            "human-facing research-log (chronological, composed from per-stage track_notes)",
+            "genre-structured deliverable document (in version_closeout.content.deliverable_document)"
+          ]
+        }
+      }
     }
   }
 }

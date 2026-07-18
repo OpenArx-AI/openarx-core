@@ -16,6 +16,12 @@ export interface V4Role {
   readonly token_type: TokenType;
   readonly name: string;
   readonly version: string;
+  /** Optional server-level MCP `instructions` (the initialize-response field). An EAGER
+   *  discoverability signal: Claude-Code-family harnesses surface a server's instructions in the
+   *  system prompt even when its tools are DEFERRED (names-only until searched), so a cold-start
+   *  agent sees it before reading any tool description. Methodology content (methodist SoT,
+   *  mirror-pattern); the gateway wires it into the McpServer for roles that carry it. */
+  readonly instructions?: string;
   /** Register the role's full tool set — no scope filtering (§2). */
   registerTools(server: McpServer, ctx: AppContext): void;
 }

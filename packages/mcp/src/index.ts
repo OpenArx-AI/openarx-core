@@ -602,6 +602,7 @@ async function main(): Promise<void> {
     let effId: string;
     let effVersion: string;
     let effRegister: (server: McpServer, ctx: AppContext) => void;
+    let effInstructions: string | undefined; // server-level MCP instructions (v4 roles that carry it)
 
     if (isV4) {
       // Facade-mirror compat (openarx-534w): a v4 token is served ITS OWN role's toolset
@@ -635,6 +636,7 @@ async function main(): Promise<void> {
       effId = v4Role.token_type;
       effVersion = v4Role.version;
       effRegister = (s, c) => v4Role.registerTools(s, c);
+      effInstructions = v4Role.instructions;
     } else {
       const profile = getProfile(profileId);
       if (!profile) {
@@ -678,10 +680,16 @@ async function main(): Promise<void> {
     })._webStandardTransport;
     internalTransport.validateSession = () => undefined;
 
-    const server = new McpServer({
-      name: `openarx-${effId}`,
-      version: effVersion,
-    });
+    const server = new McpServer(
+      {
+        name: `openarx-${effId}`,
+        version: effVersion,
+      },
+      // Server-level MCP `instructions` — an eager cold-start signal surfaced by Claude-Code-family
+      // harnesses even under tool-deferral (methodist door discoverability). Only roles that carry it
+      // (researcher); governance has no methodist door, so no instructions.
+      effInstructions ? { instructions: effInstructions } : undefined,
+    );
 
     // Wrap tool registration with metrics + portal credit deduction
     const originalTool = server.tool.bind(server);

@@ -174,3 +174,55 @@ describe('dispatch (§3.1)', () => {
     await expect(runEndpoint(deps(), 'entry', { route: 'zzz' })).rejects.toThrow(/dispatch: no procedure/);
   });
 });
+
+// ── §12.1 state-batch integration (openarx-ntwe orphan-guard + t5rb derive-dose wiring) ──
+import { deriveDosePrimitive } from '../src/primitives/algorithmic/derive-dose.js';
+
+describe('interpreter — state-batch v1.9 wiring', () => {
+  it('falsy gate on diag.cycle: empty diagnose → rejected, create-run SKIPPED (no orphan); valid → run created', async () => {
+    let created = false;
+    const r = new Registry();
+    r.register(definePrimitive({ id: 'diag-mock', version: 'v1', kind: 'algorithmic', goal: 't', access: [], effects: [], determinism: 'deterministic' },
+      ({ inputs }) => ({ outputs: ((inputs as { emit?: Record<string, unknown> }).emit ?? {}) })));
+    r.register(definePrimitive({ id: 'mk-run', version: 'v1', kind: 'state', goal: 't', access: [], effects: [], determinism: 'deterministic' },
+      () => { created = true; return { outputs: { run_id: 'r1' } }; }));
+    const m: Methodology = {
+      methodology_version: 't',
+      procedures: [{
+        name: 'dg', trigger: { kind: 'endpoint', ref: 'dg' },
+        steps: [
+          // real v1.9 shape: diag(+falsy gate) BEFORE create-run → a failed/empty diagnose aborts first
+          { id: 'diag', primitive: 'diag-mock', version: 'v1', in: { emit: '$input.emit' }, out: 'diag', gate: { when: { field: 'cycle', op: 'falsy' }, outcome: 'rejected' } },
+          { id: 'run', primitive: 'mk-run', version: 'v1', out: 'run' },
+        ],
+        route: { default: { ok: { const: true } }, rejected: { status: { const: 'diagnose_failed' } } },
+      }],
+    };
+    const d = { runtime: { registry: r, stores: new InMemoryStores() }, methodology: m };
+    const bad = await runEndpoint(d, 'dg', { emit: {} }); // no cycle → gate fires
+    expect(bad.outcome).toBe('rejected');
+    expect(created).toBe(false); // ★ create-run never ran → no orphan run
+    created = false;
+    const good = await runEndpoint(d, 'dg', { emit: { cycle: 3 } });
+    expect(good.outcome).toBe('default');
+    expect(created).toBe(true);
+  });
+
+  it('process_ref injects the _process dose table into a derive-dose step → dose looked up (t5rb)', async () => {
+    const r = new Registry();
+    r.register(deriveDosePrimitive); // the REAL primitive
+    const m: Methodology = {
+      methodology_version: 't',
+      _process: { dose_by_cycle_stage: { c3: { '1': { operations: ['c3s1'], beacons: ['b'], counters: ['ct'], expected_artifacts: ['a'] } } } },
+      procedures: [{
+        name: 'dv', trigger: { kind: 'endpoint', ref: 'dv' },
+        steps: [
+          { id: 'derive', primitive: 'derive-dose', version: 'v1', params: { process_ref: 'dose_by_cycle_stage' }, in: { cycle: '$input.cycle', current_stage: { const: 1 } }, out: 'derive' },
+        ],
+        route: { default: { dose: '$derive.dose', found: '$derive.found' } },
+      }],
+    };
+    const res = await runEndpoint({ runtime: { registry: r, stores: new InMemoryStores() }, methodology: m }, 'dv', { cycle: 3 });
+    expect(res.response).toMatchObject({ found: true, dose: { operations: ['c3s1'], beacons: ['b'], counters: ['ct'], expected_artifacts: ['a'], stage: 1 } });
+  });
+});

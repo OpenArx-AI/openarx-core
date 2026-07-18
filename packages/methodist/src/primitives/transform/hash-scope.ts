@@ -23,6 +23,10 @@ export interface HashScope {
   readonly keepOnlyWhen?: readonly ScopeGuard[];
   /** fields dropped WHEN their guard matches */
   readonly dropWhen?: readonly ScopeGuard[];
+  /** array fields whose ELEMENTS are canonicalized by sort before hashing → set-identity
+   *  (order-independent). E.g. bundle.members (§4.3 bundle-by-reference, openarx-1ed5).
+   *  JCS preserves array order, so the sort must happen here. */
+  readonly sortFields?: readonly string[];
 }
 
 function excluded(field: string, record: Record<string, unknown>, scope: HashScope): boolean {
@@ -40,8 +44,13 @@ export function extractScope(record: Record<string, unknown>, scope: HashScope):
   const out: Record<string, unknown> = {};
   for (const field of scope.include) {
     if (excluded(field, record, scope)) continue;
-    const value = record[field];
-    if (value !== undefined) out[field] = value;
+    let value = record[field];
+    if (value === undefined) continue;
+    // set-identity (§4.3): sort array elements so element ORDER does not affect the hash.
+    if (scope.sortFields?.includes(field) && Array.isArray(value)) {
+      value = [...(value as unknown[])].sort();
+    }
+    out[field] = value;
   }
   return out;
 }

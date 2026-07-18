@@ -20,6 +20,7 @@ import {
   neoListActivitiesByType,
   neoPut,
   neoPutRelation,
+  neoPutBundle,
   getDossier,
   upsertDossier,
   appendRunJournal,
@@ -201,6 +202,14 @@ export function buildStores(
                   source: mapping.edge.source,
                   target: mapping.edge.target,
                   label: mapping.edge.label,
+                });
+              } else if (recordType === 'bundle' && mapping.bundleEdges) {
+                // §12.1 bundle-by-reference (openarx-1ed5): persist the bundle node + one
+                // member-reference edge per EXISTING member claim (no re-mint). An RO-Crate or
+                // member-less bundle has no mapping.bundleEdges → plain node upsert below.
+                await neoPutBundle(id, mapping.data, mapping.scalars, {
+                  members: mapping.bundleEdges.members,
+                  label: mapping.bundleEdges.label,
                 });
               } else {
                 await neoPut(mapping.label, 'id', id, mapping.data, mapping.scalars);

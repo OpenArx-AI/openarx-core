@@ -231,3 +231,63 @@ describe('filter-latest-only', () => {
     expect((ok(out) as { records_latest: Array<{ id: string }> }).records_latest.map((r) => r.id)).toEqual(['a', 'c']);
   });
 });
+
+// ── derive-dose (§12.1 t5rb: deterministic (cycle,stage) dose lookup) ──────────
+describe('derive-dose', () => {
+  const TABLE = {
+    _meta: { purpose: 'test' },
+    c3: {
+      '1': { operations: ['op1'], beacons: ['b1'], counters: ['ct1'], expected_artifacts: ['a1'] },
+      '5': {
+        operations: ['synthesize top-N by reference'],
+        beacons: ['bundle references existing claim_ids'],
+        counters: ['do NOT re-mint committed claims'],
+        expected_artifacts: ['narrative_synthesis bundle'],
+      },
+    },
+    c1: { '1': { operations: ['sweep literature'], beacons: [], counters: [], expected_artifacts: [] } },
+  };
+  const derive = async (cycle: unknown, current_stage: unknown) =>
+    ok(await call(reg(), 'derive-dose', { inputs: { cycle, current_stage }, params: { dose_by_cycle_stage: TABLE } })) as {
+      found: boolean;
+      dose?: Record<string, unknown>;
+    };
+
+  it('looks up (cycle,current_stage) → full field-set + stage (c3-St5 = the bundle fix cell)', async () => {
+    const out = await derive(3, 5);
+    expect(out.found).toBe(true);
+    expect(out.dose).toEqual({
+      operations: ['synthesize top-N by reference'],
+      beacons: ['bundle references existing claim_ids'],
+      counters: ['do NOT re-mint committed claims'],
+      expected_artifacts: ['narrative_synthesis bundle'],
+      stage: 5,
+    });
+  });
+
+  it('accepts numeric-string cycle/stage (as stored on the run node)', async () => {
+    expect((await derive('3', '1')).found).toBe(true);
+  });
+
+  it('c1 keyed by current_stage 1-7 (the +1 offset is in the table keys, not the primitive)', async () => {
+    const out = await derive(1, 1);
+    expect(out.found).toBe(true);
+    expect(out.dose?.stage).toBe(1);
+  });
+
+  it('miss → found:false (out-of-range stage / reserved cycle 7 / unknown cycle) = fallback', async () => {
+    expect((await derive(3, 99)).found).toBe(false);
+    expect((await derive(7, 1)).found).toBe(false);
+    expect((await derive(99, 1)).found).toBe(false);
+  });
+
+  it('no table → found:false (fallback to current generation)', async () => {
+    const out = ok(await call(reg(), 'derive-dose', { inputs: { cycle: 3, current_stage: 5 } })) as { found: boolean };
+    expect(out.found).toBe(false);
+  });
+
+  it('non-numeric cycle/stage → found:false (never keys on garbage)', async () => {
+    expect((await derive('abc', 5)).found).toBe(false);
+    expect((await derive(3, null)).found).toBe(false);
+  });
+});

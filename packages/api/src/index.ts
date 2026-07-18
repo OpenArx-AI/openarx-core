@@ -129,6 +129,7 @@ export {
   neoListActivitiesByType,
   neoPut,
   neoPutRelation,
+  neoPutBundle,
   neoGraphCounts,
   neoDelete,
   getNeo4jDriver,

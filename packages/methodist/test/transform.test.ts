@@ -104,6 +104,41 @@ describe('canonicalize', () => {
     expect(await canonical(r, ACTIVITY_SCOPE, withInstr)).toContain('applied_instrument');
     expect(await contentHash(r, ACTIVITY_SCOPE, withInstr)).not.toBe(await contentHash(r, ACTIVITY_SCOPE, ACTIVITY));
   });
+
+  // §4.3 bundle identity (openarx-1ed5): the ACTIVE FRAME_SPECS.bundle scope. members =
+  // sorted SET (order-independent); synthesis_narrative EXCLUDED (projection); bundle_type
+  // INCLUDED. Guards against the pre-fix CLAIM_SCOPE degeneracy (collapse → collision).
+  it('bundle — members = sorted SET; synthesis_narrative EXCLUDED; bundle_type INCLUDED; no degenerate collapse', async () => {
+    const r = reg();
+    const BUNDLE_SCOPE = {
+      include: ['bundle_type', 'members', 'manifest', 'attester_id', 'attested_at'],
+      sortFields: ['members'],
+    };
+    const base = {
+      record_type: 'bundle',
+      bundle_type: 'narrative_synthesis',
+      attester_id: 'agent:a',
+      attested_at: '2026-07-01T12:00:00Z',
+      members: ['src:claim:bbb', 'src:claim:aaa', 'src:claim:ccc'],
+      synthesis_narrative: 'UNIQUENARRATIVEXYZ',
+    };
+    // element order does NOT change the id (sorted set)
+    const shuffled = { ...base, members: ['src:claim:ccc', 'src:claim:bbb', 'src:claim:aaa'] };
+    expect(await contentHash(r, BUNDLE_SCOPE, base)).toBe(await contentHash(r, BUNDLE_SCOPE, shuffled));
+    const bytes = await canonical(r, BUNDLE_SCOPE, base);
+    // synthesis_narrative is a projection — neither key nor value enters the hash
+    expect(bytes).not.toContain('synthesis_narrative');
+    expect(bytes).not.toContain('UNIQUENARRATIVEXYZ');
+    // bundle_type + members ARE in the scope (non-degenerate)
+    expect(bytes).toContain('narrative_synthesis');
+    expect(bytes).toContain('members');
+    // editing the narrative does NOT change the id
+    const edited = { ...base, synthesis_narrative: 'a different narrative' };
+    expect(await contentHash(r, BUNDLE_SCOPE, edited)).toBe(await contentHash(r, BUNDLE_SCOPE, base));
+    // a different member set ⇒ a different id (pre-fix CLAIM_SCOPE would have collided)
+    const diff = { ...base, members: ['src:claim:zzz'] };
+    expect(await contentHash(r, BUNDLE_SCOPE, diff)).not.toBe(await contentHash(r, BUNDLE_SCOPE, base));
+  });
 });
 
 // ── compute-hash ──────────────────────────────────────────────────────────────

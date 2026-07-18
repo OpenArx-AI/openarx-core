@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-07-18
+
+Reproducible, non-polluting methodology runs. Per-stage guidance becomes deterministic,
+synthesis stops duplicating claims, and a research run is only created once it has a valid
+diagnosis — plus a cold-start signal that points a connecting agent to the research door.
+
+### Added
+
+- **Deterministic per-stage guidance.** A methodology stage's guidance (operations,
+  beacons, counters, expected artifacts) is now a deterministic lookup keyed by cycle and
+  stage rather than a language-model expansion — the same stage yields the same guidance
+  every run, and it can no longer drift out of sync with the run's actual stage.
+- **Synthesis by reference.** A synthesis stage now references the existing claims it builds
+  on through typed graph edges instead of re-submitting them as duplicate records — one node
+  per proposition, no graph pollution.
+- **Cold-start research signal.** The researcher profile advertises a server-level instruction
+  that points a connecting agent to the methodology door before it reads any tool description.
+- **Human-channel research log.** Every stage across all cycles now records a compact
+  human-facing research-log entry, and each cycle's closeout carries a genre-specific write-up
+  template (discovery note, IMRaD, survey, methods, dispute map, agenda, design doc, referee).
+
+### Changed
+
+- **A run is created only after a valid diagnosis.** The run record is minted after the
+  diagnosis produces a cycle, so a failed or empty diagnosis no longer leaves an orphaned run.
+- **First-class identity for reference bundles.** A synthesis bundle gets a content-addressed
+  identity from its kind and its (order-independent) member set, so it is addressable and
+  collision-free.
+
+### Fixed
+
+- **Deterministic activity-record validation.** Author-submitted activity records are checked
+  against a fixed allowed-set deterministically instead of via a language-model judgment,
+  making acceptance reproducible.
+
 ## [0.3.0] — 2026-07-16
 
 Deeper graph reads and safer contribution. The methodology surface gains richer,

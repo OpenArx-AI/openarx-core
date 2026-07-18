@@ -58,6 +58,19 @@ const EPISTEMIC_RELATIONS = new Set([
 ]);
 const ENGINEERING_RELATIONS = new Set(['depends_on', 'satisfies']);
 
+// §12.1 bundle kinds (openarx-1ed5) — a CLOSED discriminator enum (like relation_class): it selects
+// the required-field set, so an unknown value cannot be shape-checked. Extensible BY-VERSION.
+const BUNDLE_TYPES = new Set(['ro_crate', 'narrative_synthesis']);
+
+// §12.4 (openarx-0aof): the CLOSED set of activity_types a WARD may submit as an authoritative
+// record. Currently {version_closeout} — run-closure is the only ward-authored activity; all other
+// activity intents have proper homes (claims / relations / bundle). System- and methodist-emitted
+// outcome activities (§12.4 co-sign/tier-change/course-completion/contested-attestation) and the
+// checkpoint_go/return path do NOT pass through this ward shape-check. This deterministic guard
+// replaces the LLM checkpoint-judge's fragile P-6 extrapolation (grading reproducibility).
+// Extensible BY-VERSION (e.g. a future c9 review-attestation type, openarx-t6ou).
+const WARD_SUBMITTABLE_ACTIVITY_TYPES = new Set(['version_closeout']);
+
 /**
  * Validate a mentee-submitted record's SHAPE — the id-affecting fields authored at submit
  * time, NOT the server-stamped provenance (attester_id / attested_at / run_id / cycle_context)
@@ -144,13 +157,47 @@ export function validateRecordShape(record: unknown, recordType: string): Valida
       }
       break;
     }
-    case 'activity':
+    case 'activity': {
       reqString(issues, rec.activity_type, 'activity_type');
+      // §12.4 (openarx-0aof): deterministic ward-submission guard — a ward may author ONLY a
+      // {version_closeout} activity. Any other activity_type has a proper home in claims/relations/
+      // bundle; rejecting it here (not via an LLM judge) makes grading reproducible.
+      const at = typeof rec.activity_type === 'string' ? rec.activity_type : '';
+      if (at && !WARD_SUBMITTABLE_ACTIVITY_TYPES.has(at)) {
+        issue(
+          issues,
+          `activity_type: '${at}' is not ward-submittable — only {${[...WARD_SUBMITTABLE_ACTIVITY_TYPES].join('|')}} (§12.4; other intents belong in claims/relations/bundle)`,
+        );
+      }
       break;
+    }
     case 'metric':
       reqString(issues, rec.metric_name, 'metric_name');
       reqString(issues, rec.metric_type, 'metric_type');
       break;
+    case 'bundle': {
+      // §12.1 bundle (openarx-1ed5). bundle_type discriminates kind (CLOSED enum, like relation_class:
+      // it selects the required-field set → an unknown value cannot be validated).
+      const bt = typeof rec.bundle_type === 'string' ? rec.bundle_type : '';
+      if (!BUNDLE_TYPES.has(bt)) {
+        issue(issues, `bundle_type: required, one of {${[...BUNDLE_TYPES].join('|')}}`);
+      }
+      if (bt === 'narrative_synthesis') {
+        // synthesis-BY-REFERENCE: members = EXISTING canonical claim_ids, REFERENCED not re-minted.
+        if (!Array.isArray(rec.members) || rec.members.length === 0) {
+          issue(issues, 'members: required non-empty array of existing claim_ids (narrative_synthesis)');
+        } else {
+          (rec.members as unknown[]).forEach((m, i) => reqString(issues, m, `members[${i}]`));
+        }
+        // the narrative deliverable is committed on the bundle (hash-EXCLUDED projection, §4.3 0043).
+        reqString(issues, rec.synthesis_narrative, 'synthesis_narrative');
+      } else if (bt === 'ro_crate') {
+        if (!rec.manifest || typeof rec.manifest !== 'object' || Array.isArray(rec.manifest)) {
+          issue(issues, 'manifest: required object (ro_crate)');
+        }
+      }
+      break;
+    }
     default:
       issue(issues, `record_type: unknown '${recordType}'`);
   }

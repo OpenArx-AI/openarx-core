@@ -89,4 +89,30 @@ describe('graph-mapping adapter (§12.7 · I1)', () => {
   it('missing id → empty key string (never undefined)', () => {
     expect(graphMapping('bundle', { attester_id: 'a' }, { indexed_properties: ['attester_id'] }).key).toBe('');
   });
+
+  // §12.1 bundle-by-reference (openarx-1ed5): a narrative_synthesis bundle projects HAS_MEMBER
+  // edges to its referenced member claims; an RO-Crate / member-less bundle projects none.
+  it('bundle with members → HAS_MEMBER member-edge projection (bundle-by-reference)', () => {
+    const rec = {
+      id: 'oarx:bundle:z', record_type: 'bundle', bundle_type: 'narrative_synthesis',
+      attester_id: 'a', members: ['agent:a:claim:c1', 'agent:a:claim:c2'], synthesis_narrative: 'converge on X',
+    };
+    const m = graphMapping('bundle', rec, { indexed_properties: ['attester_id'] });
+    expect(m.edge).toBeUndefined();
+    expect(m.bundleEdges).toEqual({
+      members: ['agent:a:claim:c1', 'agent:a:claim:c2'],
+      bundleId: 'oarx:bundle:z',
+      label: 'HAS_MEMBER',
+    });
+  });
+
+  it('bundle without members (RO-Crate) → no member-edge projection (plain node)', () => {
+    const rec = { id: 'oarx:bundle:r', record_type: 'bundle', bundle_type: 'ro_crate', manifest: {} };
+    expect(graphMapping('bundle', rec, { indexed_properties: ['attester_id'] }).bundleEdges).toBeUndefined();
+  });
+
+  it('bundle members filter to non-empty strings (no dangling/blank refs projected)', () => {
+    const rec = { id: 'b', record_type: 'bundle', members: ['agent:a:claim:c1', '', 42, 'agent:a:claim:c2'] };
+    expect(graphMapping('bundle', rec, undefined).bundleEdges?.members).toEqual(['agent:a:claim:c1', 'agent:a:claim:c2']);
+  });
 });

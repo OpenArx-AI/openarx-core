@@ -295,10 +295,23 @@ export interface Metric {
 export interface Bundle {
   id: string;
   record_type: 'bundle';
+  /** Discriminates bundle kinds (§4.3 identity). 'ro_crate' = RO-Crate metadata bundle
+   *  (carries `manifest`); 'narrative_synthesis' = c3-St5 synthesis-by-reference
+   *  (carries `members` + `synthesis_narrative`). Hash-INCLUDED. All bundles set it. */
+  bundle_type?: 'ro_crate' | 'narrative_synthesis';
   attester_id: string;
   attested_at: string;
-  /** The full `ro-crate-metadata.json` manifest. Hash-INCLUDED in its entirety. */
-  manifest: Record<string, unknown>;
+  /** The full `ro-crate-metadata.json` manifest. Hash-INCLUDED (present-only).
+   *  RO-Crate bundles only; absent on narrative_synthesis. */
+  manifest?: Record<string, unknown>;
+  /** narrative_synthesis: EXISTING canonical claim_ids being synthesized —
+   *  referenced by id, NEVER re-minted (§12.1 bundle-by-reference, openarx-1ed5).
+   *  Hash-INCLUDED as a SORTED SET (canonical member order → order-independent identity). */
+  members?: string[];
+  /** narrative_synthesis: the committed narrative-synthesis deliverable text.
+   *  Hash-EXCLUDED (projection): editing it does NOT change the bundle-id — stored as a
+   *  mutable-in-place projection (owner-only update, light edit-log; §4.3 ruling 0043). */
+  synthesis_narrative?: string;
   // optional:
   consent_scope?: ConsentScope; // hash-excluded
   supersedes?: string | null; // hash-excluded
@@ -357,7 +370,10 @@ export const HASH_INCLUDED_FIELDS: Record<RecordType, readonly string[]> = {
     'attester_id',
     'attested_at',
   ],
-  bundle: ['manifest', 'attester_id', 'attested_at'],
+  // §4.3 bundle identity (openarx-1ed5): bundle_type discriminates kind; members = the
+  // referenced claim_id SET (hashed sorted → order-independent, see extractHashScope);
+  // manifest present-only (RO-Crate). synthesis_narrative is EXCLUDED (projection, mutable).
+  bundle: ['bundle_type', 'members', 'manifest', 'attester_id', 'attested_at'],
 } as const;
 
 // Fields never entering the hash, for any record type (§4.3 hash-excluded list).

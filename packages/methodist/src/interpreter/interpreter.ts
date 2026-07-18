@@ -17,7 +17,7 @@ import { invoke, type RuntimeDeps } from '../runtime/index.js';
 export type Source = string | { const: unknown } | Source[] | { [k: string]: Source };
 export interface Condition {
   field: string;
-  op: 'eq' | 'in' | 'truthy' | 'gt' | 'lt';
+  op: 'eq' | 'in' | 'truthy' | 'falsy' | 'gt' | 'lt';
   value?: unknown;
 }
 export interface Step {
@@ -156,6 +156,12 @@ function evalGate(when: Source | Condition, slots: Slots, outValue: unknown): bo
     switch (c.op) {
       case 'truthy':
         return Boolean(v);
+      case 'falsy':
+        // §12.1 orphan-guard (openarx-ntwe): a gate fires (early-return) when a field is ABSENT
+        // or empty — e.g. diag.cycle missing (failed/rejected/empty diagnose) → abort before
+        // create-run. Complements 'truthy'; the interpreter aborts natively only on 'rejected',
+        // so a 'failed' step needs this explicit gate to prevent an orphan run.
+        return !v;
       case 'eq':
         return v === c.value;
       case 'in':

@@ -6,7 +6,7 @@ import {
   computeSourceDigest,
   assignRecordId,
 } from './layer2-hash.js';
-import type { Activity, Claim, Relation } from './layer2.js';
+import type { Activity, Bundle, Claim, Relation } from './layer2.js';
 
 // ── Golden vectors (FROZEN) ──────────────────────────────────────────────────
 // Pure RFC 8785 JCS, no NFC (contract §4.3 rev6). Any change to these constants
@@ -195,4 +195,51 @@ test('activity — genre is hash-INCLUDED when present, independent of applied_i
   assert.notEqual(hGenre, hBase);
   assert.notEqual(hBoth, hBase);
   assert.notEqual(hBoth, hGenre);
+});
+
+// ── BUNDLE §4.3 identity (openarx-1ed5, bundle-by-reference) ──────────────────
+// bundle_type + members = identity; members hashed as a SORTED SET (order-independent);
+// synthesis_narrative is hash-EXCLUDED (projection). These lock the c3-St5 fix + guard
+// against the pre-fix CLAIM_SCOPE degeneracy that collapsed a bundle scope to
+// {attester_id, attested_at} (silent id collision).
+const BUNDLE: Bundle = {
+  id: 'PLACEHOLDER',
+  record_type: 'bundle',
+  bundle_type: 'narrative_synthesis',
+  attester_id: 'agent:msi:openarx-research',
+  attested_at: '2026-07-01T12:00:00Z',
+  members: ['src:claim:bbb', 'src:claim:aaa', 'src:claim:ccc'],
+  synthesis_narrative: 'UNIQUENARRATIVEXYZ — these claims converge on effect X.',
+};
+
+test('bundle — members hash as a SORTED SET (element order does not affect id)', () => {
+  const ordered: Bundle = { ...BUNDLE, members: ['src:claim:aaa', 'src:claim:bbb', 'src:claim:ccc'] };
+  const shuffled: Bundle = { ...BUNDLE, members: ['src:claim:ccc', 'src:claim:aaa', 'src:claim:bbb'] };
+  assert.equal(computeContentHash(ordered), computeContentHash(shuffled));
+});
+
+test('bundle — synthesis_narrative is hash-EXCLUDED (projection: editing does not change id)', () => {
+  const edited: Bundle = { ...BUNDLE, synthesis_narrative: 'A completely different narrative text.' };
+  assert.equal(computeContentHash(edited), computeContentHash(BUNDLE));
+  // neither the field key nor its distinctive value enters the canonical bytes
+  const bytes = recordCanonicalBytes(BUNDLE);
+  assert.ok(!bytes.includes('synthesis_narrative'));
+  assert.ok(!bytes.includes('UNIQUENARRATIVEXYZ'));
+});
+
+test('bundle — bundle_type is hash-INCLUDED (discriminates kind)', () => {
+  const roc: Bundle = { ...BUNDLE, bundle_type: 'ro_crate' };
+  assert.notEqual(computeContentHash(roc), computeContentHash(BUNDLE));
+  assert.ok(recordCanonicalBytes(BUNDLE).includes('narrative_synthesis'));
+});
+
+test('bundle — members participate in identity + no degenerate collapse (pre-fix CLAIM_SCOPE bug)', () => {
+  // Two bundles differing ONLY in their member set must get DISTINCT ids. Under the old
+  // CLAIM_SCOPE placeholder both collapsed to {attester_id, attested_at} → same id.
+  const b1: Bundle = { ...BUNDLE, members: ['src:claim:aaa'] };
+  const b2: Bundle = { ...BUNDLE, members: ['src:claim:bbb'] };
+  assert.notEqual(computeContentHash(b1), computeContentHash(b2));
+  // and the scope is non-degenerate: it carries bundle_type + members, not just attester/ts
+  assert.ok(recordCanonicalBytes(b1).includes('members'));
+  assert.ok(recordCanonicalBytes(b1).includes('bundle_type'));
 });

@@ -58,7 +58,13 @@ export function extractHashScope(record: Layer2Record): Record<string, unknown> 
       // Combined with endpoint-order canonicalization at insert (source<target),
       // same_as(A,B) and same_as(B,A) yield the SAME content_hash → one row, mirror-deduped.
     }
-    const value = rec[field];
+    let value = rec[field];
+    // §4.3 bundle identity (openarx-1ed5): `members` is a SET of referenced claim_ids —
+    // sort its elements for order-independent identity (JCS preserves array order, so the
+    // sort must happen here, before canonicalization). Mirrors same_as endpoint-ordering.
+    if (type === 'bundle' && field === 'members' && Array.isArray(value)) {
+      value = [...(value as unknown[])].sort();
+    }
     if (value !== undefined) scope[field] = value;
   }
   return scope;

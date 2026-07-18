@@ -16,6 +16,7 @@
 
 import { definePrimitive, RuntimeError, type Registration } from '../../runtime/index.js';
 import { normalizeCycle } from './cycle-label.js';
+import { deriveDose, type DoseCell } from '../algorithmic/derive-dose.js';
 
 interface RunNode {
   current_stage?: number | null;
@@ -43,6 +44,16 @@ interface In {
 }
 interface Out {
   ok: true;
+  /** §12.1 Model U (t5rb): the dose materialized on this write — the derived (cycle, current_stage)
+   *  dose, or null at done/out-of-range. Returned so a caller (checkpoint route.GO) can surface the
+   *  freshly-materialized next dose WITHOUT a re-fetch (no dangling $verdict.next_dose ref). */
+  dose?: unknown;
+}
+interface Params {
+  /** §12.1 Model U (t5rb): the dose_by_cycle_stage table (methodist _process SoT), injected via the
+   *  step's `process_ref`. Present ⇒ the dose is re-derived as a write-through projection of the
+   *  authoritative (cycle, current_stage) on every write. Absent (tests/legacy) ⇒ caller-set dose. */
+  dose_by_cycle_stage?: Record<string, Record<string, DoseCell>>;
 }
 
 function verdictValue(v: Verdict | undefined): 'GO' | 'RETURN' | undefined {
@@ -51,7 +62,7 @@ function verdictValue(v: Verdict | undefined): 'GO' | 'RETURN' | undefined {
 }
 
 export const updateRunStatePrimitive: Registration = definePrimitive<
-  Record<string, never>,
+  Params,
   In,
   Out
 >(
@@ -64,7 +75,7 @@ export const updateRunStatePrimitive: Registration = definePrimitive<
     effects: ['run-state', 'journal'],
     determinism: 'deterministic',
   },
-  async ({ inputs, ctx }) => {
+  async ({ inputs, ctx, params }) => {
     const current = (await ctx.read('run-state').get(inputs.run_id)) as RunNode | undefined;
     if (current === undefined)
       throw new RuntimeError('bad-output', `run '${inputs.run_id}' does not exist`);
@@ -105,7 +116,21 @@ export const updateRunStatePrimitive: Registration = definePrimitive<
     }
     // RETURN: no GO mark, stage stays (retry the same stage).
 
-    if (inputs.next_dose !== undefined) next.dose = inputs.next_dose; // GO carries the next stage's dose
+    if (inputs.next_dose !== undefined) next.dose = inputs.next_dose; // legacy/no-table: GO carries the next dose
+
+    // §12.1 Model U (t5rb): when the dose_by_cycle_stage table is present (the frame injects it via
+    // the step's process_ref), the dose is a WRITE-THROUGH PROJECTION of the authoritative
+    // (cycle, current_stage) — re-derived on EVERY state write (both are finalized above: stage on
+    // GO-advance, cycle on diagnose) so it can NEVER lag the stage — OVERRIDING any caller-passed
+    // dose. A miss (done / out-of-range / unknown-or-reserved cycle) clears the active dose. Without
+    // the table (tests / legacy callers) the caller-set dose above stands (back-compat).
+    const doseTable = (params ?? {}).dose_by_cycle_stage;
+    if (doseTable !== undefined) {
+      const derived = deriveDose(next.cycle, next.current_stage, doseTable);
+      next.dose = derived.found ? derived.dose : null;
+    }
+    // dose_adjustment overlay (course/ask) — applied LAST, on top of the derived base (DORMANT but
+    // preserved; §12.1 keeps the per-run adjustment path extensible).
     if (inputs.dose_adjustment !== undefined) {
       next.dose = {
         ...((next.dose as Record<string, unknown> | null) ?? {}),
@@ -141,6 +166,6 @@ export const updateRunStatePrimitive: Registration = definePrimitive<
     if (event !== undefined)
       await ctx.write('journal').append({ run_id: inputs.run_id, event, payload });
 
-    return { outputs: { ok: true } };
+    return { outputs: { ok: true, dose: next.dose } };
   },
 );

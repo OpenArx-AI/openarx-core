@@ -11,6 +11,7 @@ export * from './compute-superseded-by.js';
 export * from './filter-latest-only.js';
 export * from './route-intent.js';
 export * from './derive-run-status.js';
+export * from './derive-dose.js';
 
 import type { Registration } from '../../runtime/index.js';
 import { checkStopRulePrimitive } from './check-stop-rule.js';
@@ -26,6 +27,7 @@ import { computeSupersededByPrimitive } from './compute-superseded-by.js';
 import { filterLatestOnlyPrimitive } from './filter-latest-only.js';
 import { routeIntentPrimitive } from './route-intent.js';
 import { deriveRunStatusPrimitive } from './derive-run-status.js';
+import { deriveDosePrimitive } from './derive-dose.js';
 
 /** All algorithmic (B) primitives. detect-language needs an injected lang-id; validate-schema
  *  takes an optional platform shape-validator (fail-closed record well-formedness, openarx-xpfz). */
@@ -34,6 +36,7 @@ export function algorithmicPrimitives(langId: LangId, validateShape?: ValidateSh
     checkStopRulePrimitive,
     routeIntentPrimitive,
     deriveRunStatusPrimitive,
+    deriveDosePrimitive,
     checkIdempotencyPrimitive,
     makeValidateSchema(validateShape),
     makeDetectLanguage(langId),

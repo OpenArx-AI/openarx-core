@@ -40,8 +40,17 @@ const REL_SCOPE = { include: ['source_claim_id', 'target_claim_id', 'relation', 
 const ACT_SCOPE = {
   include: ['activity_type', 'attested_at', 'wasAssociatedWith', 'generated', 'activity_content', 'applied_instrument', 'genre', 'attester_id'],
 };
+// §4.3 bundle identity (openarx-1ed5): bundle_type discriminates kind; members = the referenced
+// claim_id SET (sortFields → order-independent identity); manifest present-only (RO-Crate only).
+// synthesis_narrative is EXCLUDED (projection, mutable-in-place). This REPLACES the prior
+// CLAIM_SCOPE placeholder, which degenerated to {attester_id, attested_at} for a bundle
+// (no content/evidence) → every synthesis bundle by one attester at one ts would collide.
+const BUNDLE_SCOPE = {
+  include: ['bundle_type', 'members', 'manifest', 'attester_id', 'attested_at'],
+  sortFields: ['members'],
+};
 const FRAME_SPECS: FrameSpecs = {
-  hashScopes: { frame_default: { claim: CLAIM_SCOPE, relation: REL_SCOPE, activity: ACT_SCOPE, metric: CLAIM_SCOPE, bundle: CLAIM_SCOPE } },
+  hashScopes: { frame_default: { claim: CLAIM_SCOPE, relation: REL_SCOPE, activity: ACT_SCOPE, metric: CLAIM_SCOPE, bundle: BUNDLE_SCOPE } },
   schemas: { layer2_v12: { type: 'object' } },
   // Phase 0.2 / §12.7 record_schemas registry (methodist-owned VALUES from source/record_schemas.json;
   // empty until Phase 1/Wave-2). The graph/vector/read adapters (2b) consume it via `params.record_schema`.

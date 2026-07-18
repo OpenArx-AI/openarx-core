@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific and engineering knowledge. A semantic knowledge graph of claims and typed relations (scientific and engineering) plus an ingest pipeline for research papers, exposed over MCP. Two roles, selected by access token: researcher (corpus search + read, claim-graph read and traversal, document publishing, and a methodology-guided contribution door) and governance (civic participation — initiatives, voting, discussion, reputation).",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
