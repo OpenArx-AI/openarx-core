@@ -70,14 +70,21 @@ export function registerSearchSemantic(server: McpServer, ctx: AppContext): void
 
       const useRerank = strategy === 'rerank';
       const hasFilters = !!(categories || dateFrom || dateTo || contentType || entities);
-      const candidateCount = useRerank
-        ? Math.max(RERANK_CANDIDATE_COUNT, limit * 3)
-        : (hasFilters ? Math.max(50, limit * 5) : Math.max(30, limit * 3));
+      // batch-3 D2: when reranking WITH a content-type/entity filter, fetch a large pool (like the
+      // fast path) so that after filtering there are still enough candidates to rerank. Previously the
+      // rerank path used max(15, limit*3) regardless of filters, then a selective filter
+      // (e.g. contentType=[survey]) applied AFTER a top-15 rerank collapsed the result to ~1 (vs ~10
+      // on fast). Now the pool is filter-aware AND the filter runs before the rerank (below).
+      const candidateCount = hasFilters
+        ? Math.max(50, limit * 5)
+        : useRerank
+          ? Math.max(RERANK_CANDIDATE_COUNT, limit * 3)
+          : Math.max(30, limit * 3);
 
       // Vector-only retrieval
       const vectorRaw = await ctx.vectorStore.search(vector, vectorName, candidateCount);
 
-      let ranked: RankedChunk[] = vectorRaw.map((r) => ({
+      const ranked: RankedChunk[] = vectorRaw.map((r) => ({
         chunkId: r.chunkId,
         documentId: r.documentId,
         content: r.content,
@@ -87,25 +94,29 @@ export function registerSearchSemantic(server: McpServer, ctx: AppContext): void
         finalScore: r.score,
       }));
 
-      // Optional rerank
-      if (useRerank) {
-        const candidates = ranked.slice(0, RERANK_CANDIDATE_COUNT);
+      // batch-3 D2: hydrate + apply the content-type/entity filters on the FULL candidate pool BEFORE
+      // reranking, so the reranker ranks the RELEVANT (e.g. survey-only) chunks rather than the global
+      // top-N that a selective filter then cuts to ~1. Hydration is one batched query (cheap even at
+      // the enlarged candidateCount); with no filter this is only "hydrate earlier" — same results.
+      let chunks = await hydrateChunkContexts(ranked, ctx);
+      if (contentType || entities) {
+        chunks = applyChunkContextFilters(chunks, { contentType, entities });
+      }
+
+      // Optional rerank — over the FILTERED pool (top RERANK_CANDIDATE_COUNT survivors), so a
+      // filtered rerank returns filtered results ranked by the cross-encoder, not an empty-ish page.
+      if (useRerank && chunks.length > 0) {
+        const candidates = chunks.slice(0, RERANK_CANDIDATE_COUNT);
         try {
           const passages = candidates.map((c) => c.content);
           const rerankResult = await ctx.rerankerClient.rerank(query, passages);
-          ranked = rerankResult.scores.map((s) => ({
+          chunks = rerankResult.scores.map((s) => ({
             ...candidates[s.index],
             finalScore: s.score,
           }));
         } catch (err) {
           console.error('[v1/search_semantic] Reranker unavailable, fast fallback:', err instanceof Error ? err.message : err);
         }
-      }
-
-      let chunks = await hydrateChunkContexts(ranked, ctx);
-
-      if (contentType || entities) {
-        chunks = applyChunkContextFilters(chunks, { contentType, entities });
       }
 
       const candidateDocIds = [...new Set(chunks.map((c) => c.documentId))];

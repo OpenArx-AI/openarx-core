@@ -25,6 +25,10 @@ import type {
 import { query } from '@openarx/api';
 import { textSimilarity } from '../lib/dedup.js';
 import { fixChunkBoundaries } from '../lib/chunk-boundary-fix.js';
+// Stage-2 Part B (marker/anchor chunking): the LLM emits start/end anchors instead of full
+// text; the verbatim chunk content is recovered from the source with the SAME parity-tested
+// infra the qwen bulk uses. recoverFromAnchorPairs (Stage-2) + coverageCheck (0-loss gate).
+import { recoverFromAnchorPairs, coverageCheck } from './verbatim-recovery.js';
 
 export interface ChunkerStepInput {
   parsed: ParsedDocument;
@@ -39,6 +43,63 @@ interface ChunkJson {
   content_type?: string;
   entities?: string[];
   self_contained?: boolean;
+}
+
+/** Marker (anchor) chunker output — Stage-2 Part B. The LLM returns per chunk the verbatim
+ *  first/last ~8 words (start_anchor/end_anchor) instead of the full text; the content is then
+ *  recovered from the source. All other fields match ChunkJson. Anchors are ephemeral (consumed
+ *  by recovery, never persisted). */
+interface AnchorChunkJson {
+  section: string;
+  start_anchor: string;
+  end_anchor: string;
+  summary?: string;
+  key_concept?: string;
+  content_type?: string;
+  entities?: string[];
+  self_contained?: boolean;
+}
+
+/** Marker-mode WIRE keys. The model is asked for these short names instead of the internal ones,
+ *  because the key names repeat on EVERY chunk and carry no information: measured at ~23 of the 168
+ *  output tokens per chunk on the 2026-07-26 run, which made them the cheapest real saving available.
+ *
+ *  ★ This is a WIRE format only. The internal AnchorChunkJson shape and the STORED chunk context keys
+ *  are unchanged — buildEmbedInput, search, the cap-marking backfill and Console all read the long
+ *  names, and 36M existing chunks use them. normaliseAnchorChunk() maps wire → internal.
+ *
+ *  ★ Short but still readable (`sa`, not `a`): the model has to know what belongs in each field, and
+ *  single letters buy a couple more tokens at the cost of comprehension on a task where a
+ *  misunderstood field means a failed batch and a full-text fallback — i.e. dearer, not cheaper. */
+const ANCHOR_WIRE_TO_INTERNAL: Readonly<Record<string, keyof AnchorChunkJson>> = {
+  sec: 'section',
+  sa: 'start_anchor',
+  ea: 'end_anchor',
+  sum: 'summary',
+  kc: 'key_concept',
+  ct: 'content_type',
+  ent: 'entities',
+  sc: 'self_contained',
+};
+
+/** Accept a model chunk written with EITHER the short wire keys or the original long ones.
+ *
+ *  Tolerating both is not politeness, it is the safety property: the long names are what the model
+ *  has seen for months, and a prompt drift or a stubborn response written the old way would, under
+ *  strict short-only parsing, fail the batch and send it down the full-text fallback — making the run
+ *  MORE expensive, which is exactly the metric this change exists to improve. Short wins on conflict. */
+export function normaliseAnchorChunk(raw: unknown): Partial<AnchorChunkJson> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  // Long names first, so a short key present alongside overwrites it.
+  for (const long of Object.values(ANCHOR_WIRE_TO_INTERNAL)) {
+    if (r[long] !== undefined) out[long] = r[long];
+  }
+  for (const [short, long] of Object.entries(ANCHOR_WIRE_TO_INTERNAL)) {
+    if (r[short] !== undefined) out[long] = r[short];
+  }
+  return out as Partial<AnchorChunkJson>;
 }
 
 const VALID_CONTENT_TYPES = new Set([
@@ -436,6 +497,21 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
       }
 
       batchBounds.push(chunks.length);
+
+      // Stage-2 Part B: try marker (anchor) chunking first — cheaper + verbatim (content
+      // recovered from source). On ANY recovery failure tryMarkerBatch returns null and we fall
+      // through to the full-text path below (the .12 fallback, which keeps the pro retry,
+      // enforceSectionBoundaries, and fixChunkBoundaries).
+      const marker = await this.tryMarkerBatch(batch, document, chunkerOptions, context, position);
+      if (marker) {
+        for (const c of marker.chunks) chunks.push(c);
+        position += marker.chunks.length;
+        mergedMetadata.code_urls.push(...marker.metadata.code_urls);
+        mergedMetadata.dataset_mentions.push(...marker.metadata.dataset_mentions);
+        mergedMetadata.benchmark_mentions.push(...marker.metadata.benchmark_mentions);
+        continue;
+      }
+
       const prompt = this.buildPrompt(document.title, batch);
 
       try {
@@ -621,8 +697,11 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
       logger.warn(`Section coverage low: ${outputSections.size}/${inputSections.size} sections in chunks (${missedSections.length} missing)`);
     }
 
-    // Fix mid-sentence chunk boundaries (trim backward to last complete sentence)
-    const boundaryFixes = fixChunkBoundaries(chunks);
+    // Fix mid-sentence chunk boundaries (trim backward to last complete sentence). GATED to the
+    // full-text / fallback chunks only — marker chunks are already verbatim, 0-loss, cleanly-tiled
+    // slices; trimming them would DISCARD recovered content (violates the Part B 0-loss invariant).
+    // fixChunkBoundaries mutates in place, so the filtered subset shares the same chunk objects.
+    const boundaryFixes = fixChunkBoundaries(chunks.filter((c) => c.context.chunkingMode !== 'marker'));
     if (boundaryFixes > 0) {
       logger.info(`Fixed ${boundaryFixes} mid-sentence chunk boundaries`);
     }
@@ -746,10 +825,30 @@ export class ChunkerStep implements PipelineStep<ChunkerStepInput, Chunk[]> {
     return parts;
   }
 
-  private buildPrompt(title: string, sections: FlatSection[]): string {
+  private buildPrompt(title: string, sections: FlatSection[], mode: 'marker' | 'full_text' = 'full_text'): string {
     const sectionTexts = sections
       .map((s) => `---SECTION: ${s.path}---\n${s.content}`)
       .join('\n\n');
+
+    // Output-spec differs by mode. marker: emit start/end anchors (verbatim first/last ~8
+    // words) instead of the full text — the content is recovered from source (Stage-2 Part B:
+    // cheaper + no distortion). full_text: the legacy spec (also used for the marker fallback).
+    const outputSpec = mode === 'marker'
+      ? `Do NOT return the full chunk text. For EACH chunk return ONLY its boundary markers:
+- "sa" (start anchor): the FIRST ~8 words of the chunk, copied EXACTLY character-for-character from the source above (verbatim).
+- "ea" (end anchor): the LAST ~8 words of the chunk, copied EXACTLY character-for-character (verbatim).
+Copy anchors verbatim — do NOT paraphrase, normalize, translate, fix, or drop any LaTeX/math/punctuation. The anchors must appear literally in the source so the full text can be reconstructed.
+
+Use SHORT field names exactly as shown (they cost fewer tokens):
+  sec = section header, sa = start_anchor, ea = end_anchor, sum = summary,
+  kc = key concept, ct = content type, ent = entities, sc = self contained.
+
+Return ONLY a JSON object with two keys:
+1. "chunks": [{"sec": "exact section header from above", "sa": "first ~8 words verbatim", "ea": "last ~8 words verbatim", "sum": "1-2 sentence summary", "kc": "main idea in 3-5 words", "ct": "methodology", "ent": ["BERT", "SQuAD"], "sc": true}, ...]
+2. "metadata": {"code_urls": ["https://github.com/..."], "dataset_mentions": ["ImageNet", ...], "benchmark_mentions": ["BLEU", ...]}`
+      : `Return ONLY a JSON object with two keys:
+1. "chunks": [{"section": "exact section header from above", "text": "chunk text", "summary": "1-2 sentence summary", "key_concept": "main idea in 3-5 words", "content_type": "methodology", "entities": ["BERT", "SQuAD"], "self_contained": true}, ...]
+2. "metadata": {"code_urls": ["https://github.com/..."], "dataset_mentions": ["ImageNet", ...], "benchmark_mentions": ["BLEU", ...]}`;
 
     return `Split the following paper sections into semantic units.
 Each unit = one complete thought/claim/concept. Preserve original text exactly.
@@ -773,9 +872,7 @@ Document: "${title}"
 Sections:
 ${sectionTexts}
 
-Return ONLY a JSON object with two keys:
-1. "chunks": [{"section": "exact section header from above", "text": "chunk text", "summary": "1-2 sentence summary", "key_concept": "main idea in 3-5 words", "content_type": "methodology", "entities": ["BERT", "SQuAD"], "self_contained": true}, ...]
-2. "metadata": {"code_urls": ["https://github.com/..."], "dataset_mentions": ["ImageNet", ...], "benchmark_mentions": ["BLEU", ...]}
+${outputSpec}
 
 For metadata, extract ONLY what is explicitly mentioned in the text above. Return empty arrays if nothing found.`;
   }
@@ -870,6 +967,153 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
     return { chunks: result, metadata: { ...EMPTY_METADATA } };
   }
 
+  // ─── Stage-2 Part B: marker (anchor) chunking ────────────────────────────
+
+  /** Strict check for the marker path: JSON with at least one chunk having non-empty
+   *  start_anchor + end_anchor. Mirrors hasValidChunkJson. */
+  private hasValidAnchorJson(text: string): { valid: boolean; repaired: boolean } {
+    let cleaned = text.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    }
+    try {
+      const { parsed, repaired } = parseChunkJson(cleaned);
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : (parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).chunks : null);
+      const valid = Array.isArray(arr) && arr.some((c) => {
+        const a = normaliseAnchorChunk(c);
+        return !!a && typeof a.start_anchor === 'string' && a.start_anchor.length > 0
+          && typeof a.end_anchor === 'string' && a.end_anchor.length > 0;
+      });
+      return { valid, repaired };
+    } catch {
+      return { valid: false, repaired: false };
+    }
+  }
+
+  /** Parse a marker-mode response into AnchorChunkJson[] + metadata. No paragraph fallback —
+   *  a parse/validity failure returns [] and the caller falls back to the full-text path. */
+  private parseAnchorResponse(text: string): { chunks: AnchorChunkJson[]; metadata: ExtractedMetadata } {
+    let cleaned = text.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    }
+    try {
+      const { parsed } = parseChunkJson(cleaned);
+      const obj = (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+        ? (parsed as Record<string, unknown>)
+        : null;
+      const rawList = (obj?.chunks ?? (Array.isArray(parsed) ? parsed : null)) as unknown[] | null;
+      if (Array.isArray(rawList)) {
+        // normalise wire→internal, then keep only chunks that actually carry both anchors —
+        // that check is what turns a Partial into a usable AnchorChunkJson.
+        const raw = rawList
+          .map(normaliseAnchorChunk)
+          .filter((c): c is AnchorChunkJson =>
+            c !== null && typeof c.start_anchor === 'string' && typeof c.end_anchor === 'string'
+            && typeof c.section === 'string');
+        const chunks = raw
+          .filter((c) => c && typeof c.start_anchor === 'string' && c.start_anchor.length > 0
+            && typeof c.end_anchor === 'string' && c.end_anchor.length > 0)
+          .map((c) => ({
+            ...c,
+            section: typeof c.section === 'string' ? sanitizeForPg(c.section) : c.section,
+            start_anchor: sanitizeForPg(c.start_anchor),
+            end_anchor: sanitizeForPg(c.end_anchor),
+            summary: typeof c.summary === 'string' ? sanitizeForPg(c.summary) : c.summary,
+            key_concept: typeof c.key_concept === 'string' ? sanitizeForPg(c.key_concept) : c.key_concept,
+            content_type: typeof c.content_type === 'string' ? sanitizeForPg(c.content_type) : c.content_type,
+            entities: Array.isArray(c.entities)
+              ? c.entities.filter((e): e is string => typeof e === 'string').map(sanitizeForPg)
+              : c.entities,
+          }));
+        const meta = obj ? (obj.metadata as Partial<ExtractedMetadata> | undefined) : undefined;
+        return { chunks, metadata: sanitizeMetadata(meta) };
+      }
+    } catch {
+      /* fall through */
+    }
+    return { chunks: [], metadata: { ...EMPTY_METADATA } };
+  }
+
+  /**
+   * Marker path for one batch (Stage-2 Part B). Emits anchors, recovers verbatim content from
+   * the SAME batch source the model saw, and gates on a 0-loss coverage check. Returns the
+   * recovered chunks on success, or NULL to fall through to the existing full-text path (.12
+   * fallback — which keeps the pro-retry, enforceSectionBoundaries, and fixChunkBoundaries).
+   * The lossy boundary machinery is thereby GATED OUT of the marker path (0-silent-wrong).
+   */
+  private async tryMarkerBatch(
+    batch: FlatSection[],
+    document: Document,
+    chunkerOptions: ModelOptions,
+    context: PipelineContext,
+    startPos: number,
+  ): Promise<{ chunks: Chunk[]; metadata: ExtractedMetadata } | null> {
+    const { modelRouter, logger, costTracker } = context;
+    const prompt = this.buildPrompt(document.title, batch, 'marker');
+
+    let response;
+    const start = performance.now();
+    try {
+      response = await modelRouter.complete('chunking', prompt, chunkerOptions);
+    } catch (err) {
+      logger.warn(`Marker chunking LLM call failed (${err instanceof Error ? err.message : err}) — full-text fallback`);
+      return null;
+    }
+    const durationMs = Math.round(performance.now() - start);
+    await costTracker.record('chunking', response.model, response.provider ?? 'openrouter',
+      response.inputTokens, response.outputTokens, response.cost, durationMs);
+
+    // Unparseable / truncated marker JSON → full-text path (which has its own pro retry). Rare
+    // (~3%: marker valid-JSON ≈ 96.7% vs 80.3% full-text — short anchors trip LaTeX escaping less).
+    if (response.finishReason === 'MAX_TOKENS' || !this.hasValidAnchorJson(response.text).valid) {
+      logger.info(`Marker batch unusable (finishReason=${response.finishReason}) — full-text fallback for ${batch.length} sections`);
+      return null;
+    }
+
+    const { chunks: anchorChunks, metadata } = this.parseAnchorResponse(response.text);
+    if (anchorChunks.length === 0) return null;
+
+    // Recover from the EXACT in-loop batch source (header-less) — this is batchRawContent(batch),
+    // inlined to avoid FlatSection type coupling; alignment (0-silent-wrong) is guaranteed because
+    // we recover from the same batch the model was given.
+    const source = batch.map((s) => s.content).join('\n');
+    const pairs: Array<[string, string]> = anchorChunks.map((c) => [c.start_anchor, c.end_anchor]);
+    const results = recoverFromAnchorPairs(pairs, source);
+
+    // 0-loss gate: any FAILED anchor, or any real (non-droppable) coverage gap / non-clean tiling
+    // → NULL → full-text fallback. Accepted only when every chunk's content is a byte-exact
+    // source slice AND the batch tiles cleanly. Content is never LLM-serialized in this path.
+    if (results.some((r) => r.status === 'FAILED' || r.span === null || r.text === null)) {
+      logger.info(`Marker recovery had FAILED anchors (${batch.length} sections) — full-text fallback`);
+      return null;
+    }
+    const cov = coverageCheck(results.map((r) => r.span), source);
+    if (cov.gaps.length > 0 || !cov.cleanTiling) {
+      logger.info(`Marker recovery not 0-loss (gaps=${cov.gaps.length}, cleanTiling=${cov.cleanTiling}, ${batch.length} sections) — full-text fallback`);
+      return null;
+    }
+
+    const pathByName = new Map<string, string>();
+    for (const s of batch) { pathByName.set(s.name, s.path); pathByName.set(s.path, s.path); }
+    const chunks: Chunk[] = [];
+    let pos = startPos;
+    for (let i = 0; i < anchorChunks.length; i++) {
+      const a = anchorChunks[i];
+      const content = results[i].text as string; // non-null: guarded above
+      const meta: ChunkJson = {
+        section: a.section, text: content, summary: a.summary, key_concept: a.key_concept,
+        content_type: a.content_type, entities: a.entities, self_contained: a.self_contained,
+      };
+      const path = pathByName.get(a.section) ?? a.section;
+      chunks.push(this.createChunk(document.id, a.section, content, pos++, path, meta, 'marker'));
+    }
+    logger.debug(`Marker batch: ${batch.length} sections → ${chunks.length} verbatim-recovered chunks in ${durationMs}ms`);
+    return { chunks, metadata };
+  }
+
   private splitParagraphs(text: string): string[] {
     return text
       .split(/\n\n+/)
@@ -953,6 +1197,7 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
     position: number,
     sectionPath?: string,
     meta?: ChunkJson,
+    chunkingMode: 'marker' | 'full_text' = 'full_text',
   ): Chunk {
     const contentType = meta?.content_type && VALID_CONTENT_TYPES.has(meta.content_type)
       ? meta.content_type
@@ -973,6 +1218,7 @@ For metadata, extract ONLY what is explicitly mentioned in the text above. Retur
         sectionPath: sectionPath ?? sectionName,
         positionInDocument: position,
         totalChunks: 0,
+        chunkingMode,
         ...(meta?.summary ? { summary: meta.summary } : {}),
         ...(meta?.key_concept ? { keyConcept: meta.key_concept } : {}),
         ...(contentType ? { contentType } : {}),

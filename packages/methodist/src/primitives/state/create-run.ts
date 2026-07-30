@@ -17,6 +17,14 @@ interface In {
   credential_id: string;
   parent_run_id?: string;
   methodology_version?: string;
+  /**
+   * The STABLE run-owner hash (sha256(userId), 'own:'-prefixed) — the run-ownership basis for
+   * §8-inv4 run_id-threading (contracts EMPTY_LOG KEYING FIX). Threaded by the interpreter from the
+   * door input (identity is FRAME-owned; the methodology never binds it), NOT the token-composite
+   * credential_id — so ownership survives token-refresh. Persisted so the tool-call boundary can
+   * validate `sha256(caller.userId) == run.owner_hash` (REJECT-HARD on a foreign/absent run_id).
+   */
+  owner_hash?: string;
 }
 interface Out {
   run_id: string;
@@ -42,6 +50,7 @@ export function makeCreateRun(mintId: MintId): Registration {
       await ctx.write('run-state').put(run_id, {
         run_id,
         credential_id: inputs.credential_id,
+        owner_hash: inputs.owner_hash ?? null,
         parent_run_id: inputs.parent_run_id ?? null,
         methodology_version: inputs.methodology_version ?? null,
         cycle: null,

@@ -264,6 +264,11 @@ const PUBLISH_ENDPOINT = `http://127.0.0.1:${process.env.MCP_PORT ?? '3100'}/api
 const PORTAL_INTERNAL_URL = process.env.PORTAL_INTERNAL_URL ?? 'http://localhost:3200';
 const PORTAL_PUBLIC_URL = process.env.PORTAL_PUBLIC_URL ?? 'https://portal.openarx.ai';
 const DRAFT_ENDPOINT = `${PORTAL_INTERNAL_URL}/api/internal/agent-create-draft`;
+/** §15.9 agent-publish-own-draft (contracts mse1; Portal side by 0748). Portal OWNS resolve +
+ *  publish (via the unified gate, caller=mcp+storagebox) + inline §23 billing (single-biller,
+ *  billing=A) + §19.2 stale-parent; it enforces ownership (portal_drafts.user_id==user_id AND
+ *  created_by='agent'). publish_draft is a THIN delegate — Core forwards + surfaces, never bills. */
+const AGENT_PUBLISH_DRAFT_ENDPOINT = `${PORTAL_INTERNAL_URL}/api/internal/agent-publish-draft`;
 
 /** Marker the gateway honours to skip credit deduction (openarx-contracts-w3rr
  *  Part B). Set on tool results for endpoint responses the user shouldn't pay
@@ -464,6 +469,26 @@ async function callDraftEndpoint(payload: Record<string, unknown>): Promise<{ st
   }
 }
 
+/** §15.9: POST to Portal's agent-publish-draft (X-Internal-Secret). Portal resolves+publishes+bills
+ *  inline and returns a sync §23-envelope (billing=A). Returns raw status + parsed body; status 0 =
+ *  Portal unreachable. Core NEVER bills — the caller marks every result __skipBilling. */
+async function callAgentPublishDraft(payload: Record<string, unknown>): Promise<{ status: number; body: unknown }> {
+  try {
+    const resp = await fetch(AGENT_PUBLISH_DRAFT_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'X-Internal-Secret': process.env.CORE_INTERNAL_SECRET ?? '',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(30_000),
+    });
+    return { status: resp.status, body: await resp.json().catch(() => ({})) };
+  } catch (err) {
+    return { status: 0, body: { error: 'publish_service_unreachable', message: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
 /** Map MCP author shape → endpoint author shape (given/family names). */
 function endpointAuthors(authors: Array<{ given_name: string; family_name: string; orcid?: string }>): Array<Record<string, unknown>> {
   return authors.map((a) => ({ given_name: a.given_name, family_name: a.family_name, orcid: a.orcid }));
@@ -550,7 +575,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
   server.tool(
     'submit_document',
-    `Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. ${ARCHIVE_NOTE} ${CONTENT_REF_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
+    `Submit a document for indexing on OpenArx. Supports LaTeX, Markdown, and PDF formats. Returns a core_document_id for status tracking. Published documents are immutable. To correct or update one later, publish a new version rather than editing in place. ${ARCHIVE_NOTE} ${CONTENT_REF_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
     {
       title: titleField.describe('Document title'),
       abstract: abstractField.describe('Document abstract'),
@@ -749,7 +774,7 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
 
   server.tool(
     'create_new_version',
-    `Submit a new version of an existing document. The previous version's chunks will be marked as not-latest. Omit \`categories\`, \`keywords\`, or \`language\` to inherit each independently from the previous version; pass a value to override. ${ARCHIVE_NOTE} ${CONTENT_REF_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
+    `Submit a new version of an existing document. The earlier version is not replaced: it keeps its own identifier, so an existing citation of it still resolves to the exact text it referred to. The previous version's chunks will be marked as not-latest. Omit \`categories\`, \`keywords\`, or \`language\` to inherit each independently from the previous version; pass a value to override. ${ARCHIVE_NOTE} ${CONTENT_REF_NOTE} ${LIMITS_NOTE} ${DRY_RUN_NOTE}`,
     {
       previous_document_id: z.string().describe('Core document ID of the previous version'),
       title: titleField.describe('Updated title'),
@@ -1080,6 +1105,50 @@ export function registerPublishTools(server: McpServer, ctx: AppContext): void {
       const editUrl = (b.edit_url as string | undefined) ?? `${PORTAL_PUBLIC_URL}/portal/drafts/${returnedDraftId}`;
       // Free tool — never deduct credits (the billable event is publishing, not drafting).
       return skipBilling(jsonResult({ draft_id: returnedDraftId, edit_url: editUrl, would_save: wouldSave }));
+    },
+  );
+
+  // ── publish_draft (§15.9 agent-publish-own-draft; contracts mse1) ─────────
+  // Publish a draft the AGENT created on its OWN account. THIN DELEGATE: resolve + publish + inline
+  // §23 billing are Portal-owned (billing=A single-biller); Core forwards (draft_id, server-bound
+  // userId, publish-time metadata) to Portal's agent-publish-draft, surfaces the sync §23-envelope,
+  // and maps REJECTs. Core NEVER bills (PORTAL_BILLED_TOOLS skips the pre-check; __skipBilling skips
+  // the deduct). Metadata (COI/license/title + publishable fields) is supplied HERE at publish
+  // (create_draft stays lightweight, #3). Ownership is Portal-enforced on the STABLE account userId +
+  // created_by='agent'. Consent = Vlad tier-0 onboarding-grant (§10-bis).
+  server.tool(
+    'publish_draft',
+    'Publish one of YOUR OWN Portal drafts (a draft you created with create_draft) to OpenArx. Pass its draft_id and any publish-time metadata (coi_statement, license, title, authors, …) — supplied here because create_draft stays lightweight. Publishing is the billable event (the draft itself was free). You may only publish drafts on your own account that you created as an agent — someone else\'s draft, a human-staged draft, or a non-existent draft is rejected. Returns the publication result (indexing status + core_document_id / oarx_id), or a clear error (draft_ownership_denied / unknown_draft / stale_parent).',
+    {
+      draft_id: z.string().describe('The draft_id returned by create_draft — a draft on your own account that you created as an agent.'),
+      metadata: z.record(z.unknown()).optional()
+        .describe('Optional publish-time metadata — same field set as submit_document (coi_statement, license, title, authors, abstract, funding, data_availability, related_identifiers, embargo_until, doi, arxiv_id, source_url, arxiv_categories, …). Supply COI/license/title here at publish. Unrecognized keys are dropped.'),
+    },
+    async ({ draft_id, metadata }, extra) => {
+      const portalToken = (extra as unknown as Record<string, unknown>)._portalToken as { userId?: string } | undefined;
+      const userId = portalToken?.userId;
+      if (!userId) return skipBilledError('user_required', 'Publisher token required (userId missing)');
+
+      // Delegate to Portal (billing=A single-biller): Portal enforces ownership
+      // (portal_drafts.user_id==userId AND created_by='agent'), publishes via the unified gate
+      // (caller=mcp, content_source=storagebox), runs §19.2, bills inline (§23), and returns a sync
+      // §23-envelope. Core forwards the SERVER-BOUND userId (never a tool arg) + publish metadata.
+      const { status, body } = await callAgentPublishDraft({
+        draft_id,
+        user_id: userId,
+        metadata: pickDraftMetadata(metadata ?? {}),
+      });
+      const b = (body ?? {}) as Record<string, unknown>;
+      const msg = (fallback: string): string => (typeof b.message === 'string' && b.message ? b.message : fallback);
+
+      // Map Portal REJECTs to clear ward-facing codes (mirror the run-ownership REJECT shapes).
+      if (status === 403) return skipBilledError('draft_ownership_denied', msg('This draft belongs to a different principal, or was not created by an agent. You can only publish your own agent-created drafts.'));
+      if (status === 404) return skipBilledError('unknown_draft', msg('No such draft. Pass a draft_id returned by create_draft.'));
+      if (status === 409) return skipBilledError('stale_parent', msg('The draft is bound to a document version whose parent is stale. Refresh the version binding, then publish.'));
+      if (status < 200 || status >= 300) return skipBilledError('publish_service_unavailable', `publish service returned ${status || 'no response'}`);
+
+      // Success — surface Portal's sync §23-envelope verbatim. Core never bills (billing=A, Portal-side).
+      return skipBilling(jsonResult(b));
     },
   );
 }

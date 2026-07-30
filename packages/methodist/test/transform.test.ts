@@ -260,3 +260,101 @@ describe('resolve-local-ids identity guard (§12.8)', () => {
     expect(res.records_resolved[0].record.id).toBe(res.records_resolved[1].record.id);
   });
 });
+
+// ── redact-fields (closeout verdict-input prose-redaction; bead openarx-mbtx / s4ez) ──
+describe('redact-fields', () => {
+  const PATHS = ['records[].content.deliverable_document.sections'];
+  interface DeliverableDoc {
+    genre: string;
+    title: string;
+    section_outline: string[];
+    sections: Record<string, unknown>;
+  }
+  interface Rec {
+    kind: string;
+    local_id?: string;
+    content?: Record<string, unknown>;
+    [k: string]: unknown;
+  }
+  const closeoutRecord = (): Rec => ({
+    kind: 'activity',
+    activity_type: 'version_closeout',
+    local_id: '_:vc',
+    content: {
+      carry_forward: ['carry-x'],
+      seeds: [{ q: 'seed-q1' }],
+      whats_closed: 'stage-8',
+      deliverable_document: {
+        genre: 'dispute-map',
+        title: 'The Title',
+        section_outline: ['Intro', 'Body', 'Conclusion'],
+        sections: {
+          Intro: 'A'.repeat(500),
+          Body: 'B'.repeat(3000),
+          Conclusion: 'C'.repeat(800),
+        },
+      },
+    },
+  });
+  const claimRecord = (): Rec => ({ kind: 'claim', local_id: '_:c', content: { text: 'a short claim' } });
+  const sub = (records: Rec[]): { submission_hash: string; records: Rec[] } => ({ submission_hash: 'h', records });
+
+  const runRedact = (submission: unknown, paths: unknown = PATHS) =>
+    invoke(deps(reg()), { id: 'redact-fields', version: 'v1', params: { paths }, inputs: { submission } });
+  const redactedDoc = (o: Outcome<unknown>): DeliverableDoc =>
+    (ok(o) as { submission: { records: Rec[] } }).submission.records[0].content!
+      .deliverable_document as unknown as DeliverableDoc;
+
+  it('keeps genre/title/section_outline + sections KEYS; drops sections prose to length-markers', async () => {
+    const dd = redactedDoc(await runRedact(sub([closeoutRecord()])));
+    expect(dd.genre).toBe('dispute-map');
+    expect(dd.title).toBe('The Title');
+    expect(dd.section_outline).toEqual(['Intro', 'Body', 'Conclusion']);
+    // completeness cross-check survives: outline ↔ Object.keys(sections)
+    expect(Object.keys(dd.sections)).toEqual(dd.section_outline);
+    // prose bodies gone, size signal preserved (non-empty)
+    expect(dd.sections.Body).toBe('[prose omitted: 3000 chars]');
+    expect(dd.sections.Intro).toBe('[prose omitted: 500 chars]');
+  });
+
+  it('no raw prose survives in the redacted output', async () => {
+    const out = await runRedact(sub([closeoutRecord()]));
+    const json = JSON.stringify((ok(out) as { submission: unknown }).submission);
+    expect(json).not.toContain('BBBBB');
+    expect(json).not.toContain('AAAAA');
+  });
+
+  it('★ §4.3: NEVER mutates the input — the original submission keeps full prose (persist path stays raw)', async () => {
+    const original = sub([closeoutRecord()]);
+    await runRedact(original);
+    const origDoc = original.records[0].content!.deliverable_document as unknown as DeliverableDoc;
+    expect(origDoc.sections.Body).toBe('B'.repeat(3000));
+    expect(origDoc.sections.Intro).toBe('A'.repeat(500));
+  });
+
+  it('path-absent → no-op pass-through (non-closeout submission is deep-equal unchanged)', async () => {
+    const claimOnly = sub([claimRecord()]);
+    const out = ok(await runRedact(claimOnly)) as { submission: unknown };
+    expect(out.submission).toEqual(claimOnly);
+  });
+
+  it('mixed submission: claim record untouched, only the closeout record is redacted', async () => {
+    const claim = claimRecord();
+    const out = ok(await runRedact(sub([claim, closeoutRecord()]))) as { submission: { records: Rec[] } };
+    expect(out.submission.records[0]).toEqual(claim);
+    const dd = out.submission.records[1].content!.deliverable_document as unknown as DeliverableDoc;
+    expect(dd.sections.Body).toBe('[prose omitted: 3000 chars]');
+  });
+
+  it('array-valued section → item-count marker (keeps key)', async () => {
+    const rec = closeoutRecord();
+    (rec.content!.deliverable_document as DeliverableDoc).sections = { Intro: ['p1', 'p2', 'p3'] };
+    const dd = redactedDoc(await runRedact(sub([rec])));
+    expect(dd.sections.Intro).toBe('[omitted: 3 items]');
+  });
+
+  it('malformed params.paths (not a string[]) → rejected (fail-loud on misconfig)', async () => {
+    expect((await runRedact(sub([closeoutRecord()]), 'not-an-array')).status).toBe('rejected');
+    expect((await runRedact(sub([closeoutRecord()]), [1, 2])).status).toBe('rejected');
+  });
+});

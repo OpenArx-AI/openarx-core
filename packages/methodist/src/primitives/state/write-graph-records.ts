@@ -18,13 +18,14 @@ import { definePrimitive, RuntimeError, type Registration } from '../../runtime/
 import { asRecordArray } from '../shared.js';
 import type { AssignId } from '../transform/resolve-local-ids.js';
 import type { Clock } from './update-dossier.js';
+import { isUnrecognisedVerdict, normaliseVerdict } from './verdict.js';
 
 interface ResolvedRecord {
   record_type: string;
   record: Record<string, unknown>;
 }
 interface Verdict {
-  verdict?: 'GO' | 'RETURN';
+  verdict?: string;
   quality?: unknown;
   reasons?: unknown;
   corrections?: unknown;
@@ -60,7 +61,31 @@ export function makeWriteGraphRecords(assignId: AssignId, now: Clock): Registrat
       determinism: 'deterministic',
     },
     ({ inputs }) => {
-      const v = inputs.verdict.verdict;
+      // Case-tolerant: a lowercase "go" would otherwise fall to the RETURN path and silently
+      // skip publishing the records.
+      const v = normaliseVerdict(inputs.verdict);
+      // ★ Refuse an unreadable verdict HERE, before anything is written. The checkpoint order is
+      // written → committed → vec → rstate, so the run's path event is recorded LAST. A verdict that
+      // cannot be read was previously caught at rstate — after commit-bundle-atomic had already put
+      // an activity into the graph — which left an activity with no corresponding path event, and
+      // every retry added another (openarx-y492). Those orphans are not merely untidy: anything
+      // reading behavioural history over time gets records that correspond to no epistemic act, so
+      // an agent unlucky with retries looks less argumentative than it was.
+      //
+      // Failing at this step costs nothing, because this step only STAGES the write-set (effects: []
+      // — commit-bundle-atomic performs the actual write). Refusing before the side effect is the
+      // whole point: the later check in update-run-state stays as a backstop, but it can no longer
+      // be the first line of defence.
+      if (isUnrecognisedVerdict(inputs.verdict)) {
+        throw new RuntimeError(
+          'bad-output',
+          `unrecognised verdict ${JSON.stringify(
+            typeof inputs.verdict === 'string'
+              ? inputs.verdict
+              : (inputs.verdict as { verdict?: unknown })?.verdict,
+          )} — expected GO or RETURN (any casing); refusing before any graph write`,
+        );
+      }
       const prefix = inputs.credential_id;
       const cycle_context = { cycle_type: inputs.cycle ?? null, run_id: inputs.run_id, stage_id: inputs.stage ?? null };
       const written: ResolvedRecord[] = [];
@@ -91,6 +116,23 @@ export function makeWriteGraphRecords(assignId: AssignId, now: Clock): Registrat
           // mentee didn't declare it (no fabricated default — the enum has no neutral initial).
           if (r.record_type === 'claim' && typeof content?.claim_status === 'string') {
             rec.claim_status = content.claim_status;
+          }
+          // §12.10 A1 positive-grounding: grounding is a SUPPORT-only [0,1] score emitted INLINE on
+          // the support record (verify-step). Normalize the inline value defensively: clamp a
+          // support relation's grounding to [0,1]; strip grounding from any non-support relation
+          // (support-only invariant). Hash-EXCLUDED → never affects the id (already spread in `rec`).
+          if (r.record_type === 'relation') {
+            if (rec.relation === 'support' && typeof rec.grounding === 'number') {
+              rec.grounding = Math.min(1, Math.max(0, rec.grounding));
+            } else if (rec.grounding !== undefined) {
+              delete rec.grounding; // support-only
+            }
+            // §12.11 vsz correction marker: QUALIFY/REFUTE-only — strip from support/others (a
+            // 'correction on support' is meaningless and would yield a wrong corrected_by). Mirrors
+            // the grounding support-only strip. Hash-excluded → never affects the id.
+            if (rec.correction !== undefined && rec.relation !== 'qualify' && rec.relation !== 'refute') {
+              delete rec.correction;
+            }
           }
           const id = typeof rec.id === 'string' ? rec.id : assignId(rec, r.record_type, prefix);
           rec.id = id;

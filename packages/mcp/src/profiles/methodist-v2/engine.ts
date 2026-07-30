@@ -6,7 +6,7 @@
 // call runEndpoint(engine, <endpoint>, input) against this.
 
 import { randomUUID } from 'node:crypto';
-import { VertexLlm, EmbedClient, recordMethodistLlmCost, validateRecordShape, makeLlmLangId, DEFAULT_LANG_DETECT_MODEL } from '@openarx/api';
+import { VertexLlm, OpenRouterLlm, EmbedClient, recordMethodistLlmCost, validateRecordShape, makeLlmLangId, DEFAULT_LANG_DETECT_MODEL } from '@openarx/api';
 import { assignRecordId, RECORD_TYPES, type Layer2Record } from '@openarx/types';
 import {
   Registry,
@@ -69,6 +69,16 @@ const geminiEmbed: Embed = async (text: string) => {
   const r = await embedClient.callEmbed([text], 'gemini-embedding-2-preview');
   return r.vectors[0] ?? [];
 };
+// Scope-B B1.2 (lsqk.17): the alt-model embedder for the 768 "specter2" slot — qwen3-embedding-8b
+// over the SAME §7 scientific projection as gemini (the two-model availability-insurance alt-vector;
+// the 3250 existing claims were backfilled by layer2-qwen-backfill.ts). allowFallback = the reference
+// recipe (pool → OpenRouter if the GPU pool is down). Wired unconditionally but INERT until
+// LAYER2_ALT_VECTOR=true gates the write inside vectorize-and-store (the specter2 slot already exists,
+// so no schema-op is needed — unlike gemini_eng's collection recreate).
+const qwenEmbed: Embed = async (text: string) => {
+  const r = await embedClient.callEmbed([text], 'qwen3-embedding-8b', { allowFallback: true });
+  return r.vectors[0] ?? [];
+};
 
 let cached: InterpreterDeps | null = null;
 
@@ -76,18 +86,37 @@ let cached: InterpreterDeps | null = null;
 export function buildDoorEngine(): InterpreterDeps {
   if (cached) return cached;
 
-  const vertex = new VertexLlm({ apiKey: process.env.GOOGLE_AI_API_KEY });
+  // Provider selection mirrors DefaultModelRouter: Vertex while Google credentials are configured,
+  // OpenRouter otherwise. It used to be a hardcoded VertexLlm, which meant the methodist doors were
+  // the ONE path that could not follow a provider switch — removing the Google credentials would have
+  // left every door calling an unconfigured Vertex. Both classes expose the same complete() shape, and
+  // OpenRouterLlm rewrites bare `gemini-*` ids to their `google/…` spelling, so the door prompts and
+  // METHODIST_MODEL keep working unchanged under either provider.
+  const googleCreds = process.env.GOOGLE_SA_KEY_FILE ?? process.env.GOOGLE_AI_API_KEY;
+  const llm: { complete: VertexLlm['complete'] } = googleCreds
+    ? new VertexLlm({
+        apiKey: process.env.GOOGLE_AI_API_KEY,
+        serviceAccountKeyFile: process.env.GOOGLE_SA_KEY_FILE,
+      })
+    : new OpenRouterLlm({ apiKey: process.env.OPENROUTER_API_KEY ?? '' });
+  console.error(`[methodist-v2] LLM provider: ${googleCreds ? 'vertex' : 'openrouter'}`);
   const model: ModelClient = {
     async generate(req) {
-      const r = await vertex.complete('enrichment', req.context, {
+      const r = await llm.complete('enrichment', req.context, {
         model: req.modelId || process.env.METHODIST_MODEL,
         responseMimeType: 'application/json',
         responseSchema: req.outputSchema,
         // openarx-tester-8lf: 1024 intermittently TRUNCATED the diagnose dose (operations +
         // beacons + expected_artifacts + counters + probe) for rich/complex research intents →
-        // cut JSON → bad-output → 'rejected'. 8192 gives ample headroom (a normal dose is
-        // ~400 tokens; the model only spends more when the intent genuinely needs it).
-        maxTokens: 8192,
+        // cut JSON → bad-output → 'rejected'. A normal dose is ~400 tokens; the model only spends
+        // more when the intent genuinely needs it.
+        //   • sbt2 / batch-3 D4: 8192 in turn TRUNCATED a LARGE version_closeout grading OUTPUT
+        //     (checkpoint_verdict: per-record verdicts + corrections + reasons + AAR-metrics for a
+        //     big closeout) → the same cut-JSON→bad-output→rejected. This is a CAP (a shared limit
+        //     across all model-calls: diagnose/verdict/verify/ask); raising it leaves small calls
+        //     unaffected and only gives the large-closeout grading the headroom it needs. Orthogonal
+        //     to v1.25 redact-fields (that trims the verdict INPUT prose; this is the OUTPUT budget).
+        maxTokens: 32768,
       });
       // 2h context-cache ROI (gs21): the big fixed methodology/TRIZ prefix (prepare-context's
       // staticPrefix, identified by cache_anchor) is repeated on every door call, so on Gemini
@@ -132,7 +161,7 @@ export function buildDoorEngine(): InterpreterDeps {
   const langDetect = makeLlmLangId(
     async (prompt, opts) =>
       (
-        await vertex.complete('enrichment', prompt, {
+        await llm.complete('enrichment', prompt, {
           model: opts.model,
           responseMimeType: opts.responseMimeType,
           responseSchema: opts.responseSchema,
@@ -148,6 +177,7 @@ export function buildDoorEngine(): InterpreterDeps {
       assignId,
       langId: langDetect,
       embed: geminiEmbed,
+      embedAlt: qwenEmbed, // Scope-B B1.2: qwen → 768 "specter2" slot (gated by LAYER2_ALT_VECTOR)
       mintId: (credential: string) => `run:${credential}:${randomUUID()}`,
       now: () => new Date().toISOString(),
       // §12.7: read-graph keys its per-type read projection off the record_schemas registry.

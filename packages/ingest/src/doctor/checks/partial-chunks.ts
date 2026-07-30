@@ -52,7 +52,7 @@ export function createPartialChunksCheck(ctx: DoctorContext): CheckModule {
       }
       return {
         status: 'warn',
-        message: `${count} chunks across ${docs} documents missing SPECTER2 vector`,
+        message: `${count} chunks across ${docs} documents missing the 768 vector (qwen)`,
         affectedCount: count,
       };
     },
@@ -96,7 +96,7 @@ export function createPartialChunksCheck(ctx: DoctorContext): CheckModule {
         });
 
         try {
-          const sResult = await ctx.embedClient!.callEmbed(texts, 'specter2', { timeoutMs: 300_000 });
+          const sResult = await ctx.embedClient!.callEmbed(texts, 'qwen3-embedding-8b', { timeoutMs: 300_000 });
 
           // Attach specter2 to existing points (Qdrant named-vector upsert)
           const points = batch.map((chunk, j) => ({
@@ -114,7 +114,7 @@ export function createPartialChunksCheck(ctx: DoctorContext): CheckModule {
           );
 
           fixed += batch.length;
-          log.info({ fixed, batch: batch.length }, 'specter2 re-embed batch complete');
+          log.info({ fixed, batch: batch.length }, '768-vector (qwen) re-embed batch complete');
         } catch (err) {
           failed += batch.length;
           log.error({ err: err instanceof Error ? err.message : err, batch: i }, 'Batch re-embed failed');

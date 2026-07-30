@@ -236,6 +236,18 @@ export interface Relation {
   interpretation_difference?: string; // hash-INCLUDED when relation === 'shared_evidence'
   consent_scope?: ConsentScope; // hash-excluded
   supersedes?: string | null; // hash-excluded
+  /** §12.10 A1 positive-grounding: a support relation's positive-grounding score in [0,1],
+   *  set at the verify step (emitted INLINE on the support record). SUPPORT-only. Hash-EXCLUDED
+   *  (updatable projection, mirrors verification) — NOT in FRAME_SPECS.relation nor
+   *  HASH_INCLUDED.relation, so it has zero §4.3 id-impact. Absent (pre-A1) ⇒ neutral in the
+   *  ward-computed AAR (methodist dose fallback). */
+  grounding?: number;
+  /** §12.11 vsz correction marker: true iff this qualify/refute relation fixes a factual ERROR
+   *  in the target claim (a correction filed at closeout, where new claims aren't accepted).
+   *  QUALIFY/REFUTE-only. Hash-EXCLUDED indexed routing scalar (mirrors relation_class) → zero
+   *  §4.3 id-impact. Drives the claim-read `corrected_by` computed reverse-lookup; the correction
+   *  CONTENT lives in citation_context/mediator (this is only a discoverability flag). */
+  correction?: boolean;
 }
 
 // ── ACTIVITY (PROV-O) ────────────────────────────────────────────────────────
@@ -385,4 +397,6 @@ export const HASH_EXCLUDED_FIELDS = [
   'consent_scope',
   'edge_provenance',
   'source_digest',
+  'grounding', // §12.10 A1: support-relation positive-grounding score — set at verify, updatable, never in identity
+  'correction', // §12.11 vsz: qualify/refute correction marker — indexed routing scalar, never in identity
 ] as const;

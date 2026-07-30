@@ -243,9 +243,9 @@ export function buildStores(
           } as AppendOnlyHandle;
         case 'vector':
           // §12.6/2c: methodist GO-claim projections → Qdrant `layer2_claims`. The primitive
-          // has already rendered the schema projection + embedded it (gemini); here we complete
-          // the ClaimPointPayload (computed claim_id/text_hash/embedded_at/schema_version) and
-          // upsert with the gemini named vector only (specter2 = later schema-driven swap).
+          // has already rendered the schema projection + embedded it (gemini §7, optional gemini_eng
+          // §12.9 P3, optional qwen alt Scope-B B1.2); here we complete the ClaimPointPayload
+          // (computed claim_id/text_hash/embedded_at/schema_version) and upsert the present slots.
           return {
             store,
             put: async (id, v) => {
@@ -279,9 +279,15 @@ export function buildStores(
               const vectorEng = Array.isArray(r.vector_eng)
                 ? (r.vector_eng as number[])
                 : undefined;
+              // Scope-B B1.2 (lsqk.17): the alt-model (qwen) vector over the same §7 projection → the
+              // 768 "specter2" slot (present only when LAYER2_ALT_VECTOR gated the primitive's embed;
+              // upsertClaimPoint omits an undefined slot, so a gate-off write never wipes it).
+              const vectorAlt = Array.isArray(r.vector_alt)
+                ? (r.vector_alt as number[])
+                : undefined;
               await vectorStore.upsertClaimPoint(
                 ref,
-                { gemini: vector as number[], gemini_eng: vectorEng },
+                { gemini: vector as number[], gemini_eng: vectorEng, specter2: vectorAlt },
                 payload,
               );
             },

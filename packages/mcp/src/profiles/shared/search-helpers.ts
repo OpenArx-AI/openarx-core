@@ -16,7 +16,15 @@ import type { AppContext } from '../../context.js';
 import { computeCanServeFile, computeIndexingLimitation, truncateChunk } from './helpers.js';
 import { getRedis } from '../../lib/redis.js';
 
-const SEARCH_POOL_TTL_SEC = 300;
+// batch-3 D1: the paginate search-pool TTL. 300s (5 min) was too short for long research sessions
+// (a survey/agenda run can span many minutes between paginate calls, then hit "pool expired" and
+// have to re-run the full pipeline). Raised the default to 1800s (30 min) and made it env-tunable
+// (SEARCH_POOL_TTL_SEC) so it can go higher without a redeploy. Pools are small (candidate id lists)
+// in Redis (allkeys-lru), so a longer TTL is cheap; a bad/empty env value falls back to the default.
+export const SEARCH_POOL_TTL_SEC = ((): number => {
+  const raw = Number(process.env.SEARCH_POOL_TTL_SEC);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1800;
+})();
 const SEARCH_POOL_KEY_PREFIX = 'search-pool:';
 
 export type DetailLevel = 'minimal' | 'standard' | 'full';

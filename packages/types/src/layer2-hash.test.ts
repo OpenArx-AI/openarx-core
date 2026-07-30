@@ -243,3 +243,24 @@ test('bundle — members participate in identity + no degenerate collapse (pre-f
   assert.ok(recordCanonicalBytes(b1).includes('members'));
   assert.ok(recordCanonicalBytes(b1).includes('bundle_type'));
 });
+
+// ── §12.10 A1 positive-grounding (support-relation grounding score, hash-EXCLUDED) ──
+test('relation support — grounding is hash-EXCLUDED (§12.10 A1: the score never affects the id)', () => {
+  const support: Relation = { ...REL_SHARED, relation: 'support', shared_source_uri: undefined, interpretation_difference: undefined };
+  const withGrounding: Relation = { ...support, grounding: 0.83 };
+  // grounding rides on the record but is OUTSIDE the §4.3 hash-scope → identical content_hash
+  assert.equal(computeContentHash(withGrounding), computeContentHash(support));
+  const bytes = recordCanonicalBytes(withGrounding);
+  assert.ok(!bytes.includes('grounding'));
+  assert.ok(!bytes.includes('0.83'));
+});
+
+// ── §12.11 vsz correction marker (qualify/refute correction flag, hash-EXCLUDED) ──
+test('relation qualify — correction is hash-EXCLUDED (§12.11 vsz: the marker never affects the id)', () => {
+  const qualify: Relation = { ...REL_SHARED, relation: 'qualify', shared_source_uri: undefined, interpretation_difference: undefined };
+  const withCorrection: Relation = { ...qualify, correction: true };
+  // correction rides on the record but is OUTSIDE the §4.3 hash-scope → identical content_hash
+  assert.equal(computeContentHash(withCorrection), computeContentHash(qualify));
+  const bytes = recordCanonicalBytes(withCorrection);
+  assert.ok(!bytes.includes('correction'));
+});

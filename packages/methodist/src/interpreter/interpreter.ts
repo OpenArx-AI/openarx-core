@@ -244,6 +244,14 @@ async function runProcedure(
     if (step.primitive === 'create-run' && inputs.methodology_version == null) {
       inputs.methodology_version = deps.methodology.methodology_version;
     }
+    // Run-OWNERSHIP is FRAME-owned identity (§1-bis; §8-inv4 run_id-threading, contracts EMPTY_LOG
+    // KEYING FIX) — the methodology never binds it. Thread the STABLE owner hash (sha256(userId),
+    // door-supplied) from the endpoint input into create-run, so the run node carries an owner
+    // ANCHORED TO THE PRINCIPAL (userId), not the per-token composite credential — ownership then
+    // survives a token-refresh. Fill-only: an explicit in.owner_hash binding, if ever added, wins.
+    if (step.primitive === 'create-run' && inputs.owner_hash == null) {
+      inputs.owner_hash = (input as { owner_hash?: unknown }).owner_hash;
+    }
     // Identity is FRAME-owned (§1-bis) — the methodology never binds it. Thread the runtime
     // credential (= the §4.3 id prefix AND the attester) from the endpoint input into
     // resolve-local-ids, so a bundle-local ref resolves to the SAME §4.3 id that write-graph-records

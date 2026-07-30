@@ -45,6 +45,21 @@ describe('create-run', () => {
     expect(out.status).toBe('rejected');
     expect(stores.dump('run-state').kv.size).toBe(0);
   });
+  // §8-inv4 run_id-threading (contracts EMPTY_LOG KEYING FIX): the run node carries a STABLE
+  // owner_hash (sha256(userId), threaded by the interpreter) so the tool-call boundary can validate
+  // run-ownership across token-refresh. Persisted when supplied; null when absent (pre-change runs).
+  it('persists a supplied owner_hash on the run node', async () => {
+    const stores = new InMemoryStores();
+    const out = await call(stores, 'create-run', { inputs: { credential_id: 'agent:a', owner_hash: 'own:deadbeef' } });
+    const runId = (ok(out) as { run_id: string }).run_id;
+    expect(stores.dump('run-state').kv.get(runId)).toMatchObject({ owner_hash: 'own:deadbeef' });
+  });
+  it('defaults owner_hash to null when not supplied (backward-compat)', async () => {
+    const stores = new InMemoryStores();
+    const out = await call(stores, 'create-run', { inputs: { credential_id: 'agent:a' } });
+    const runId = (ok(out) as { run_id: string }).run_id;
+    expect(stores.dump('run-state').kv.get(runId)).toMatchObject({ owner_hash: null });
+  });
 });
 
 // ── update-run-state (flat params, branch by data) ────────────────────────────
@@ -199,6 +214,30 @@ describe('create-corrective-activity', () => {
 // ── write-graph-records (verdict-branch + outcome-activity) ───────────────────
 describe('write-graph-records', () => {
   const base = { run_id: 'r1', credential_id: 'agent:a', cycle: '3', stage: 2, track_note: { intended: 'x', did: 'y', derived: 'z' } };
+  it('★ refuses an UNREADABLE verdict here, before anything is staged (openarx-y492)', async () => {
+    // The checkpoint order is written → committed → vec → rstate, so the path event lands LAST. When
+    // an unreadable verdict was only caught at rstate, commit-bundle-atomic had already put an
+    // activity into the graph — an orphan with no path event, one more per retry. Refusing at this
+    // step costs nothing (it only STAGES; the commit is a later step), so the write never happens.
+    const out = await call(new InMemoryStores(), 'write-graph-records', {
+      inputs: { ...base, verdict: { verdict: 'maybe' }, verify_status: { outcome: 'VERIFIED' }, language: 'en', records: [] },
+    });
+    // The runtime turns a RuntimeError into a rejected outcome rather than a thrown promise, so the
+    // assertion is on the outcome — the point being that the step does NOT return a write-set.
+    expect((out as { status?: string }).status).toBe('rejected');
+    expect(String((out as { error?: unknown }).error)).toMatch(/unrecognised verdict/i);
+    expect((out as { outputs?: unknown }).outputs).toBeUndefined();
+  });
+
+  it('an ABSENT verdict is not treated as unreadable (that is a different failure, caught upstream)', async () => {
+    // Guard against over-correction: the required-key check owns "no verdict at all". If this step
+    // also rejected absence, a legitimately verdict-less call would fail with the wrong diagnosis.
+    const out = await call(new InMemoryStores(), 'write-graph-records', {
+      inputs: { ...base, verdict: {}, verify_status: { outcome: 'VERIFIED' }, language: 'en', records: [] },
+    });
+    expect(ok(out)).toBeDefined();
+  });
+
   it('GO: publishes annotated claims + a checkpoint_go outcome-activity', async () => {
     const out = await call(new InMemoryStores(), 'write-graph-records', {
       inputs: { ...base, verdict: { verdict: 'GO', quality: { dims: [] } }, verify_status: { outcome: 'VERIFIED' }, language: 'en', records: [{ record_type: 'claim', record: { content: { text: 'c', claim_status: 'empirical_result' } } }] },
@@ -227,6 +266,36 @@ describe('write-graph-records', () => {
     expect(written[0].record).toMatchObject({ activity_type: 'checkpoint_return', run_id: 'r1', is_superseded: false });
     expect((written[0].record.activity_content as Record<string, unknown>).reasons).toEqual(['weak']);
     expect(written.some((w) => w.record_type === 'claim')).toBe(false);
+  });
+  it('§12.10 A1: grounding kept+clamped on SUPPORT relations, stripped from non-support', async () => {
+    const out = await call(new InMemoryStores(), 'write-graph-records', {
+      inputs: { ...base, verdict: { verdict: 'GO', quality: {} }, verify_status: { outcome: 'VERIFIED' }, records: [
+        { record_type: 'relation', record: { id: 'rHi', source_claim_id: 'c1', target_claim_id: 'c2', relation: 'support', grounding: 1.4 } },
+        { record_type: 'relation', record: { id: 'rOk', source_claim_id: 'c1', target_claim_id: 'c4', relation: 'support', grounding: 0.83 } },
+        { record_type: 'relation', record: { id: 'rLo', source_claim_id: 'c1', target_claim_id: 'c5', relation: 'support', grounding: -0.2 } },
+        { record_type: 'relation', record: { id: 'rQ', source_claim_id: 'c1', target_claim_id: 'c3', relation: 'qualify', grounding: 0.9 } },
+      ] },
+    });
+    const written = (ok(out) as { written: Array<{ record_type: string; record: Record<string, unknown> }> }).written;
+    const by = (id: string) => written.find((w) => w.record.id === id)!.record;
+    expect(by('rHi').grounding).toBe(1);    // clamped 1.4 → 1
+    expect(by('rOk').grounding).toBe(0.83); // in-range preserved
+    expect(by('rLo').grounding).toBe(0);    // clamped -0.2 → 0
+    expect(by('rQ').grounding).toBeUndefined(); // support-only: stripped from qualify
+  });
+  it('§12.11 vsz: correction marker kept on QUALIFY/REFUTE, stripped from other relations', async () => {
+    const out = await call(new InMemoryStores(), 'write-graph-records', {
+      inputs: { ...base, verdict: { verdict: 'GO', quality: {} }, verify_status: { outcome: 'VERIFIED' }, records: [
+        { record_type: 'relation', record: { id: 'rQ', source_claim_id: 'c1', target_claim_id: 'c2', relation: 'qualify', correction: true } },
+        { record_type: 'relation', record: { id: 'rR', source_claim_id: 'c1', target_claim_id: 'c3', relation: 'refute', correction: true } },
+        { record_type: 'relation', record: { id: 'rS', source_claim_id: 'c1', target_claim_id: 'c4', relation: 'support', correction: true } },
+      ] },
+    });
+    const written = (ok(out) as { written: Array<{ record_type: string; record: Record<string, unknown> }> }).written;
+    const by = (id: string) => written.find((w) => w.record.id === id)!.record;
+    expect(by('rQ').correction).toBe(true);        // qualify: kept
+    expect(by('rR').correction).toBe(true);        // refute: kept
+    expect(by('rS').correction).toBeUndefined();   // qualify/refute-only: stripped from support
   });
 });
 
@@ -288,6 +357,83 @@ describe('vectorize-and-store', () => {
     expect(p.text).toContain('It supports: "B is a metric".'); // {{edges}} computed from the committed relation
     expect(p.text).toContain('A improves B on dataset D'); // {{text}} {{caveats}}
     expect(p.payload).toMatchObject({ claim_status: 'empirical_result', run_id: 'run:x' }); // schema payload, present-only
+  });
+  // ── Scope-B B1.2 (lsqk.17): the alt-model (qwen) vector → the 768 "specter2" slot ──
+  it('embeds the alt-model vector into vector_alt when LAYER2_ALT_VECTOR=true', async () => {
+    const prev = process.env.LAYER2_ALT_VECTOR;
+    process.env.LAYER2_ALT_VECTOR = 'true';
+    try {
+      const stubAltEmbed: Embed = (text) => [text.length, 1, 1]; // distinguishable from gemini stub
+      const r = new Registry();
+      r.registerAll(
+        statePrimitives(stubEmbed, stubMint, stubNow, stubAssign, testRecordSchemas, stubAltEmbed),
+      );
+      const stores = new InMemoryStores();
+      const out = await invoke(deps(r, stores), {
+        id: 'vectorize-and-store',
+        version: 'v1',
+        inputs: { committed: [{ record_type: 'claim', record: { id: 'c1', content: { text: 'abcd' } } }] },
+      });
+      expect((ok(out) as { vector_ids: string[] }).vector_ids).toEqual(['vec:c1']);
+      // gemini (primary) + qwen alt over the SAME projection text → both slots populated.
+      expect(stores.dump('vector').kv.get('vec:c1')).toMatchObject({
+        vector: [4, 0, 0], // gemini
+        vector_alt: [4, 1, 1], // qwen alt → specter2 slot
+      });
+    } finally {
+      if (prev === undefined) delete process.env.LAYER2_ALT_VECTOR;
+      else process.env.LAYER2_ALT_VECTOR = prev;
+    }
+  });
+  it('★ an alt-embedder FAILURE must not fail the publish — gemini vector still written, alt slot left empty', async () => {
+    const prev = process.env.LAYER2_ALT_VECTOR;
+    process.env.LAYER2_ALT_VECTOR = 'true';
+    try {
+      const failingAlt: Embed = () => {
+        throw new Error('qwen provider unavailable');
+      };
+      const r = new Registry();
+      r.registerAll(
+        statePrimitives(stubEmbed, stubMint, stubNow, stubAssign, testRecordSchemas, failingAlt),
+      );
+      const stores = new InMemoryStores();
+      const out = await invoke(deps(r, stores), {
+        id: 'vectorize-and-store',
+        version: 'v1',
+        inputs: { committed: [{ record_type: 'claim', record: { id: 'c1', content: { text: 'abcd' } } }] },
+      });
+      // The step must SUCCEED: the alt vector is a hedge, not a precondition for publishing.
+      expect((ok(out) as { vector_ids: string[] }).vector_ids).toEqual(['vec:c1']);
+      const rec = stores.dump('vector').kv.get('vec:c1') as Record<string, unknown>;
+      expect(rec.vector).toEqual([4, 0, 0]); // primary gemini vector present
+      expect(rec.vector_alt).toBeUndefined(); // alt slot left for the backfill to fill
+    } finally {
+      if (prev === undefined) delete process.env.LAYER2_ALT_VECTOR;
+      else process.env.LAYER2_ALT_VECTOR = prev;
+    }
+  });
+  it('leaves vector_alt undefined when the gate is off (gemini-only write, even with an alt embedder wired)', async () => {
+    const prev = process.env.LAYER2_ALT_VECTOR;
+    delete process.env.LAYER2_ALT_VECTOR;
+    try {
+      const stubAltEmbed: Embed = (text) => [text.length, 1, 1];
+      const r = new Registry();
+      r.registerAll(
+        statePrimitives(stubEmbed, stubMint, stubNow, stubAssign, testRecordSchemas, stubAltEmbed),
+      );
+      const stores = new InMemoryStores();
+      await invoke(deps(r, stores), {
+        id: 'vectorize-and-store',
+        version: 'v1',
+        inputs: { committed: [{ record_type: 'claim', record: { id: 'c1', content: { text: 'abcd' } } }] },
+      });
+      const rec = stores.dump('vector').kv.get('vec:c1') as Record<string, unknown>;
+      expect(rec.vector).toEqual([4, 0, 0]); // gemini present
+      expect(rec.vector_alt).toBeUndefined(); // gate off → no alt embed (the flag, not the embedder, controls it)
+    } finally {
+      if (prev === undefined) delete process.env.LAYER2_ALT_VECTOR;
+      else process.env.LAYER2_ALT_VECTOR = prev;
+    }
   });
 });
 

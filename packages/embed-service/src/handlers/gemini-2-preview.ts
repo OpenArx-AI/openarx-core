@@ -109,7 +109,47 @@ export class Gemini2Handler implements ModelHandler {
     } else if (!allowFallback) {
       throw new Error('gemini-2-preview: Vertex SA not configured and fallback disabled');
     }
-    return retry(() => this.callOpenRouter(texts), { label: 'gemini2-openrouter', retries: 3 });
+    return this.callOpenRouterBatched(texts);
+  }
+
+  /** OpenRouter's embeddings endpoint silently returns FEWER vectors than requested for a large
+   *  input array — the 2026-07-26 ingest run sent 142 texts and got a short array back, which the
+   *  count check below turned into a loud 502 (correctly: a short array would otherwise misalign
+   *  every vector with its chunk). Vertex was called one text at a time so the limit never showed.
+   *
+   *  So split into sub-batches and concatenate, preserving order. The cap is deliberately
+   *  conservative — the exact provider limit is undocumented and the cost of a too-small batch is
+   *  only a few extra round-trips, while the cost of a too-large one is a failed document. */
+  private static readonly OPENROUTER_MAX_BATCH = 32;
+
+  private async callOpenRouterBatched(texts: string[]): Promise<{
+    vectors: number[][];
+    provider: string;
+    inputTokens: number;
+    cost: number;
+  }> {
+    const max = Gemini2Handler.OPENROUTER_MAX_BATCH;
+    if (texts.length <= max) {
+      return retry(() => this.callOpenRouter(texts), { label: 'gemini2-openrouter', retries: 3 });
+    }
+    const vectors: number[][] = [];
+    let inputTokens = 0;
+    let cost = 0;
+    for (let i = 0; i < texts.length; i += max) {
+      const part = await retry(() => this.callOpenRouter(texts.slice(i, i + max)), {
+        label: `gemini2-openrouter[${i}]`,
+        retries: 3,
+      });
+      vectors.push(...part.vectors);
+      inputTokens += part.inputTokens;
+      cost += part.cost;
+    }
+    if (vectors.length !== texts.length) {
+      throw new Error(
+        `gemini2-openrouter batched: assembled ${vectors.length} vectors for ${texts.length} texts`,
+      );
+    }
+    return { vectors, provider: 'openrouter', inputTokens, cost };
   }
 
   private async callVertex(text: string, taskType?: string): Promise<number[]> {

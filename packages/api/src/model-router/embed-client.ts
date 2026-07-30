@@ -19,6 +19,7 @@ import type { EmbedResponse } from '@openarx/types';
 
 export type EmbedModel =
   | 'specter2'
+  | 'qwen3-embedding-8b'
   | 'gemini-embedding-2-preview';
 
 export interface EmbedClientConfig {

@@ -6,12 +6,16 @@ import {
   loadCachedSearchPool,
   diversifyChunks,
   formatSearchResult,
+  SEARCH_POOL_TTL_SEC,
 } from '../shared/search-helpers.js';
+
+// batch-3 D1: surface the (now env-tunable) pool TTL in the copy instead of a hard-coded "5 minutes".
+const POOL_TTL_MIN = Math.max(1, Math.round(SEARCH_POOL_TTL_SEC / 60));
 
 export function registerPaginate(server: McpServer, ctx: AppContext): void {
   server.tool(
     'paginate',
-    'Continue from a previous search without re-running the full pipeline. Pass the `searchId` returned in any search response and an offset to fetch more results from the cached candidate pool. Cached for 5 minutes — for older searches re-run the original tool.',
+    `Continue from a previous search without re-running the full pipeline. Pass the \`searchId\` returned in any search response and an offset to fetch more results from the cached candidate pool. Cached for ~${POOL_TTL_MIN} minutes — for older searches re-run the original tool.`,
     {
       searchId: z.string().uuid().describe(
         'searchId from a previous search / search_keyword / search_semantic response',
@@ -25,7 +29,7 @@ export function registerPaginate(server: McpServer, ctx: AppContext): void {
       const cached = await loadCachedSearchPool(searchId);
       if (!cached) {
         return jsonResult({
-          error: 'Search pool not found or expired (5min TTL). Re-run the original search.',
+          error: `Search pool not found or expired (~${POOL_TTL_MIN}min TTL). Re-run the original search.`,
         });
       }
 

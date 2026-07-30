@@ -23,6 +23,7 @@
 // out: { ok } · access: dossier · effects: dossier.
 
 import { definePrimitive, type Registration } from '../../runtime/index.js';
+import { normaliseVerdict } from './verdict.js';
 
 export type Clock = () => string;
 
@@ -35,7 +36,7 @@ interface DossierMap {
   [k: string]: unknown;
 }
 interface Verdict {
-  verdict?: 'GO' | 'RETURN';
+  verdict?: string;
   next_dose?: { autonomy?: { level?: unknown } } | null;
   corrections?: Array<{ what?: unknown; topic?: unknown }>;
   patches?: unknown[];
@@ -77,7 +78,8 @@ export function makeUpdateDossier(now: Clock): Registration {
         patches_received: [...cur.patches_received],
         corrections: cur.corrections.map((c) => ({ ...c })),
       };
-      const v = inputs.verdict.verdict;
+      // Case-tolerant: "go" must not be read as a non-GO and silently skip the passed-unit.
+      const v = normaliseVerdict(inputs.verdict);
 
       // autonomy — ONLY from the carrier's next_dose.autonomy.level; never mechanical.
       const level = inputs.verdict.next_dose?.autonomy?.level;

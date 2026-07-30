@@ -15,6 +15,8 @@
 
 // ── Result shape ─────────────────────────────────────────────────────────────
 
+import { KNOWN_RELATIONS, KNOWN_ACTIVITY_TYPES } from '@openarx/types';
+
 export interface ValidationIssue {
   /** §8.2 reason code, e.g. 'schema_invalid'. */
   code: string;
@@ -47,15 +49,13 @@ function reqUnit(issues: Issues, v: unknown, path: string): void {
 // via a COORDINATED methodology version bump (methodist proposes verb lower_snake under the contracts
 // guardrail → registered → enum ↑ → enforced-set updated in lockstep). {depends_on,satisfies} is the
 // current engineering version; never widen either set silently — a change here IS a version event.
-const EPISTEMIC_RELATIONS = new Set([
-  'support',
-  'extend',
-  'qualify',
-  'refute',
-  'background',
-  'shared_evidence',
-  'same_as',
-]);
+// Derived from the DECLARED vocabulary rather than retyped. Twelve vocabularies are declared in
+// @openarx/types and this file imported none of them, keeping local copies instead — so "declared"
+// and "enforced" were two independent lists that nothing reconciled, and six fields ended up checked
+// as free strings while their vocabulary sat unused one package away (openarx-vz1c). Deriving
+// removes the possibility of drift. It changes no behaviour today, because the local copy happened
+// to be identical — which is the point: it was identical by luck, not by construction.
+const EPISTEMIC_RELATIONS: ReadonlySet<string> = new Set<string>(KNOWN_RELATIONS);
 const ENGINEERING_RELATIONS = new Set(['depends_on', 'satisfies']);
 
 // §12.1 bundle kinds (openarx-1ed5) — a CLOSED discriminator enum (like relation_class): it selects
@@ -69,7 +69,29 @@ const BUNDLE_TYPES = new Set(['ro_crate', 'narrative_synthesis']);
 // checkpoint_go/return path do NOT pass through this ward shape-check. This deterministic guard
 // replaces the LLM checkpoint-judge's fragile P-6 extrapolation (grading reproducibility).
 // Extensible BY-VERSION (e.g. a future c9 review-attestation type, openarx-t6ou).
-const WARD_SUBMITTABLE_ACTIVITY_TYPES = new Set(['version_closeout']);
+const WARD_SUBMITTABLE_ACTIVITY_TYPES: ReadonlySet<string> = new Set<string>(['version_closeout']);
+// A ward-submittable type ought to BE a real activity type. This check found on its first run that
+// it is not: 'version_closeout' — the only activity a ward may author (§12.1 closeout) — is absent
+// from KNOWN_ACTIVITY_TYPES. That is a genuine divergence between what the platform accepts and what
+// it declares, and it is the same gap that left six fields unvalidated (openarx-vz1c).
+//
+// It reports rather than throws, deliberately. The value is correct and in daily production use, so
+// the declaration is what is behind — and taking the service down over a stale declaration would
+// turn a documentation defect into an outage. Widening the vocabulary is a version event that goes
+// through contracts (see the note on the relation sets above), not a side effect of this file.
+const undeclaredWardActivityTypes = [...WARD_SUBMITTABLE_ACTIVITY_TYPES].filter(
+  (t) => !(KNOWN_ACTIVITY_TYPES as readonly string[]).includes(t),
+);
+if (undeclaredWardActivityTypes.length > 0) {
+  console.error(
+    JSON.stringify({
+      at: 'layer2-validate.vocabulary-drift',
+      field: 'activity_type',
+      accepted_but_undeclared: undeclaredWardActivityTypes,
+      note: 'the enforced subset is not contained in KNOWN_ACTIVITY_TYPES — declaration lags reality',
+    }),
+  );
+}
 
 /**
  * Validate a mentee-submitted record's SHAPE — the id-affecting fields authored at submit

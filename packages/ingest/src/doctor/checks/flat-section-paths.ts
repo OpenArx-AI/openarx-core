@@ -189,10 +189,10 @@ export function createFlatSectionPathsCheck(ctx: DoctorContext): CheckModule {
 
             let specter2Vectors: number[][] | undefined;
             try {
-              const s2Result = await ctx.embedClient!.callEmbed(batchTexts, 'specter2', { timeoutMs: 300_000 });
+              const s2Result = await ctx.embedClient!.callEmbed(batchTexts, 'qwen3-embedding-8b', { timeoutMs: 300_000 });
               specter2Vectors = s2Result.vectors;
             } catch {
-              log.warn({ sourceId: doc.source_id }, 'SPECTER2 embed failed, Gemini-only');
+              log.warn({ sourceId: doc.source_id }, '768-vector (qwen) embed failed, Gemini-only');
             }
 
             const points = batchChunks.map((chunk, j) => {

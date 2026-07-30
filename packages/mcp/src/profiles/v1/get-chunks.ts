@@ -173,6 +173,47 @@ export function registerGetChunks(server: McpServer, ctx: AppContext): void {
         response.strictMatchedChunks = rows.length - unknown;
       }
       if (importanceFallbackReason) response.chunkOrderNote = importanceFallbackReason;
+
+      // C4 (batch-2, PM 0335): a conjunctive-filter empty result reads as "no data" when it is
+      // really "these filters don't overlap" (e.g. section=Abstract ∩ contentType=[results] → 0,
+      // because Abstract chunks carry contentType='abstract', which the results-filter excludes).
+      // When the combined result is empty BUT the document has chunks and filters are active,
+      // diagnose each filter individually and explain the empty INTERSECTION (so the caller relaxes
+      // a filter rather than concluding the data is missing). Diagnostic queries run ONLY on empty.
+      if (rows.length === 0 && totalChunks > 0 && ((contentType && contentType.length > 0) || section || (entities && entities.length > 0))) {
+        const active: string[] = [];
+        const perFilter: Record<string, number> = {};
+        if (contentType && contentType.length > 0) {
+          active.push(`contentType=[${contentType.join(',')}]`);
+          const r = await ctx.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM chunks WHERE document_id = $1 AND is_latest = true AND (context->>'contentType' = ANY($2::text[]) OR context->>'contentType' IS NULL)`,
+            [documentId, contentType],
+          );
+          perFilter.contentType = parseInt(r.rows[0]?.c ?? '0', 10);
+        }
+        if (section) {
+          active.push(`section="${section}"`);
+          const r = await ctx.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM chunks WHERE document_id = $1 AND is_latest = true AND (section_path ILIKE $2 OR context->>'sectionPath' ILIKE $2)`,
+            [documentId, `${section}%`],
+          );
+          perFilter.section = parseInt(r.rows[0]?.c ?? '0', 10);
+        }
+        if (entities && entities.length > 0) {
+          active.push(`entities=[${entities.join(',')}]`);
+          const r = await ctx.pool.query<{ c: string }>(
+            `SELECT count(*)::text AS c FROM chunks WHERE document_id = $1 AND is_latest = true AND (EXISTS (SELECT 1 FROM jsonb_array_elements_text(coalesce(context->'entities', '[]'::jsonb)) e WHERE LOWER(e) = ANY($2::text[])) OR coalesce(jsonb_array_length(context->'entities'), 0) = 0)`,
+            [documentId, entities.map((e) => e.toLowerCase())],
+          );
+          perFilter.entities = parseInt(r.rows[0]?.c ?? '0', 10);
+        }
+        response.filterMatchCounts = perFilter;
+        response.filterNote =
+          `0 chunks match all ${active.length} filters together (${active.join(' ∩ ')}), ` +
+          `though the document has ${totalChunks} chunks — this is an empty filter INTERSECTION, not missing data. ` +
+          `Each filter individually matches: ${Object.entries(perFilter).map(([k, v]) => `${k}→${v}`).join(', ')}. ` +
+          `Relax or drop the most restrictive filter (a filter matching 0 excludes everything; filters all >0 but 0 together simply don't overlap).`;
+      }
       return jsonResult(response);
     },
   );

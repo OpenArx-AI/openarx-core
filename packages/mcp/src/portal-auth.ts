@@ -85,6 +85,51 @@ export function credentialFromToken(
 }
 
 /**
+ * The STABLE run-OWNER hash — a one-way sha256(userId) (contracts "EMPTY_LOG KEYING FIX",
+ * §8-inv4/§12.2). Unlike credentialFromToken (the userId|tokenId COMPOSITE, which rotates on
+ * token-refresh), this is anchored to the STABLE principal (userId) and is therefore IMMUNE to
+ * token-refresh — the basis for run-ownership validation (a token-refreshed mentee still OWNS its
+ * own run; a different userId does NOT). One-way like the composite, so it adds NO reversible
+ * identity exposure (§12.2 preserved). SINGLE SOURCE — used both where create-run persists a run's
+ * owner_hash AND where the tool-call boundary validates ownership. 'anonymous' with no userId.
+ */
+export function ownerHashFromToken(token: { userId?: string } | undefined): string {
+  const userId = token?.userId;
+  if (!userId) return 'anonymous';
+  return 'own:' + createHash('sha256').update(userId).digest('hex').slice(0, 40);
+}
+
+/**
+ * The run-ownership decision for a THREADED run_id at the tool-call boundary (§8-inv4 run_id-threading,
+ * contracts EMPTY_LOG KEYING FIX). Pure so the security logic is exhaustively unit-testable.
+ *   - `ownerHash`: from getRunOwnerHash — a string (owner recorded), `null` (a PRE-CHANGE run, no
+ *     owner recorded), or `undefined` (NO SUCH run).
+ *   - `callerOwner`: ownerHashFromToken(callerToken) — the STABLE sha256(userId), refresh-immune.
+ *   - `lookupFaulted`: the store read threw (infra) — never REJECT a legit call on an infra blip.
+ * Outcomes: `reject` (unknown_run / run_ownership_denied → REJECT-HARD before the tool runs),
+ * `attribute` (OWNED → key the tool-log by run_id, run-anchored), `fallback` (pre-change run OR
+ * lookup-fault → credential keying, backward-compat; the un-threaded row is read via the crosscheck's
+ * credential+window fallback). NB: ownership is userId-level — a token-refreshed mentee still OWNS its
+ * run (callerOwner is stable), while a DIFFERENT principal's owner hash never matches.
+ */
+export type RunOwnershipOutcome =
+  | { kind: 'reject'; error: 'unknown_run' | 'run_ownership_denied' }
+  | { kind: 'attribute' }
+  | { kind: 'fallback' };
+
+export function classifyRunOwnership(
+  ownerHash: string | null | undefined,
+  callerOwner: string,
+  lookupFaulted: boolean,
+): RunOwnershipOutcome {
+  if (lookupFaulted) return { kind: 'fallback' };
+  if (ownerHash === undefined) return { kind: 'reject', error: 'unknown_run' };
+  if (typeof ownerHash === 'string' && ownerHash !== callerOwner) return { kind: 'reject', error: 'run_ownership_denied' };
+  if (ownerHash === callerOwner) return { kind: 'attribute' };
+  return { kind: 'fallback' }; // ownerHash === null → a pre-change run, ownership indeterminate
+}
+
+/**
  * Validate a Bearer token against Portal's internal API.
  * Returns cached result if available and fresh.
  */

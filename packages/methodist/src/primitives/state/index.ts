@@ -31,6 +31,9 @@ export function statePrimitives(
   now: Clock,
   assignId: AssignId,
   recordSchemas: Record<string, { vector?: unknown } | undefined> = {},
+  // Scope-B B1.2 (lsqk.17): alt-model (qwen) embedder → the 768 "specter2" slot; gated by
+  // LAYER2_ALT_VECTOR in vectorize-and-store (inert until enabled).
+  embedAlt?: Embed,
 ): Registration[] {
   return [
     makeCreateRun(mintId),
@@ -45,6 +48,7 @@ export function statePrimitives(
         string,
         { vector?: import('../../adapters/embed.js').VectorSchema } | undefined
       >,
+      embedAlt,
     ),
     linkSupersedesPrimitive,
     createCorrectiveActivityPrimitive,

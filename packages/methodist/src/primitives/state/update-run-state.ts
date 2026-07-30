@@ -17,6 +17,7 @@
 import { definePrimitive, RuntimeError, type Registration } from '../../runtime/index.js';
 import { normalizeCycle } from './cycle-label.js';
 import { deriveDose, type DoseCell } from '../algorithmic/derive-dose.js';
+import { isUnrecognisedVerdict, normaliseVerdict } from './verdict.js';
 
 interface RunNode {
   current_stage?: number | null;
@@ -26,7 +27,7 @@ interface RunNode {
   need?: unknown;
   [field: string]: unknown;
 }
-type Verdict = { verdict?: 'GO' | 'RETURN' } | 'GO' | 'RETURN';
+type Verdict = { verdict?: string } | string;
 interface In {
   run_id: string;
   stage?: number;
@@ -58,7 +59,10 @@ interface Params {
 
 function verdictValue(v: Verdict | undefined): 'GO' | 'RETURN' | undefined {
   if (v === undefined) return undefined;
-  return typeof v === 'string' ? v : v.verdict;
+  // Case- and whitespace-tolerant: the model alternates "RETURN" and "return" between calls, and a
+  // strict comparison silently matched neither branch. An unrecognised value raises upstream rather
+  // than being read as "no verdict".
+  return normaliseVerdict(v);
 }
 
 export const updateRunStatePrimitive: Registration = definePrimitive<
@@ -108,6 +112,18 @@ export const updateRunStatePrimitive: Registration = definePrimitive<
     if (inputs.status !== undefined) next.status = inputs.status;
     if (inputs.need !== undefined) next.need = inputs.need;
     if (inputs.dose !== undefined) next.dose = inputs.dose;
+
+    // A verdict we cannot read is not "no verdict". Falling through here is how a checkpoint came to
+    // report success while advancing nothing: the grader HAD ruled, we simply failed to recognise
+    // the word. Raise instead — an unreadable ruling must stop the run, not pass as consent.
+    if (isUnrecognisedVerdict(inputs.verdict)) {
+      throw new RuntimeError(
+        'bad-output',
+        `unrecognised verdict ${JSON.stringify(
+          typeof inputs.verdict === 'string' ? inputs.verdict : (inputs.verdict as { verdict?: unknown })?.verdict,
+        )} — expected GO or RETURN (any casing)`,
+      );
+    }
 
     if (verdict === 'GO') {
       // mark GO for the stage just judged; advance unless explicitly held (course)

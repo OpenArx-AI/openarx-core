@@ -121,30 +121,43 @@ export function registerSearch(server: McpServer, ctx: AppContext): void {
       const { vector, vectorName } = await timed('embed', () => embedQuery(query, vectorModel, ctx));
 
       const useRerank = strategy === 'rerank';
-      // Fetch wider candidate pool when filters likely shrink results
+      // batch-3 D2: fetch a wide candidate pool when filters likely shrink results — for BOTH
+      // strategies. The rerank path used max(15, limit*3) regardless of filters, then a selective
+      // content-type filter applied AFTER a top-15 rerank collapsed a filtered rerank to ~1 (vs ~10
+      // on fast). Now the pool is filter-aware AND the filter runs BEFORE the rerank (stage 3).
       const hasFilters = !!(categories || dateFrom || dateTo || contentType || entities);
-      const candidateCount = useRerank
-        ? Math.max(RERANK_CANDIDATE_COUNT, limit * 3)
-        : (hasFilters ? Math.max(50, limit * 5) : Math.max(30, limit * 3));
+      const candidateCount = hasFilters
+        ? Math.max(50, limit * 5)
+        : useRerank
+          ? Math.max(RERANK_CANDIDATE_COUNT, limit * 3)
+          : Math.max(30, limit * 3);
 
       // Stage 1: Retrieve candidates with hybrid fusion (no diversification at vector layer
-      // any more — we do it after chunk-context filters in stage 6)
+      // any more — we do it after chunk-context filters in stage 4)
       const [vectorRaw, bm25Raw] = await Promise.all([
         timed('qdrant', () => ctx.vectorStore.search(vector, vectorName, candidateCount)),
         timed('bm25', () => ctx.searchStore.searchBM25(query, candidateCount)),
       ]);
 
       const tMerge = performance.now();
-      let ranked = mergeHybridResults(vectorRaw, bm25Raw);
+      const merged = mergeHybridResults(vectorRaw, bm25Raw);
       recordStage('merge', performance.now() - tMerge);
 
-      // Stage 2 (rerank only): Cross-encoder reranking
-      if (useRerank) {
-        const candidates = ranked.slice(0, RERANK_CANDIDATE_COUNT);
+      // Stage 2: Hydrate chunk context from PG for chunks lacking markers in the vector payload
+      // (pre-backfill state), then apply chunk-context filters — BEFORE reranking (D2), so a filtered
+      // rerank ranks the relevant (e.g. survey-only) chunks, not the global top-N a filter cuts to ~1.
+      let chunks: RankedChunk[] = await timed('hydrate', () => hydrateChunkContexts(merged as RankedChunk[], ctx));
+      if (contentType || entities) {
+        chunks = applyChunkContextFilters(chunks, { contentType, entities });
+      }
+
+      // Stage 3 (rerank only): Cross-encoder reranking over the FILTERED pool.
+      if (useRerank && chunks.length > 0) {
+        const candidates = chunks.slice(0, RERANK_CANDIDATE_COUNT);
         try {
           const passages = candidates.map((c) => c.content);
           const rerankResult = await timed('rerank', () => ctx.rerankerClient.rerank(query, passages));
-          ranked = rerankResult.scores.map((s) => ({
+          chunks = rerankResult.scores.map((s) => ({
             ...candidates[s.index],
             finalScore: s.score,
           }));
@@ -152,15 +165,6 @@ export function registerSearch(server: McpServer, ctx: AppContext): void {
           // Graceful degradation
           console.error('[v1/search] Reranker unavailable, falling back to fast:', err instanceof Error ? err.message : err);
         }
-      }
-
-      // Stage 3: Hydrate chunk context from PG for chunks lacking markers
-      // in Qdrant payload (pre-backfill state).
-      let chunks: RankedChunk[] = await timed('hydrate', () => hydrateChunkContexts(ranked as RankedChunk[], ctx));
-
-      // Stage 4: Chunk-context filters (contentType, entities)
-      if (contentType || entities) {
-        chunks = applyChunkContextFilters(chunks, { contentType, entities });
       }
 
       // Stage 5: Document-level filters (categories, dates)

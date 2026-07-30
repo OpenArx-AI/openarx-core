@@ -68,10 +68,8 @@ export class DefaultModelRouter implements ModelRouter {
 export { AnthropicLlm } from './anthropic-llm.js';
 export { OpenRouterLlm } from './openrouter-llm.js';
 export { VertexLlm } from './vertex-llm.js';
-export { Specter2Client } from './specter2-client.js';
 export { RerankerClient } from './reranker-client.js';
 export type { RerankResult, RerankResponse } from './reranker-client.js';
-export { EmbeddingPool } from './embedding-pool.js';
 export { EmbedClient, type EmbedClientConfig, type EmbedClientRequestOverrides, type EmbedModel } from './embed-client.js';
 export { retry, type RetryOptions } from './retry.js';
 export { makeLlmLangId, DEFAULT_LANG_DETECT_MODEL, type LangResult, type CompleteText } from './llm-lang-id.js';

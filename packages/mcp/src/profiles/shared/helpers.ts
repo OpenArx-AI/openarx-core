@@ -40,7 +40,9 @@ export async function embedQuery(
   ctx: AppContext,
 ): Promise<{ vector: number[]; vectorName: string }> {
   if (vectorModel === 'specter2') {
-    const resp = await ctx.embedClient.callEmbed([query], 'specter2', { timeoutMs: 300_000 });
+    // The physical 768-dim slot is named "specter2" but holds qwen vectors since the
+    // embedding_qwen_migration (Stage-2). Embed the query with qwen; search the same slot.
+    const resp = await ctx.embedClient.callEmbed([query], 'qwen3-embedding-8b', { timeoutMs: 300_000 });
     recordEmbed(resp);
     return { vector: resp.vectors[0], vectorName: 'specter2' };
   }

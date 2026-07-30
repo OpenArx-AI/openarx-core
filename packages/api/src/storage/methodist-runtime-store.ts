@@ -54,9 +54,28 @@ export async function logRunToolCall(runId: string, tool: string): Promise<void>
  * Record a LIVE tool call by an authenticated credential (migration 048). The gateway
  * MCP call-interception writes here for every researcher tool call — the real anti-gaming
  * tool-log (§8 inv-4). Best-effort: a journal failure must never break the tool call.
+ *
+ * §8-inv4 run_id-threading (migration 053, contracts EMPTY_LOG KEYING FIX): when the mentee
+ * threads a run_id (and the boundary validated ownership) the row is ALSO run-anchored — the
+ * crosscheck then reads it by run_id, immune to token-refresh credential divergence (the empty_log
+ * root). `runId` omitted/null → credential-only row (the backward-compatible pre-threading path).
  */
-export async function logMethodistToolCall(credentialId: string, tool: string): Promise<void> {
-  await query(`INSERT INTO methodist_tool_log (credential_id, tool) VALUES ($1, $2)`, [credentialId, tool]);
+export async function logMethodistToolCall(credentialId: string, tool: string, runId?: string | null): Promise<void> {
+  await query(`INSERT INTO methodist_tool_log (credential_id, tool, run_id) VALUES ($1, $2, $3)`, [credentialId, tool, runId ?? null]);
+}
+
+/**
+ * The STABLE run-owner hash (sha256(userId), 'own:'-prefixed) a run node carries — the run-ownership
+ * basis for the tool-call boundary (§8-inv4 run_id-threading, contracts EMPTY_LOG KEYING FIX).
+ * Returns: the owner_hash string; `null` for a PRE-CHANGE run (created before owner_hash existed →
+ * ownership indeterminate → the boundary falls back, never rejects, backward-compat); `undefined`
+ * for NO SUCH run (the boundary REJECT-HARDs — invalid/foreign run_id). Throws only on a store fault
+ * (the boundary treats a fault as fallback, not a reject, so an infra blip never blocks a call).
+ */
+export async function getRunOwnerHash(runId: string): Promise<string | null | undefined> {
+  const run = (await neoGet('run', 'run_id', runId)) as { owner_hash?: string | null } | undefined;
+  if (run === undefined) return undefined;
+  return run.owner_hash ?? null;
 }
 
 /** Per-call door-model LLM cost ledger row (migration 052, Console 694n). Persists what the
@@ -102,8 +121,7 @@ export async function recordMethodistLlmCost(row: {
  */
 export async function listRunToolLog(runId: string): Promise<Array<{ run_id: string; tool: string }>> {
   const run = (await neoGet('run', 'run_id', runId)) as { credential_id?: string } | undefined;
-  const credentialId = run?.credential_id;
-  if (!credentialId) return [];
+  const credentialId = run?.credential_id ?? null;
   // openarx-abvc (B): window the tool-log to the CURRENT stage — from the last checkpoint_go
   // (the GO that advanced into this stage), NOT the whole run. Whole-run mixes earlier stages'
   // tool calls into the crosscheck → a false `logged_not_claimed` for an honest zero-usage stage
@@ -116,12 +134,21 @@ export async function listRunToolLog(runId: string): Promise<Array<{ run_id: str
      )::text AS started`,
     [runId],
   );
-  const started = startRow.rows[0]?.started;
+  const started = startRow.rows[0]?.started ?? null;
+  // §8-inv4 run_id-threading (migration 053, contracts EMPTY_LOG KEYING FIX) — DUAL-KEY read:
+  //   PRIMARY  = rows attributed DIRECTLY by run_id (written when the mentee threaded run_id +
+  //              the boundary validated ownership) → immune to token-refresh credential divergence.
+  //   FALLBACK = un-threaded rows (run_id IS NULL) by credential+window (the pre-threading path;
+  //              a token-refresh scatters these across credentials → the crosscheck's note-iii
+  //              inconclusive/benign path, NEVER fabrication). Kept so the transition doesn't
+  //              orphan un-threaded rows (contracts point 2: dual-key, not a clean cutover).
+  // The stage window applies to BOTH branches (an honest zero-usage stage stays clean).
   const r = await query<{ tool: string }>(
-    started
-      ? `SELECT tool FROM methodist_tool_log WHERE credential_id = $1 AND called_at >= $2 ORDER BY called_at`
-      : `SELECT tool FROM methodist_tool_log WHERE credential_id = $1 ORDER BY called_at`,
-    started ? [credentialId, started] : [credentialId],
+    `SELECT tool FROM methodist_tool_log
+      WHERE ( run_id = $1 ${started ? 'AND called_at >= $3' : ''} )
+         OR ( run_id IS NULL AND credential_id = $2 ${started ? 'AND called_at >= $3' : ''} )
+      ORDER BY called_at`,
+    started ? [runId, credentialId, started] : [runId, credentialId],
   );
   return r.rows.map((x) => ({ run_id: runId, tool: x.tool }));
 }

@@ -91,7 +91,14 @@ function edgesFor(
   return edges;
 }
 
-export function makeVectorizeAndStore(embed: Embed, recordSchemas: SchemaMap = {}): Registration {
+export function makeVectorizeAndStore(
+  embed: Embed,
+  recordSchemas: SchemaMap = {},
+  // Scope-B B1.2 (lsqk.17): the alt-model embedder (qwen) for the 768 "specter2" slot. Optional +
+  // env-gated (LAYER2_ALT_VECTOR) so the code is inert until enabled — the slot already exists in
+  // layer2_claims (no schema-op, unlike gemini_eng). When absent/off, the write is gemini-only.
+  embedAlt?: Embed,
+): Registration {
   return definePrimitive<Record<string, never>, In, Out>(
     {
       id: 'vectorize-and-store',
@@ -160,6 +167,31 @@ export function makeVectorizeAndStore(embed: Embed, recordSchemas: SchemaMap = {
           const embEng = buildEmbed(flat, vectorSchema, { run, edges: renderEdges(engEdgesList) });
           vectorEng = await embed(embEng.text);
         }
+        // Scope-B B1.2 (lsqk.17): the alt-model (qwen) vector over the SAME §7 scientific projection
+        // (emb.text — identical text gemini embeds) → the 768 "specter2" slot. add-alt-only, no
+        // methodology-logic change: gives cross-model agreement/associations (contracts I10 hedge).
+        // GATED by LAYER2_ALT_VECTOR so deploy is inert until the flag is set (slot already exists).
+        //
+        // ★ BEST-EFFORT ON PURPOSE. gemini is the PRIMARY vector and the alt slot is an
+        // availability/agreement hedge, so a hiccup in the alt provider must NOT be able to fail a
+        // ward's publish — that would let a hedge take down the thing it is hedging. On failure we
+        // log and continue with the gemini vector alone; the missing alt vector is recoverable
+        // afterwards by the same backfill that filled the slot for the existing 3250 claims.
+        let vectorAlt: number[] | undefined;
+        if (process.env.LAYER2_ALT_VECTOR === 'true' && embedAlt) {
+          try {
+            vectorAlt = await embedAlt(emb.text);
+          } catch (err) {
+            console.error(
+              JSON.stringify({
+                at: 'vectorize-and-store.alt-embed-failed',
+                claim_id: id,
+                error: err instanceof Error ? err.message : String(err),
+                note: 'gemini vector written; 768 alt slot left empty, recoverable by backfill',
+              }),
+            );
+          }
+        }
         const vecId = `vec:${id}`;
         // Hand the embedded vector(s) + schema payload to the injected vector store; the
         // store-provider adds the computed ClaimPointPayload fields and upserts to Qdrant.
@@ -168,6 +200,7 @@ export function makeVectorizeAndStore(embed: Embed, recordSchemas: SchemaMap = {
           ref: id,
           vector,
           vector_eng: vectorEng,
+          vector_alt: vectorAlt, // Scope-B B1.2: qwen → specter2 slot (undefined when gate off)
           is_engineering_connected: engEdgesList.length > 0,
           payload: emb.payload,
           text: emb.text,

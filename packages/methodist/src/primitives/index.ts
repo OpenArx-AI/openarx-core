@@ -22,6 +22,9 @@ export interface PrimitiveDeps {
   langId: LangId;
   /** query/text embedder (search-semantic, vectorize-and-store) */
   embed: Embed;
+  /** Scope-B B1.2 (lsqk.17): alt-model (qwen) embedder → the 768 "specter2" slot in
+   *  vectorize-and-store; gated by LAYER2_ALT_VECTOR (inert until enabled). */
+  embedAlt?: Embed;
   /** run-id source (create-run) */
   mintId: MintId;
   /** clock for dossier deltas (update-dossier) */
@@ -44,6 +47,7 @@ export function allPrimitives(deps: PrimitiveDeps): Registration[] {
       deps.now,
       deps.assignId,
       deps.recordSchemas as Record<string, { vector?: unknown } | undefined> | undefined,
+      deps.embedAlt,
     ),
     ...modelPrimitives(),
   ];

@@ -1,6 +1,6 @@
 {
   "name": "@openarx/mcp",
-  "version": "0.4.0",
+  "version": "0.3.0",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx --test 'src/**/*.test.ts'"
+    "test": "tsx --test 'src/**/*.test.ts'",
+    "test:find-related": "CORE_INTERNAL_SECRET=test-only node --test --import tsx src/profiles/methodist-v2/__tests__/find-related-claims.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

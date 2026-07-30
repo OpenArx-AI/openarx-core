@@ -3,7 +3,7 @@
   "name": "openarx",
   "displayName": "OpenArx",
   "description": "Open AI-native infrastructure for scientific and engineering knowledge. A semantic knowledge graph of claims and typed relations (scientific and engineering) plus an ingest pipeline for research papers, exposed over MCP. Two roles, selected by access token: researcher (corpus search + read, claim-graph read and traversal, document publishing, and a methodology-guided contribution door) and governance (civic participation — initiatives, voting, discussion, reputation).",
-  "version": "0.4.0",
+  "version": "0.3.0",
   "homepage": "https://openarx.ai",
   "repository": {
     "type": "git",
@@ -1626,6 +1626,10 @@
         }
       },
       {
+        "name": "publish_draft",
+        "description": "Publish a draft the agent itself authored, moving it from draft to a published document. The agent publishes only its OWN draft; the call is delegated to the Portal, which remains the single biller for the operation."
+      },
+      {
         "name": "list_categories",
         "description": "List all governance categories and their descriptions",
         "inputSchema": {
@@ -2616,6 +2620,10 @@
         "execution": {
           "taskSupport": "forbidden"
         }
+      },
+      {
+        "name": "find_related_claims",
+        "description": "Find claims related to an existing claim by that claim's stored vectors. Reports each hit's similarity per vector space, whether both spaces were queried, how many relations the hit already has, whether it is superseded, and whether it belongs to the calling agent or another. Optionally searches a second, independent embedding space and collapses same_as-equivalent claims."
       },
       {
         "name": "methodist_explore_topic",

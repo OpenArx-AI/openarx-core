@@ -9,12 +9,13 @@ import { createContext, type AppContext } from './context.js';
 import { getProfile, getAllProfiles } from './profiles/registry.js';
 import { isTokenTypeSufficient } from './profiles/types.js';
 import { roleFor, V4_ROLES, type V4Role } from './profiles/v4/index.js';
-import { logMethodistToolCall } from '@openarx/api';
+import { logMethodistToolCall, getRunOwnerHash } from '@openarx/api';
+import { z } from 'zod';
 import { requiredScope, SCOPE_READ, SCOPE_METHODIST } from './profiles/scopes.js';
 import { registerInternalRoutes } from './internal-routes.js';
 import { registerUploadRoutes } from './upload-routes.js';
 import { registerAdminRoutes } from './admin-routes.js';
-import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, applyPublishRefund, credentialFromToken, type PublishRefundOp, type TokenInfo } from './portal-auth.js';
+import { isPortalAuthEnabled, verifyToken, deductCredit, hasPermission, checkTier, toolCheck, toolDeduct, applyPublishRefund, credentialFromToken, ownerHashFromToken, classifyRunOwnership, type PublishRefundOp, type TokenInfo } from './portal-auth.js';
 import { logRequest, extractResultSummary } from './request-logger.js';
 import { getCostKey, isDryRunCall } from './cost-key.js';
 import { resolveAgentId, getAgentReputation, getAgentTier } from './gov-identity.js';
@@ -41,6 +42,12 @@ const METHODIST_MECHANISM_DOORS = new Set([
   'methodist_escalate',
   'methodist_get_my_development',
 ]);
+
+// §15.9 agent-publish-draft (billing=A, contracts): publish_draft is billed PORTAL-side inline
+// (single-biller — Portal owns resolve+publish+charge, mirroring the /:id/index UI path). Core must
+// NOT pre-check or deduct for it (else a double-charge). The deduct is already skipped via the tool
+// result's __skipBilling marker; this set also skips the Core affordability PRE-check.
+const PORTAL_BILLED_TOOLS = new Set(['publish_draft']);
 
 // Layer2 PG-graph consumers were removed with the PG→Neo4j teardown (openarx-1woy) + the dead-code
 // cleanup (openarx-contracts-9xgj): the embed worker (PG layer2_claims → Qdrant) + the §7.6 dedup
@@ -241,6 +248,22 @@ async function main(): Promise<void> {
       console.error(`[oauth-proxy] Error proxying ${req.method} ${req.url}: ${err instanceof Error ? err.message : err}`);
       res.status(502).json({ error: 'oauth_proxy_error' });
     }
+  });
+
+  // Directory-ownership proof for the Glama MCP directory. Glama verifies that whoever claims the
+  // connector controls the server's domain, by fetching this file and matching the maintainer email
+  // against the claiming account. Static, unauthenticated and deliberately minimal: it proves domain
+  // control and nothing else — no capability, endpoint or version information belongs here, since it
+  // is served to anyone who asks and would be one more copy to drift.
+  //
+  // Served by the application rather than the web server on purpose: this host already answers the
+  // other .well-known routes from here, so ownership of the answer stays with the service that owns
+  // the surface being claimed.
+  app.get('/.well-known/glama.json', (_req: Request, res: Response) => {
+    res.json({
+      $schema: 'https://glama.ai/mcp/schemas/connector.json',
+      maintainers: [{ email: 'wlad@wlad.com.ua' }],
+    });
   });
 
   // Protected Resource Metadata — tells clients this resource requires OAuth2.
@@ -726,6 +749,24 @@ async function main(): Promise<void> {
       }
       const args = [name, ...rest];
       const handlerIdx = args.findIndex((a, i) => i > 0 && typeof a === 'function');
+      // §8-inv4 run_id-threading (contracts EMPTY_LOG KEYING FIX): expose an OPTIONAL run_id on every
+      // LOGGED research-tool (exactly the crosscheck-logged set — the researcher role minus the
+      // methodist MECHANISM doors, the same condition the tool-log write uses below) so a mentee can
+      // attribute the call to its run. Run-anchored → immune to the token-refresh credential
+      // divergence that is the empty_log root. The schema is the object arg before the handler (this
+      // codebase uses no annotations arg); the tool handler ignores run_id — the handler-wrapper below
+      // reads it, validates ownership (REJECT-HARD on a foreign/absent run_id), and keys the tool-log.
+      if (isV4 && effId === 'researcher' && !METHODIST_MECHANISM_DOORS.has(name) && handlerIdx > 1) {
+        const schema = args[handlerIdx - 1];
+        if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+          (schema as Record<string, unknown>).run_id = z
+            .string()
+            .optional()
+            .describe(
+              'Optional. The active methodist run_id (as returned by the methodist diagnose / get_current_dose door). Pass it whenever you call this tool while working inside a run, so the call is attributed to that run for the §8 usage crosscheck — attribution is run-anchored, so it stays correct even if your access token refreshes mid-run. Must be YOUR run: a run_id owned by a different principal, or a non-existent run_id, is rejected.',
+            );
+        }
+      }
       if (handlerIdx > 0) {
         const originalHandler = args[handlerIdx] as (...a: unknown[]) => Promise<unknown>;
         args[handlerIdx] = async (...handlerArgs: unknown[]) => {
@@ -757,13 +798,45 @@ async function main(): Promise<void> {
           //   • 2f: key the log by the SAME credential the run node carries
           //     (credentialFromToken → the (userId,tokenId) composite), NOT the raw userId —
           //     else listRunToolLog (which looks up by run.credential_id) finds nothing.
+          //   • §8-inv4 run_id-threading (contracts EMPTY_LOG KEYING FIX): if the mentee threaded a
+          //     run_id, VALIDATE OWNERSHIP against the run's STABLE owner_hash (sha256(userId)) and
+          //     attribute the row to the RUN (run-anchored → immune to the token-refresh credential
+          //     divergence that is the empty_log root). Ownership is userId-level, NOT the per-token
+          //     composite: a token-refreshed mentee still OWNS its run; a DIFFERENT principal does not.
           if (
             isV4 &&
             effId === 'researcher' &&
             portalToken?.userId &&
             !METHODIST_MECHANISM_DOORS.has(name)
           ) {
-            void logMethodistToolCall(credentialFromToken(portalToken), name).catch((e) =>
+            const argsObj = handlerArgs[0] as Record<string, unknown> | undefined;
+            const rawRunId = argsObj?.run_id;
+            // Never surface run_id to the tool handler (it is a gateway concern; would otherwise leak
+            // into a tool's ...rest / metadata, e.g. publish payloads).
+            if (argsObj && 'run_id' in argsObj) delete argsObj.run_id;
+            const threadedRunId = typeof rawRunId === 'string' && rawRunId.length > 0 ? rawRunId : null;
+            let attributeRunId: string | null = null;
+            if (threadedRunId) {
+              let ownerHash: string | null | undefined;
+              let lookupFaulted = false;
+              try {
+                ownerHash = await getRunOwnerHash(threadedRunId);
+              } catch {
+                lookupFaulted = true; // infra blip → fall back to credential keying, never REJECT a legit call
+              }
+              const decision = classifyRunOwnership(ownerHash, ownerHashFromToken(portalToken), lookupFaulted);
+              if (decision.kind === 'reject') {
+                // REJECT-HARD before the tool runs (unknown_run = invalid; run_ownership_denied = framing).
+                const message =
+                  decision.error === 'unknown_run'
+                    ? 'The run_id does not reference an existing run. Omit run_id, or pass the run_id the methodist diagnose door returned.'
+                    : 'This run_id belongs to a different principal. You may only attribute tool calls to your own runs.';
+                return { content: [{ type: 'text', text: JSON.stringify({ error: decision.error, message, run_id: threadedRunId }) }], isError: true };
+              }
+              if (decision.kind === 'attribute') attributeRunId = threadedRunId;
+              // decision.kind === 'fallback' → pre-change run / lookup-fault → credential keying below.
+            }
+            void logMethodistToolCall(credentialFromToken(portalToken), name, attributeRunId).catch((e) =>
               console.error('[methodist tool-log]', e instanceof Error ? e.message : e),
             );
           }
@@ -822,8 +895,9 @@ async function main(): Promise<void> {
               }
             }
 
-            // Pre-check: can user afford this tool?
-            if (portalToken?.userId && !dryRun) {
+            // Pre-check: can user afford this tool? (skipped for Portal-billed tools — §15.9
+            // publish_draft charges Portal-side inline, so a Core pre-check would double-count.)
+            if (portalToken?.userId && !dryRun && !PORTAL_BILLED_TOOLS.has(name)) {
               // For gov tools: fetch agent reputation for discount calculation
               let agentReputation: number | undefined;
               if (isGovSurface && toolArgs.agentId) {

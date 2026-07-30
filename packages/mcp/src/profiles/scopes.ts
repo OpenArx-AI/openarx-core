@@ -34,6 +34,7 @@ export const TOOL_REQUIRED_SCOPE: Record<string, string> = {
   submit_document: SCOPE_WRITE_DOCUMENTS,
   create_new_version: SCOPE_WRITE_DOCUMENTS,
   create_draft: SCOPE_WRITE_DOCUMENTS,
+  publish_draft: SCOPE_WRITE_DOCUMENTS, // §15.9 agent-publish-own-draft
   create_upload_url: SCOPE_WRITE_DOCUMENTS,
   // ── methodist channel ──
   methodist_diagnose: SCOPE_METHODIST,

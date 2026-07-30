@@ -105,7 +105,23 @@ export function makeValidateSchema(validateShape?: ValidateShape): Registration 
         return { outputs: { valid: true, errors: [] } };
       }
       // Fallback structural mini-schema (base ⊕ overlay) — no injected validator.
-      if (!params.base_schema) return { outputs: { valid: true, errors: [] } }; // no spec resolved → nothing to check
+      if (!params.base_schema) {
+        // Reaching here means NOTHING validated the records: the real validator was not injected AND
+        // the methodology declared no schema. Returning valid:true is the only safe control flow —
+        // procedures legitimately use this primitive with no schema — but it must not be silent.
+        // A checkpoint that validated nothing and said 'valid' is the failure mode this whole surface
+        // has been losing days to (openarx-vz1c and siblings): success reported without a check.
+        if (inputs.records !== undefined || inputs.record !== undefined) {
+          console.error(
+            JSON.stringify({
+              at: 'validate-schema.nothing-checked',
+              reason: validateShape ? 'no base_schema resolved' : 'no validator injected and no base_schema',
+              note: 'records passed through unvalidated — valid:true here means UNCHECKED, not CLEAN',
+            }),
+          );
+        }
+        return { outputs: { valid: true, errors: [] } };
+      }
       const schema = mergeSchema(params.base_schema, params.overlay);
       const errors: string[] = [];
       if (inputs.record !== undefined) {

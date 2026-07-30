@@ -98,7 +98,7 @@ export interface PipelineSteps {
   enricherStep: EnricherStep;
   indexerStep: IndexerStep;
   modelRouter: ModelRouter;
-  /** Required: all chunk embeddings (Gemini + SPECTER2) route through
+  /** Required: both chunk embeddings (gemini 3072 + the 768 slot, qwen) route through
    *  openarx-embed-service via EmbedClient — shared Redis cache and
    *  rate-limiter with the rest of the platform. Direct embedder fallback
    *  has been removed (see openarx-9o0f). */
@@ -449,10 +449,11 @@ export async function embedGeminiWorker(item: WorkItem, steps: PipelineSteps): P
   logger.info(`Gemini embedding complete: ${geminiResult.dimensions}d in ${durationMs}ms (provider=${geminiResult.provider})`);
 }
 
-/** SPECTER2 embed-service can transiently 502 with "no available SPECTER2
- *  servers (waited Ns, all at capacity or down)" during bursty pool usage.
- *  Retry with jittered exponential backoff before falling through to the
- *  gemini-only safety net (openarx-rth1). */
+/** The 768-vector embed call can transiently 502 during bursty usage. Retry with jittered
+ *  exponential backoff before falling through to the gemini-only safety net (openarx-rth1).
+ *  NB the symbol and env names still say "specter2" — that model is gone and the slot now holds
+ *  qwen; renaming them touches the shared prod .env and pipeline step names Console may read, so it
+ *  is tracked separately (openarx-zqx4). The behaviour here is provider-agnostic either way. */
 async function callSpecter2WithRetry(
   client: EmbedClient,
   texts: string[],
@@ -465,7 +466,8 @@ async function callSpecter2WithRetry(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      return await client.callEmbed(texts, 'specter2', {
+      // Physical 768 slot "specter2" now holds qwen vectors (embedding_qwen_migration Stage-2).
+      return await client.callEmbed(texts, 'qwen3-embedding-8b', {
         timeoutMs: 300_000,
         bypassCache: opts.bypassCache,
       });
@@ -475,7 +477,7 @@ async function callSpecter2WithRetry(
       const exp = Math.min(BASE_DELAY_MS * 3 ** (attempt - 1), MAX_DELAY_MS);
       const jitterMs = Math.round(exp * (0.9 + Math.random() * 0.2)); // ±10%
       opts.logger.warn(
-        `SPECTER2 transient error (attempt ${attempt}/${MAX_ATTEMPTS}, retry in ${jitterMs}ms, doc=${opts.docId}): ${err instanceof Error ? err.message : String(err)}`,
+        `768-vector embed transient error (qwen; attempt ${attempt}/${MAX_ATTEMPTS}, retry in ${jitterMs}ms, doc=${opts.docId}): ${err instanceof Error ? err.message : String(err)}`,
       );
       await new Promise((r) => setTimeout(r, jitterMs));
     }
@@ -504,12 +506,13 @@ export async function embedSpecterWorker(item: WorkItem, steps: PipelineSteps): 
   const texts = chunks.map((chunk) => buildEmbedText(chunk));
 
   try {
-    context.logger.info(`Embedding ${chunks.length} chunks with SPECTER2 via embed-service${steps.bypassEmbedCache ? ' (bypassCache)' : ''}`);
+    context.logger.info(`Embedding ${chunks.length} chunks with qwen3-embedding-8b (768 slot) via embed-service${steps.bypassEmbedCache ? ' (bypassCache)' : ''}`);
     const t0 = performance.now();
-    // SPECTER2 container is a single-host CPU model that serializes large
-    // batches from many parallel pool workers — observed 45-59s p99 latency
-    // under a 100-doc run with bursts of 40-128-chunk batches. 300s timeout
-    // matches the slowest observed run-to-completion plus headroom.
+    // The generous timeout dates from the self-hosted SPECTER2 container, a single-host CPU model
+    // that serialized large batches from many parallel pool workers (45-59s p99 under a 100-doc run
+    // with 40-128-chunk bursts). That service is decommissioned and the 768 vector now comes from
+    // qwen via the embed-service, which is far faster — the headroom is kept because it costs
+    // nothing and a slow provider day should not fail a run.
     //
     // Retry policy (openarx-rth1): pool can be transiently capacity-exhausted
     // during bursty ingest. Wrap call in retry-with-backoff so transient 502s
@@ -537,12 +540,12 @@ export async function embedSpecterWorker(item: WorkItem, steps: PipelineSteps): 
       chunks[i].vectors.specter2 = specterResult.vectors[i];
     }
     item.timing.embedSpecterMs = durationMs;
-    context.logger.info(`SPECTER2 embedding complete: ${specterResult.dimensions}d in ${durationMs}ms (provider=${specterResult.provider})`);
+    context.logger.info(`768-vector embedding complete: ${specterResult.dimensions}d in ${durationMs}ms (provider=${specterResult.provider})`);
   } catch (err) {
     // Last-resort fallback after retry exhaustion (openarx-rth1). Doc is
-    // indexed gemini-only; doctor reindex-missing-specter2 will fill SPECTER2
+    // indexed gemini-only; the doctor's partial-chunks check fills the 768 vector later
     // later for free.
-    context.logger.warn(`SPECTER2 unavailable after retries, proceeding Gemini-only: ${err instanceof Error ? err.message : String(err)}`);
+    context.logger.warn(`768-vector embed unavailable after retries, proceeding Gemini-only: ${err instanceof Error ? err.message : String(err)}`);
     await query(
       `UPDATE documents SET quality_flags = COALESCE(quality_flags, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
       [JSON.stringify({ missing_specter2: true, specter2_failed_at: new Date().toISOString() }), item.document.id],
@@ -702,7 +705,7 @@ export async function translateWorker(item: WorkItem, _steps: PipelineSteps): Pr
  *
  * Skips parsing/chunking entirely. Creates a single chunk from the document's
  * abstract (which is metadata, not file content). The downstream embedder will
- * produce one Gemini + one SPECTER2 vector, and the indexer will store one
+ * produce one gemini (3072) + one 768 vector (qwen), and the indexer will store one
  * row in the chunks table and one point in Qdrant.
  *
  * Also populates a minimal parsedDocument so downstream steps (enricher, indexer)

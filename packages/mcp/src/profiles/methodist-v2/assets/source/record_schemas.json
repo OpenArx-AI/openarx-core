@@ -12,7 +12,7 @@
   },
   "relation": {
     "version": "v1",
-    "node": { "indexed_properties": ["attester_id", "run_id", "relation", "direction", "is_superseded"] },
+    "node": { "indexed_properties": ["attester_id", "run_id", "relation", "direction", "is_superseded", "grounding", "correction"] },
     "read": { "strip_fields": ["track_note"] }
   },
   "activity": {

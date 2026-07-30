@@ -53,3 +53,35 @@ export const cacheHitRate = new Gauge({
   labelNames: ['model'] as const,
   registers: [registry],
 });
+
+// ── qwen TEI GPU-pool (populated from the pool at /metrics scrape time) ──
+export const teiPoolBackends = new Gauge({
+  name: 'openarx_embed_tei_pool_backends',
+  help: 'TEI pool backend count by state (total|healthy)',
+  labelNames: ['state'] as const,
+  registers: [registry],
+});
+export const teiBackendHealthy = new Gauge({
+  name: 'openarx_embed_tei_backend_healthy',
+  help: 'TEI backend health (1 healthy, 0 down)',
+  labelNames: ['id'] as const,
+  registers: [registry],
+});
+export const teiBackendInflight = new Gauge({
+  name: 'openarx_embed_tei_backend_inflight',
+  help: 'In-flight requests per TEI backend',
+  labelNames: ['id'] as const,
+  registers: [registry],
+});
+export const teiBackendRequests = new Gauge({
+  name: 'openarx_embed_tei_backend_requests',
+  help: 'Cumulative requests per TEI backend since register',
+  labelNames: ['id'] as const,
+  registers: [registry],
+});
+export const teiBackendErrors = new Gauge({
+  name: 'openarx_embed_tei_backend_errors',
+  help: 'Cumulative errors per TEI backend since register',
+  labelNames: ['id'] as const,
+  registers: [registry],
+});

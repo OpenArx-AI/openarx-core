@@ -22,6 +22,9 @@ async function run(): Promise<void> {
     await client.createCollection(COLLECTION_NAME, {
       vectors: {
         gemini: { size: 3072, distance: 'Cosine' },
+        // Physical 768 slot named "specter2" (kept for schema stability, not renamed to avoid a
+        // 35M-point collection rebuild). Holds qwen vectors since embedding_qwen_migration; the
+        // specter2 MODEL is retired (Stage-2) — the name is a historical label only.
         specter2: { size: 768, distance: 'Cosine' },
       },
     });

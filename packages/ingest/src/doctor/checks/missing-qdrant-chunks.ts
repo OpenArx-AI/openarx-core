@@ -186,10 +186,10 @@ export function createMissingQdrantCheck(ctx: DoctorContext): CheckModule {
             // SPECTER2 embedding (optional)
             let specter2Vectors: number[][] | undefined;
             try {
-              const s2Result = await ctx.embedClient!.callEmbed(batchTexts, 'specter2', { timeoutMs: 300_000 });
+              const s2Result = await ctx.embedClient!.callEmbed(batchTexts, 'qwen3-embedding-8b', { timeoutMs: 300_000 });
               specter2Vectors = s2Result.vectors;
             } catch (err) {
-              log.warn({ err }, 'SPECTER2 embedding failed for batch, continuing gemini-only');
+              log.warn({ err }, '768-vector (qwen) embedding failed for batch, continuing gemini-only');
             }
 
             // Build Qdrant points

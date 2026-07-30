@@ -116,6 +116,42 @@ describe('interpreter', () => {
     expect(stamped).toBe('skeleton'); // injected from config, not null
   });
 
+  it('threads owner_hash from the door input into create-run (§8-inv4 run_id-threading, fill-only)', async () => {
+    // Run-ownership is FRAME-owned identity: the methodology never binds owner_hash; the interpreter
+    // threads the STABLE sha256(userId) owner from the endpoint input so the run carries a
+    // token-refresh-immune owner for boundary run-ownership validation (contracts EMPTY_LOG KEYING FIX).
+    const r = new Registry();
+    let owner: unknown = 'UNSET';
+    r.register(
+      definePrimitive(
+        { id: 'create-run', version: 'v1', kind: 'state', goal: 't', access: [], effects: ['run-state'], determinism: 'deterministic' },
+        ({ inputs }) => {
+          owner = (inputs as { owner_hash?: unknown }).owner_hash;
+          return { outputs: { run_id: 'run:x', verdict: 'GO' } };
+        },
+      ),
+    );
+    const m: Methodology = {
+      methodology_version: 'skeleton',
+      procedures: [
+        {
+          name: 'birth',
+          trigger: { kind: 'endpoint', ref: 'birth' },
+          // create-run binds only credential_id — owner_hash is NOT bound by the methodology.
+          steps: [{ id: 'run', primitive: 'create-run', version: 'v1', in: { credential_id: '$input.agent_id' }, out: 'run' }],
+          outcome_from: 'run',
+          route: { GO: { run_id: '$run.run_id' } },
+        },
+      ],
+    };
+    await runEndpoint(
+      { runtime: { registry: r, stores: new InMemoryStores() }, methodology: m },
+      'birth',
+      { agent_id: 'agent:a', owner_hash: 'own:deadbeef' },
+    );
+    expect(owner).toBe('own:deadbeef'); // threaded from the door input, not bound by the methodology
+  });
+
   it('gate (condition form) short-circuits, skipping remaining steps', async () => {
     const stores = new InMemoryStores();
     const res = await runEndpoint(deps(stores), 'flow', { blocked: true, note: 'x', run_id: 'r1' });

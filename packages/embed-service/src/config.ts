@@ -5,14 +5,6 @@ export interface Config {
   internalSecret: string;
   redisCacheUrl: string;
   cacheTtlSeconds: number;
-  specter2Url: string;
-  /** Multi-server pool for SPECTER2. Empty array → single-server mode
-   *  (fallback to specter2Url). Populated from EMBEDDING_SERVERS env as
-   *  comma-separated list, same format used historically by Specter2Client
-   *  in @openarx/api. Pool provides round-robin + per-server capacity +
-   *  health-based failover across the 5 deployed SPECTER2 instances
-   *  (S1/S2/S3 + 2 external hosts). */
-  specter2ServerUrls: string[];
   openrouterApiKey: string;
   vertexSaKeyFile: string | undefined;
   googleCloudProject: string | undefined;
@@ -20,6 +12,11 @@ export interface Config {
   gemini2ConcurrencyLimit: number;
   gemini2VertexRatePerMinute: number;
   disableCache: boolean;
+  /** Optional seed of rented-GPU TEI backends for qwen (comma-sep TEI_URLS). Usually empty
+   *  — backends are registered at RUNTIME via POST /admin/backends during a bulk run. */
+  teiSeedUrls: string[];
+  teiApiKey: string | undefined;
+  teiMaxConcurrency: number | undefined;
 }
 
 function req(name: string): string {
@@ -41,11 +38,6 @@ export function loadConfig(): Config {
       ? (process.env.REDIS_CACHE_URL ?? '')
       : req('REDIS_CACHE_URL'),
     cacheTtlSeconds: Number(process.env.EMBED_CACHE_TTL_SECONDS ?? 60 * 60 * 24 * 90),
-    specter2Url: process.env.SPECTER2_URL ?? 'http://localhost:8090',
-    specter2ServerUrls: (process.env.EMBEDDING_SERVERS ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
     openrouterApiKey: process.env.OPENROUTER_API_KEY ?? '',
     // Embed-service has its own env var name to avoid co-opting other
     // processes (runner / mcp / enrichment) that read the shared GOOGLE_SA_KEY_FILE
@@ -60,5 +52,8 @@ export function loadConfig(): Config {
     // quota of 4000 with headroom for runner + skew.
     gemini2VertexRatePerMinute: Number(process.env.GEMINI2_VERTEX_RPM ?? 3800),
     disableCache: process.env.EMBED_CACHE_DISABLED === '1',
+    teiSeedUrls: (process.env.TEI_URLS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+    teiApiKey: process.env.TEI_API_KEY,
+    teiMaxConcurrency: process.env.TEI_MAX_CONCURRENCY ? Number(process.env.TEI_MAX_CONCURRENCY) : undefined,
   };
 }

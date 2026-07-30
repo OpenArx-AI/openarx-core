@@ -6,7 +6,7 @@ import { deduplicateByDocument, fetchDocuments, embedQuery, jsonResult, computeC
 export function registerFindRelated(server: McpServer, ctx: AppContext): void {
   server.tool(
     'find_related',
-    "Find related papers via three modes: 'similarity' (default — vector similarity to a doc or text), 'byEntity' (papers mentioning a specific entity like \"BERT\"), 'byConcept' (papers sharing a key concept). Returns papers with abstract and metadata for quick understanding — no follow-up get_document needed.",
+    "Find related PAPERS via three modes (papers, not claims — for claims related to a claim use find_related_claims): 'similarity' (default — vector similarity to a doc or text), 'byEntity' (papers mentioning a specific entity like \"BERT\"), 'byConcept' (papers sharing a key concept). Returns papers with abstract and metadata for quick understanding — no follow-up get_document needed.",
     {
       mode: z.enum(['similarity', 'byEntity', 'byConcept']).default('similarity').describe(
         "'similarity' (default): vector similarity to documentId or text. 'byEntity': papers mentioning entity (e.g. 'BERT') — ranks by mention count, biases toward surveys that mention the entity many times rather than original papers introducing it; for canonical lookup use search_keyword or find_by_id. 'byConcept': papers sharing keyConcept.",

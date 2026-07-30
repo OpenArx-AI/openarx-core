@@ -127,26 +127,77 @@ describe('detect-language', () => {
   });
 });
 
-// ── crosscheck-tool-usage (mock journal) ──────────────────────────────────────
+// ── crosscheck-tool-usage (§8-inv4 fail-closed enforcement, mock journal) ─────
+// openarx-zw61: the primitive CLASSIFIES into pass / under_report / fabrication /
+// inconclusive (fork-A). The methodology gates fabrication→block, inconclusive→re-auth;
+// under_report→advisory WARN; pass→proceed. W1: non-array claimed_usage → bad-output reject.
 describe('crosscheck-tool-usage', () => {
-  it('flags claimed-not-logged and logged-not-claimed, scoped by run_id', async () => {
+  const seed = (entries: Array<{ run_id: string; tool: string }>) => {
     const stores = new InMemoryStores();
     const log = stores.dump('journal').log;
-    log.push({ id: 'e1', entry: { run_id: 'run1', tool: 'search' } });
-    log.push({ id: 'e2', entry: { run_id: 'run1', tool: 'read' } });
-    log.push({ id: 'e3', entry: { run_id: 'other', tool: 'write' } }); // different run → ignored
+    entries.forEach((e, i) => log.push({ id: `e${i}`, entry: e }));
+    return stores;
+  };
+  const run = (stores: InMemoryStores, claimed_usage: unknown, run_id = 'run1') =>
+    call(reg(), 'crosscheck-tool-usage', { inputs: { claimed_usage, run_id } }, stores);
 
-    const out = await call(reg(), 'crosscheck-tool-usage', { inputs: { claimed_usage: ['search', 'publish'], run_id: 'run1' } }, stores);
-    const res = ok(out) as { consistent: boolean; discrepancies: string[] };
-    expect(res.consistent).toBe(false);
+  it('PASS — claimed matches the log exactly (and empty-empty / legit-0)', async () => {
+    expect(ok(await run(seed([{ run_id: 'run1', tool: 'search' }]), ['search']))).toMatchObject({
+      verdict: 'pass', consistent: true, discrepancies: [], block_fabrication: false, inconclusive: false, warn_under_report: false,
+    });
+    expect(ok(await run(seed([]), []))).toMatchObject({ verdict: 'pass', consistent: true }); // legit-0
+  });
+
+  it('FABRICATION — claimed a tool NOT in a NON-EMPTY log → block_fabrication, scoped by run_id', async () => {
+    const stores = seed([
+      { run_id: 'run1', tool: 'search' },
+      { run_id: 'run1', tool: 'read' },
+      { run_id: 'other', tool: 'write' }, // different run → ignored
+    ]);
+    const res = ok(await run(stores, ['search', 'publish'])) as { verdict: string; block_fabrication: boolean; discrepancies: string[] };
+    expect(res.verdict).toBe('fabrication');
+    expect(res.block_fabrication).toBe(true);
     expect(res.discrepancies).toEqual(['claimed_not_logged:publish', 'logged_not_claimed:read']);
   });
 
-  it('consistent when claimed matches the log exactly', async () => {
-    const stores = new InMemoryStores();
-    stores.dump('journal').log.push({ id: 'e1', entry: { run_id: 'run1', tool: 'search' } });
-    const out = await call(reg(), 'crosscheck-tool-usage', { inputs: { claimed_usage: ['search'], run_id: 'run1' } }, stores);
-    expect(ok(out)).toEqual({ consistent: true, discrepancies: [] });
+  it('UNDER_REPORT — used a tool not claimed (no fabrication) → warn, NOT block (fork-A)', async () => {
+    expect(ok(await run(seed([{ run_id: 'run1', tool: 'search' }, { run_id: 'run1', tool: 'read' }]), ['search']))).toMatchObject({
+      verdict: 'under_report', warn_under_report: true, block_fabrication: false,
+    });
+  });
+
+  it('INCONCLUSIVE — claimed non-empty but log ENTIRELY empty → inconclusive(empty_log), NOT fabrication (note-iii)', async () => {
+    expect(ok(await run(seed([]), ['search']))).toMatchObject({
+      verdict: 'inconclusive', inconclusive: true, reason_code: 'empty_log', block_fabrication: false,
+    });
+  });
+
+  it('[W1] PRESENT-but-malformed claimed_usage → REJECT (bad-output), not fail-open', async () => {
+    // non-array (object/number/string) or an array with a non-string element = shape violation
+    for (const bad of [{ get_chunks: 3 }, 42, 'search', ['ok', 3]]) {
+      expect((await run(seed([{ run_id: 'run1', tool: 'search' }]), bad)).status).toBe('rejected');
+    }
+  });
+
+  it('[zw61 regression] ABSENT claimed_usage (undefined/null/missing-key) → tolerated as [], NOT hard-rejected', async () => {
+    // claimed_usage is schema-OPTIONAL; absence (incl. nested-in-submission) must NOT hard-block a
+    // legit checkpoint. Log has a tool → claimed=[] → under_report (advisory), never a reject.
+    for (const absent of [undefined, null]) {
+      expect((ok(await run(seed([{ run_id: 'run1', tool: 'search' }]), absent)) as { verdict: string }).verdict).toBe('under_report');
+    }
+    // missing key entirely (no claimed_usage in inputs) → same tolerance
+    const missing = ok(await call(reg(), 'crosscheck-tool-usage', { inputs: { run_id: 'run1' } }, seed([{ run_id: 'run1', tool: 'search' }])));
+    expect((missing as { verdict: string }).verdict).toBe('under_report');
+    // absent + empty log → pass (legit-0, no false block)
+    expect((ok(await run(seed([]), undefined)) as { verdict: string }).verdict).toBe('pass');
+  });
+
+  it('INCONCLUSIVE — journal read-fault → inconclusive(read_fault), not fail-open', async () => {
+    const stores = seed([]);
+    (stores as unknown as { read: unknown }).read = () => ({
+      store: 'journal', get: async () => undefined, list: async () => { throw new Error('neo4j down'); },
+    });
+    expect(ok(await run(stores, ['search']))).toMatchObject({ verdict: 'inconclusive', reason_code: 'read_fault' });
   });
 });
 

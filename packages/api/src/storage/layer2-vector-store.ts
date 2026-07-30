@@ -70,6 +70,8 @@ export class Layer2VectorStore {
     if (!collections.some((c) => c.name === LAYER2_COLLECTION)) {
       const vectors: Record<string, { size: number; distance: 'Cosine' }> = {
         gemini: { size: 3072, distance: 'Cosine' }, // §7-scientific claim projection
+        // Physical 768 slot named "specter2" (historical label, not the retired model). Scope-B
+        // (layer2 claims) re-embed is separate; the name stays for schema stability.
         specter2: { size: 768, distance: 'Cosine' },
       };
       // §12.9 P3: the engineering-edge projection vector is added only when the feature is enabled, so a
@@ -207,6 +209,55 @@ export class Layer2VectorStore {
       }
       offset = res.next_page_offset as string | number | null;
     } while (offset !== null && offset !== undefined);
+    return out;
+  }
+
+  /** The stored vectors of ONE claim, by claim id — the anchor for by-example association search
+   *  (Scope-B B3 `find_related_claims`). Returns whichever named vectors the point actually has:
+   *  `gemini` (§7 scientific), `specter2` (the 768 slot, holding qwen since the migration), and
+   *  `gemini_eng` when the engineering projection exists.
+   *
+   *  Searching by the STORED vector rather than re-embedding the claim's text is the point of the
+   *  by-example path: the stored vector was built from the §5.4.2 projection (run-context + 1-hop
+   *  edges + caveats), which text alone cannot reproduce — and it costs no model call. */
+  async getClaimVectors(claimId: string): Promise<Record<string, number[]> | null> {
+    const res = await this.client
+      .retrieve(LAYER2_COLLECTION, {
+        ids: [pointIdForClaim(claimId)],
+        with_vector: true,
+        with_payload: false,
+      })
+      .catch(() => []);
+    const point = res[0];
+    if (!point) return null;
+    const vectors = (point.vector ?? {}) as Record<string, number[]>;
+    // A named-vector point yields an object; guard against the unnamed-vector shape just in case.
+    return typeof vectors === 'object' && !Array.isArray(vectors) ? vectors : null;
+  }
+
+  /** Stored vectors for MANY claims in one retrieve.
+   *
+   *  Exists so a caller can score a set of hits in a space they were not returned from. Searching
+   *  two spaces independently gives each its own top-K, so a hit present in one list is often absent
+   *  from the other — and that absence is indistinguishable from "scored below the floor" unless the
+   *  missing score is computed directly. One round trip for the whole page rather than one per hit.
+   */
+  async getClaimVectorsBatch(claimIds: string[]): Promise<Map<string, Record<string, number[]>>> {
+    const out = new Map<string, Record<string, number[]>>();
+    if (claimIds.length === 0) return out;
+    const byPointId = new Map(claimIds.map((id) => [String(pointIdForClaim(id)), id]));
+    const res = await this.client
+      .retrieve(LAYER2_COLLECTION, {
+        ids: claimIds.map((id) => pointIdForClaim(id)),
+        with_vector: true,
+        with_payload: false,
+      })
+      .catch(() => []);
+    for (const point of res) {
+      const claimId = byPointId.get(String(point.id));
+      const vectors = (point.vector ?? {}) as Record<string, number[]>;
+      if (claimId && typeof vectors === 'object' && !Array.isArray(vectors)) out.set(claimId, vectors);
+    }
     return out;
   }
 

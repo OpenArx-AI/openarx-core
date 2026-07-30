@@ -325,6 +325,7 @@ export interface ChunkContext {
   contentType?: string;    // 'abstract' | 'theoretical' | 'methodology' | 'experimental' | 'results' | 'survey' | 'background' | 'other'
   entities?: string[];     // key named entities: method names, dataset names, metric names
   selfContained?: boolean; // true if chunk can be understood without surrounding context
+  chunkingMode?: 'marker' | 'full_text'; // provenance: 'marker' = anchor-recovered (Stage-2 Part B), 'full_text' = LLM full-text or fallback
 }
 
 export interface ChunkMetricValue {

@@ -119,7 +119,7 @@ async function checkPreconditions(cfg: Config): Promise<void> {
     const h = (await r.json()) as { status?: string; models?: string[] };
     if (h.status !== 'ok') problems.push(`embed-service /health status=${h.status}`);
     if (!h.models?.includes(cfg.geminiModel)) problems.push(`embed-service doesn't know ${cfg.geminiModel}`);
-    if (!h.models?.includes('specter2')) problems.push(`embed-service doesn't know specter2`);
+    if (!h.models?.includes('qwen3-embedding-8b')) problems.push(`embed-service doesn't know qwen3-embedding-8b`);
     log.info({ health: h }, 'embed-service ok');
   } catch (err) {
     problems.push(`embed-service unreachable: ${(err as Error).message}`);
@@ -189,13 +189,13 @@ async function processOrphan(
 
   const [gem, spec] = await Promise.all([
     embed.callEmbed([text], cfg.geminiModel),
-    embed.callEmbed([text], 'specter2'),
+    embed.callEmbed([text], 'qwen3-embedding-8b'),
   ]);
   if (gem.vectors.length !== 1 || gem.vectors[0].length !== 3072) {
     throw new Error(`gemini embed bad shape: ${gem.vectors.length}/${gem.vectors[0]?.length}`);
   }
   if (spec.vectors.length !== 1 || spec.vectors[0].length !== 768) {
-    throw new Error(`specter2 embed bad shape: ${spec.vectors.length}/${spec.vectors[0]?.length}`);
+    throw new Error(`768-vector (qwen) embed bad shape: ${spec.vectors.length}/${spec.vectors[0]?.length}`);
   }
 
   const payload: Record<string, unknown> = {

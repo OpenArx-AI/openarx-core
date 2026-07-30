@@ -20,7 +20,8 @@ function sha256Hex(s: string): string {
   return createHash('sha256').update(s, 'utf8').digest('hex');
 }
 import type { AppContext } from '../../context.js';
-import { credentialFromToken } from '../../portal-auth.js';
+import { credentialFromToken, ownerHashFromToken } from '../../portal-auth.js';
+import { lenientJson } from './lenient-parse.js';
 import { jsonResult } from '../shared/helpers.js';
 import { buildDoorEngine } from './engine.js';
 
@@ -36,6 +37,14 @@ function credentialOf(extra: unknown): string {
     | { userId?: string; tokenId?: string }
     | undefined;
   return credentialFromToken(token);
+}
+
+/** The STABLE run-owner hash (sha256(userId)) for a call's token — server-bound, never a param.
+ *  create-run persists it on the run node so the tool-call boundary can validate run-ownership
+ *  across token-refresh (§8-inv4 run_id-threading; delegates to ownerHashFromToken, the single mint). */
+function ownerHashOf(extra: unknown): string {
+  const token = (extra as Record<string, unknown> | undefined)?._portalToken as { userId?: string } | undefined;
+  return ownerHashFromToken(token);
 }
 
 /** openarx-xckj: a run_id supplied by the mentee MUST reference a run that diagnose already
@@ -67,10 +76,13 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
         .string()
         .optional()
         .describe('The active run (omit to start a new run — routes to diagnose)'),
+      // S6(1) lenient-parse: accept the payload as an object OR a JSON string of that object (a
+      // stringifying client is not blocked — Postel). The handler parses the string then validates
+      // as today; a non-JSON / non-object string fails loud (S6(3)). Send an object when you can.
       payload: z
-        .record(z.unknown())
+        .union([z.record(z.unknown()), z.string()])
         .describe(
-          'Mode fields the routed sub-procedure reads: diagnose → {intent, focus?, parent_run_id?}; checkpoint → {submission{records[],track_note?}, submission_hash, stage, claimed_usage?}; ask → {question, focus?}',
+          'Mode fields the routed sub-procedure reads: diagnose → {intent, focus?, parent_run_id?}; checkpoint → {submission{records[],track_note?}, stage, claimed_usage?} (submission_hash is SERVER-derived — do NOT send it); ask → {question, focus?}. Send this as a JSON object; a JSON string of the same object is also accepted, but a string that is not a JSON object is rejected.',
         ),
     },
     async ({ run_id, payload }, extra) => {
@@ -85,7 +97,30 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
             detail: 'No such run. Omit run_id to start a new run (diagnose), or verify the run_id.',
           });
         }
-        const payloadObj = (payload ?? {}) as Record<string, unknown>;
+        // S6(1)/S6(3) lenient-parse (contracts CHECKPOINT PAYLOAD LENIENT-PARSE): tolerate a
+        // stringified payload / submission / records (parse-then-validate, Postel), done BEFORE the
+        // submission_hash below → the hash is over the PARSED object (abvc-A: an object and a
+        // json-string of the SAME object hash identically). A malformed string → bad-output fail-loud.
+        const parsedPayload = lenientJson(payload ?? {}, 'payload', 'object');
+        if (!parsedPayload.ok) {
+          return errJson({ error: 'bad_payload', reason: parsedPayload.reason, detail: parsedPayload.message });
+        }
+        const payloadObj = parsedPayload.value as Record<string, unknown>;
+        if (payloadObj.submission !== undefined) {
+          const parsedSub = lenientJson(payloadObj.submission, 'submission', 'object');
+          if (!parsedSub.ok) {
+            return errJson({ error: 'bad_payload', reason: parsedSub.reason, detail: parsedSub.message });
+          }
+          payloadObj.submission = parsedSub.value;
+          const subRecords = (parsedSub.value as { records?: unknown }).records;
+          if (subRecords !== undefined) {
+            const parsedRecords = lenientJson(subRecords, 'records', 'array');
+            if (!parsedRecords.ok) {
+              return errJson({ error: 'bad_payload', reason: parsedRecords.reason, detail: parsedRecords.message });
+            }
+            (payloadObj.submission as { records?: unknown }).records = parsedRecords.value;
+          }
+        }
         // openarx-abvc (A): SERVER-derive the idempotency key over the FULL hand-in (§4.3 JCS
         // over records + track_note + claimed_usage) — NOT the client-opaque submission_hash.
         // Consequences: a correction to ANY of these (e.g. fixing a tool-usage claim that lives
@@ -107,6 +142,9 @@ export function registerMethodistDoors(server: McpServer, _ctx: AppContext): voi
         }
         const r = await runEndpoint(engine, 'methodist', {
           agent_id: credentialOf(extra),
+          // owner_hash rides into diagnose→create-run (interpreter fill) as the run's STABLE owner
+          // (sha256(userId)); ignored by checkpoint/ask (no create-run). §8-inv4 run_id-threading.
+          owner_hash: ownerHashOf(extra),
           run_id: run_id ?? null,
           payload: payloadObj,
         });

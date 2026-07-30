@@ -43,6 +43,8 @@ import {
   query,
   neoGraphCounts,
   Layer2VectorStore,
+  OARX_ID_RE,
+  LEGACY_OARX_ID_RE,
 } from '@openarx/api';
 import { isOpenLicense } from '@openarx/ingest';
 import type { SpdxLicense } from '@openarx/ingest';
@@ -75,6 +77,63 @@ function getAvailableFormats(doc: Document): string[] {
   }
 
   return formats;
+}
+
+/** Canonical UUID v4-ish shape guard — used to 404 (not 500) a non-UUID :id path. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Build the shared document-detail payload (same shape for GET /documents/:id and
+ *  GET /documents/by-oarx-id/:oarxId — Console + Portal consume one shape). Uses the
+ *  resolved doc's UUID for the chunk/version fan-out, so it works regardless of how the
+ *  document was looked up. */
+async function buildDocumentDetail(ctx: AppContext, doc: Document): Promise<Record<string, unknown>> {
+  const conceptId = doc.conceptId ?? doc.id;
+  const [chunkCountResult, allVersionsResult] = await Promise.all([
+    ctx.pool.query<{ count: string }>(
+      'SELECT count(*)::text as count FROM chunks WHERE document_id = $1',
+      [doc.id],
+    ),
+    ctx.pool.query<{ id: string; version: number; status: string; created_at: Date }>(
+      'SELECT id, version, status, created_at FROM documents WHERE concept_id = $1 ORDER BY version ASC',
+      [conceptId],
+    ),
+  ]);
+  const allVersions = allVersionsResult.rows.map((v) => ({
+    id: v.id,
+    version: v.version,
+    status: v.status,
+    created_at: v.created_at.toISOString(),
+  }));
+  return {
+    document: {
+      id: doc.id,
+      oarx_id: doc.oarxId ?? null,
+      title: doc.title,
+      abstract: doc.abstract,
+      original_title: doc.originalTitle ?? null,
+      original_abstract: doc.originalAbstract ?? null,
+      original_language: doc.language && doc.language !== 'en' ? doc.language : null,
+      license: doc.license ?? null,
+      licenses: doc.licenses ?? {},
+      indexing_tier: doc.indexingTier ?? 'full',
+      can_serve_file: canServeFile(doc),
+      available_formats: getAvailableFormats(doc),
+      authors: doc.authors,
+      source_url: doc.sourceUrl,
+      arxiv_categories: doc.categories,
+      published_at: doc.publishedAt.toISOString(),
+      version: doc.version,
+      concept_id: conceptId,
+      previous_version_id: doc.previousVersion ?? null,
+      all_versions: allVersions,
+      external_ids: doc.externalIds ?? {},
+      code_links: doc.codeLinks ?? [],
+      dataset_links: doc.datasetLinks ?? [],
+      benchmark_results: doc.benchmarkResults ?? [],
+      chunks_count: parseInt(chunkCountResult.rows[0]?.count ?? '0', 10),
+      status: doc.status,
+    },
+  };
 }
 
 // ── Auth middleware ──────────────────────────────────────────
@@ -293,6 +352,12 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
   router.get('/documents/:id', async (req: Request, res: Response) => {
     try {
       const id = String(req.params.id);
+      // 404 (not 500) on a non-UUID :id — getById would else cast-fail on the uuid column.
+      // oarx-id lookups have their own route: GET /documents/by-oarx-id/:oarxId.
+      if (!UUID_RE.test(id)) {
+        res.status(404).json({ error: 'not_found', message: 'Document not found' });
+        return;
+      }
       const doc = await ctx.documentStore.getById(id);
       // Soft-delete §3.1 invariant: deleted doc returns identical-shape
       // 404 to never-existed ID — Portal must not leak tombstoned metadata.
@@ -300,59 +365,46 @@ export function registerInternalRoutes(app: Express, ctx: AppContext): void {
         res.status(404).json({ error: 'not_found', message: 'Document not found' });
         return;
       }
-
-      const conceptId = doc.conceptId ?? doc.id;
-
-      // Parallel: chunk count + all versions of same concept
-      const [chunkCountResult, allVersionsResult] = await Promise.all([
-        ctx.pool.query<{ count: string }>(
-          'SELECT count(*)::text as count FROM chunks WHERE document_id = $1',
-          [id],
-        ),
-        ctx.pool.query<{ id: string; version: number; status: string; created_at: Date }>(
-          'SELECT id, version, status, created_at FROM documents WHERE concept_id = $1 ORDER BY version ASC',
-          [conceptId],
-        ),
-      ]);
-
-      const allVersions = allVersionsResult.rows.map((v) => ({
-        id: v.id,
-        version: v.version,
-        status: v.status,
-        created_at: v.created_at.toISOString(),
-      }));
-
-      res.json({
-        document: {
-          id: doc.id,
-          title: doc.title,
-          abstract: doc.abstract,
-          original_title: doc.originalTitle ?? null,
-          original_abstract: doc.originalAbstract ?? null,
-          original_language: doc.language && doc.language !== 'en' ? doc.language : null,
-          license: doc.license ?? null,
-          licenses: doc.licenses ?? {},
-          indexing_tier: doc.indexingTier ?? 'full',
-          can_serve_file: canServeFile(doc),
-          available_formats: getAvailableFormats(doc),
-          authors: doc.authors,
-          source_url: doc.sourceUrl,
-          arxiv_categories: doc.categories,
-          published_at: doc.publishedAt.toISOString(),
-          version: doc.version,
-          concept_id: conceptId,
-          previous_version_id: doc.previousVersion ?? null,
-          all_versions: allVersions,
-          external_ids: doc.externalIds ?? {},
-          code_links: doc.codeLinks ?? [],
-          dataset_links: doc.datasetLinks ?? [],
-          benchmark_results: doc.benchmarkResults ?? [],
-          chunks_count: parseInt(chunkCountResult.rows[0]?.count ?? '0', 10),
-          status: doc.status,
-        },
-      });
+      res.json(await buildDocumentDetail(ctx, doc));
     } catch (err) {
       console.error('[internal/documents] Error:', err instanceof Error ? err.message : err);
+      res.status(500).json({ error: 'server_error' });
+    }
+  });
+
+  // ── GET /documents/by-oarx-id/:oarxId ───────────────────────
+  // Resolve a published document by its OpenArx id (oarx-<16 hex>, or legacy oarx-<8 hex>)
+  // to the SAME payload as /documents/:id — Console + Portal smart-search-box consume ONE
+  // shared resolver (published rows are dropped on publish; the oarx_id→doc canon lives in
+  // Core). Mirrors find_by_id's oarx-id resolution (exact match, deleted_at IS NULL, not
+  // 'listed'). 400 on malformed id, 404 (not 500) on not-found.
+  router.get('/documents/by-oarx-id/:oarxId', async (req: Request, res: Response) => {
+    try {
+      const raw = String(req.params.oarxId).trim().toLowerCase();
+      let cond: string;
+      if (OARX_ID_RE.test(raw)) cond = 'oarx_id = $1';
+      else if (LEGACY_OARX_ID_RE.test(raw)) cond = 'left(oarx_id, 13) = $1'; // legacy 8-hex → prefix
+      else {
+        res.status(400).json({ error: 'invalid_oarx_id', message: 'Expected oarx- followed by 16 (or legacy 8) hex chars' });
+        return;
+      }
+      const resolved = await ctx.pool.query<{ id: string }>(
+        `SELECT id FROM documents WHERE ${cond} AND deleted_at IS NULL AND status != 'listed' LIMIT 1`,
+        [raw],
+      );
+      const uuid = resolved.rows[0]?.id;
+      if (!uuid) {
+        res.status(404).json({ error: 'not_found', message: 'Document not found' });
+        return;
+      }
+      const doc = await ctx.documentStore.getById(uuid);
+      if (!doc || doc.deletedAt) {
+        res.status(404).json({ error: 'not_found', message: 'Document not found' });
+        return;
+      }
+      res.json(await buildDocumentDetail(ctx, doc));
+    } catch (err) {
+      console.error('[internal/documents/by-oarx-id] Error:', err instanceof Error ? err.message : err);
       res.status(500).json({ error: 'server_error' });
     }
   });
